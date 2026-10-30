@@ -1,0 +1,125 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#176bd8">
+  <meta name="description" content="Crypto Intelligence Scanner">
+  <link rel="manifest" href="manifest.webmanifest">
+  <title>Crypto Scanner Pro</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f4f7fb;
+      color: #172b4d;
+    }
+    header {
+      background: white;
+      padding: 18px;
+      border-bottom: 1px solid #dce5f0;
+      font-size: 20px;
+      font-weight: bold;
+    }
+    main {
+      max-width: 650px;
+      margin: 25px auto;
+      padding: 15px;
+    }
+    .card {
+      background: white;
+      border: 1px solid #dce5f0;
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 4px 15px #18385f10;
+    }
+    p { line-height: 1.8; color: #526783; }
+    input, button {
+      width: 100%;
+      padding: 14px;
+      margin-top: 12px;
+      border-radius: 10px;
+      font-size: 15px;
+    }
+    input {
+      border: 1px solid #cbd8e7;
+      direction: ltr;
+    }
+    button {
+      border: 0;
+      background: #2878ee;
+      color: white;
+      font-weight: bold;
+    }
+    #scanner {
+      display: none;
+      width: 100%;
+      height: calc(100dvh - 65px);
+      border: 0;
+      background: white;
+    }
+  </style>
+</head>
+<body>
+  <header>₿ Crypto Scanner Pro</header>
+
+  <main id="setup">
+    <div class="card">
+      <h2>Connect your scanner</h2>
+      <p>
+        Enter your GitHub Codespaces forwarded URL
+        for port 8501.
+      </p>
+      <input
+        id="url"
+        type="url"
+        placeholder="https://your-codespace-8501.app.github.dev"
+      >
+      <button onclick="connectScanner()">
+        Open Crypto Scanner
+      </button>
+      <p>
+        Keep your Codespace running to use live market data.
+      </p>
+    </div>
+  </main>
+
+  <iframe id="scanner"></iframe>
+
+  <script>
+    function connectScanner() {
+      const value = document.getElementById("url").value.trim();
+
+      try {
+        const address = new URL(value);
+
+        if (address.protocol !== "https:") {
+          throw new Error("HTTPS required");
+        }
+
+        localStorage.setItem("scanner_url", address.href);
+
+        document.getElementById("setup").style.display = "none";
+        const frame = document.getElementById("scanner");
+        frame.src = address.href;
+        frame.style.display = "block";
+      } catch (error) {
+        alert("Please enter a valid HTTPS address.");
+      }
+    }
+
+    const saved = localStorage.getItem("scanner_url");
+    if (saved) {
+      document.getElementById("url").value = saved;
+    }
+
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("./sw.js");
+      });
+    }
+  </script>
+</body>
+</html>

@@ -464,6 +464,166 @@ def fetch_dex_search(query):
 
 
 # =========================================================
+# CRYPTOMETER API
+# =========================================================
+CRYPTOMETER_API = "https://api.cryptometer.io"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_cryptometer(endpoint: str, params: dict, api_key: str):
+    """Fetch one CryptoMeter endpoint. The API key is never included in UI errors."""
+    query = dict(params or {})
+    query["api_key"] = api_key
+    try:
+        response = requests.get(
+            f"{CRYPTOMETER_API}/{endpoint.strip('/')}/",
+            params=query,
+            timeout=25,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Network error while calling CryptoMeter: {exc.__class__.__name__}") from None
+
+    if response.status_code in (401, 403):
+        raise RuntimeError("CryptoMeter rejected the key or this endpoint is not enabled for your plan (HTTP 401/403).")
+    if response.status_code == 429:
+        raise RuntimeError("CryptoMeter rate limit or monthly quota reached (HTTP 429).")
+    if response.status_code >= 500:
+        raise RuntimeError(f"CryptoMeter server error (HTTP {response.status_code}). Try again later.")
+    if not response.ok:
+        raise RuntimeError(f"CryptoMeter request failed (HTTP {response.status_code}). Check endpoint access and parameters.")
+
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RuntimeError("CryptoMeter returned a response that was not valid JSON.") from None
+
+    if isinstance(payload, dict):
+        success = payload.get("success")
+        error_flag = payload.get("error")
+        if str(success).strip().lower() == "false" or str(error_flag).strip().lower() == "true":
+            message = payload.get("message") or payload.get("msg") or payload.get("error_message")
+            raise RuntimeError(str(message or "CryptoMeter reported an API error.")[:240])
+    return payload
+
+
+def cryptometer_data(payload):
+    """Return the endpoint's `data` value without assuming a single response shape."""
+    if isinstance(payload, dict):
+        return payload.get("data", payload)
+    return payload
+
+
+def cryptometer_frame(payload):
+    data = cryptometer_data(payload)
+    if isinstance(data, list):
+        return pd.DataFrame(data)
+    if isinstance(data, dict):
+        # Some endpoints return a single record rather than a list of records.
+        return pd.DataFrame([data])
+    return pd.DataFrame()
+
+
+def _cm_number(value):
+    try:
+        value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        return float(value) if pd.notna(value) else 0.0
+    except Exception:
+        return 0.0
+
+
+def cryptometer_watchlist(results):
+    """Build a transparent evidence score only from symbol-level returned evidence."""
+    evidence = {}
+
+    def slot(symbol):
+        symbol = str(symbol or "").strip().upper()
+        if not symbol:
+            return None
+        return evidence.setdefault(symbol, {
+            "Symbol": symbol, "Rapid bias": 0, "Rapid events": 0,
+            "Whale buys USD": 0.0, "Whale sells USD": 0.0,
+            "Netflow USD": np.nan,
+        })
+
+    rapid_result = results.get("rapid") or {}
+    if rapid_result.get("payload"):
+        rapid = cryptometer_frame(rapid_result["payload"])
+        for _, row in rapid.iterrows():
+            symbol = row.get("symbol")
+            if not symbol:
+                symbol = str(row.get("pair", "")).split("-")[0]
+            item = slot(symbol)
+            if item is None:
+                continue
+            side = str(row.get("side", row.get("direction", ""))).upper()
+            if side in ("PUMP", "BUY", "UP"):
+                item["Rapid bias"] += 1
+            elif side in ("DUMP", "SELL", "DOWN"):
+                item["Rapid bias"] -= 1
+            item["Rapid events"] += 1
+
+    whale_result = results.get("whales") or {}
+    if whale_result.get("payload"):
+        whales = cryptometer_frame(whale_result["payload"])
+        for _, row in whales.iterrows():
+            symbol = row.get("symbol") or str(row.get("pair", "")).split("-")[0]
+            item = slot(symbol)
+            if item is None:
+                continue
+            usd = _cm_number(row.get("usd_total", row.get("total", 0)))
+            side = str(row.get("side", "")).upper()
+            if side == "BUY":
+                item["Whale buys USD"] += usd
+            elif side == "SELL":
+                item["Whale sells USD"] += usd
+
+    flow_result = results.get("liquidity") or {}
+    if flow_result.get("payload"):
+        flow_data = cryptometer_data(flow_result["payload"])
+        if isinstance(flow_data, dict):
+            for symbol, values in flow_data.items():
+                if isinstance(values, dict) and "netflow" in values:
+                    item = slot(symbol)
+                    if item is not None:
+                        item["Netflow USD"] = _cm_number(values.get("netflow"))
+
+    rows = []
+    for item in evidence.values():
+        score = 50.0
+        sources = 0
+        rapid_bias = item["Rapid bias"]
+        if item["Rapid events"]:
+            score += 10 if rapid_bias > 0 else (-10 if rapid_bias < 0 else 0)
+            sources += 1
+        whale_total = item["Whale buys USD"] + item["Whale sells USD"]
+        if whale_total > 0:
+            score += 18 if item["Whale buys USD"] > item["Whale sells USD"] else -18
+            sources += 1
+        if pd.notna(item["Netflow USD"]):
+            score += 15 if item["Netflow USD"] > 0 else (-15 if item["Netflow USD"] < 0 else 0)
+            sources += 1
+        # Do not label a single-source observation bullish or bearish.
+        score = float(np.clip(score, 0, 100))
+        if sources < 2:
+            reading = "Insufficient independent evidence"
+        elif score >= 70:
+            reading = "Bullish watch — verify chart"
+        elif score <= 30:
+            reading = "Bearish / risk elevated"
+        else:
+            reading = "Mixed — monitor"
+        rows.append({
+            **item,
+            "Evidence sources": sources,
+            "Activity score": round(score, 1),
+            "Reading": reading,
+        })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["Activity score", "Evidence sources"], ascending=False)
+
+
+# =========================================================
 # HEADER
 # =========================================================
 st.title("📡 Crypto Intelligence Scanner Pro")
@@ -764,10 +924,10 @@ if not chart_source.empty:
         x="Change_24h_Percent", y="Change_7d_Percent",
         size="_volume_size", color="Pump_Potential_Score",
         hover_name="Symbol", hover_data=["Coin", "Volume_24h", "Risk_Level"],
-        color_continuous_scale="Turbo", template="plotly_dark",
+        color_continuous_scale="Turbo", template="plotly_white",
         labels={"Change_24h_Percent": "24h change (%)", "Change_7d_Percent": "7d change (%)", "Pump_Potential_Score": "Pump Potential Score"},
     )
-    fig.update_layout(paper_bgcolor="#0b1020", plot_bgcolor="#0b1020", height=520)
+    fig.update_layout(paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font_color="#172b4d", height=520, xaxis=dict(gridcolor="#e5edf6"), yaxis=dict(gridcolor="#e5edf6"))
     st.plotly_chart(fig, use_container_width=True)
 
 # Historical chart
@@ -786,8 +946,8 @@ if data_source == "CoinGecko market" and "CoinGecko_ID" in df.columns:
                 if hist.empty:
                     st.info("No price history returned.")
                 else:
-                    fig_hist = px.line(hist, x="Time", y="price", title=f"{choice} — {hist_days} day price history", template="plotly_dark")
-                    fig_hist.update_layout(paper_bgcolor="#0b1020", plot_bgcolor="#0b1020", yaxis_title=f"Price ({currency.upper()})")
+                    fig_hist = px.line(hist, x="Time", y="price", title=f"{choice} — {hist_days} day price history", template="plotly_white")
+                    fig_hist.update_layout(paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font_color="#172b4d", yaxis_title=f"Price ({currency.upper()})", xaxis=dict(gridcolor="#e5edf6"), yaxis=dict(gridcolor="#e5edf6"))
                     st.plotly_chart(fig_hist, use_container_width=True)
             except Exception as exc:
                 st.error(f"History API error: {exc}")
@@ -867,6 +1027,231 @@ if dex_button:
         except Exception as exc:
             st.error(f"DEX Screener error: {exc}")
 
+# =========================================================
+# CRYPTOMETER INTELLIGENCE PANEL
+# =========================================================
+st.divider()
+st.subheader("🧭 CryptoMeter intelligence — whale activity, flows & rapid moves")
+st.caption(
+    "CryptoMeter feeds add market evidence to the CoinGecko scanner. A signal is a research watchlist, "
+    "not a guaranteed pump prediction or an instruction to buy."
+)
+cm_key = secret_or_env("CRYPTOMETER_API_KEY")
+if not cm_key:
+    st.warning("CryptoMeter API key not found. Add CRYPTOMETER_API_KEY in Render → Environment, then save and redeploy.")
+else:
+    cm_a, cm_b, cm_c = st.columns(3)
+    with cm_a:
+        cm_symbol_filter = st.text_input(
+            "Whale / funding symbol filter (optional)", value="", key="cm_symbol_filter",
+            help="Leave blank to request the latest market-wide records where the endpoint supports it."
+        ).strip().lower()
+    with cm_b:
+        cm_timeframe = st.selectbox("Flow timeframe", ["15m", "1h", "4h", "d"], index=2, key="cm_flow_timeframe")
+    with cm_c:
+        cm_mover_timeframe = st.selectbox("Gainers/losers timeframe", ["5m", "15m", "1h", "1d", "1w"], index=2, key="cm_mover_timeframe")
+
+    st.markdown("**Free feeds** — account status, market trend pressure and the Rapid Movements feed.")
+    st.caption("The Rapid Movements endpoint is the original 4-hour movement feed. The richer Rapid Movements V2 feed is a paid endpoint.")
+
+    paid_options = {
+        "Whale trades (xtrades) — paid": "whales",
+        "Volume flow — paid": "volume_flow",
+        "Liquidity Lens / netflow — paid": "liquidity",
+        "Funding rates — paid": "funding",
+        "Gainers & losers — paid": "movers",
+    }
+    paid_selected_labels = st.multiselect(
+        "Optional paid feeds (select only endpoints included in your CryptoMeter plan)",
+        options=list(paid_options.keys()),
+        default=[],
+        help="Do not select these unless you have enabled/purchased the corresponding endpoint in CryptoMeter Manage API."
+    )
+    st.info(
+        "Whale trades, Volume Flow, Liquidity Lens, Funding Rates and Gainers/Losers are marked Paid in CryptoMeter's API documentation. "
+        "If your plan does not include an endpoint, leave it unselected."
+    )
+
+    if st.button("🔄 Fetch CryptoMeter intelligence", type="primary", key="cm_fetch_button"):
+        endpoint_jobs = {
+            "account": ("info", {}),
+            "trend": ("trend-indicator-v3", {}),
+            "rapid": ("rapid-movements", {}),
+        }
+        for label in paid_selected_labels:
+            result_key = paid_options[label]
+            if result_key == "whales":
+                params = {"symbol": cm_symbol_filter} if cm_symbol_filter else {}
+                endpoint_jobs[result_key] = ("xtrades", params)
+            elif result_key == "volume_flow":
+                endpoint_jobs[result_key] = ("volume-flow", {"timeframe": cm_timeframe})
+            elif result_key == "liquidity":
+                endpoint_jobs[result_key] = ("liquidity-lens", {"timeframe": cm_timeframe})
+            elif result_key == "funding":
+                params = {"symbol": cm_symbol_filter} if cm_symbol_filter else {}
+                endpoint_jobs[result_key] = ("funding-rates", params)
+            elif result_key == "movers":
+                endpoint_jobs[result_key] = ("gainers-losers", {"timeframe": cm_mover_timeframe})
+
+        collected = {}
+        with st.spinner("Requesting selected CryptoMeter feeds..."):
+            for result_key, (endpoint, params) in endpoint_jobs.items():
+                try:
+                    collected[result_key] = {
+                        "payload": fetch_cryptometer(endpoint, params, cm_key),
+                        "error": None,
+                        "endpoint": endpoint,
+                    }
+                except Exception as exc:
+                    collected[result_key] = {
+                        "payload": None,
+                        "error": str(exc),
+                        "endpoint": endpoint,
+                    }
+        st.session_state["cryptometer_results"] = collected
+        st.session_state["cryptometer_last_fetch"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    cm_results = st.session_state.get("cryptometer_results", {})
+    if cm_results:
+        st.caption(f"Last requested: {st.session_state.get('cryptometer_last_fetch', 'unknown')} • Responses are cached for 5 minutes.")
+        errors = [(key, value) for key, value in cm_results.items() if value.get("error")]
+        if errors:
+            with st.expander("⚠️ Feed access / API errors", expanded=True):
+                for key, value in errors:
+                    st.warning(f"{value.get('endpoint', key)}: {value['error']}")
+
+        account_result = cm_results.get("account", {})
+        if account_result.get("payload"):
+            account_df = cryptometer_frame(account_result["payload"])
+            if not account_df.empty:
+                account = account_df.iloc[0]
+                q1, q2, q3, q4 = st.columns(4)
+                q1.metric("CryptoMeter plan", str(account.get("plan", "N/A")))
+                q2.metric("API status", str(account.get("status", "N/A")))
+                q3.metric("Monthly quota", fmt_num(account.get("quota"), 0))
+                q4.metric("Requests used", fmt_num(account.get("total_requests"), 0))
+                extras = account.get("extra_endpoints")
+                if isinstance(extras, list) and extras:
+                    st.caption("Additional enabled endpoints reported by account: " + ", ".join(map(str, extras)))
+
+        trend_result = cm_results.get("trend", {})
+        if trend_result.get("payload"):
+            trend_df = cryptometer_frame(trend_result["payload"])
+            if not trend_df.empty:
+                trend = trend_df.iloc[-1]
+                st.markdown("**Market-wide trend pressure**")
+                t1, t2, t3 = st.columns(3)
+                t1.metric("Trend score", fmt_num(trend.get("trend_score")))
+                t2.metric("Buy pressure", f"{fmt_num(trend.get('buy_pressure'))}%")
+                t3.metric("Sell pressure", f"{fmt_num(trend.get('sell_pressure'))}%")
+                if trend.get("timestamp"):
+                    st.caption(f"Provider timestamp: {trend.get('timestamp')}. Treat this as broad market context, not a coin-specific signal.")
+
+        rapid_result = cm_results.get("rapid", {})
+        if rapid_result.get("payload"):
+            rapid_df = cryptometer_frame(rapid_result["payload"])
+            st.markdown("**Rapid Movements — last four hours**")
+            if rapid_df.empty:
+                st.info("No rapid-movement records were returned.")
+            else:
+                show_cols = [c for c in ["pair", "exchange", "change_detected", "side", "timestamp"] if c in rapid_df.columns]
+                st.dataframe(rapid_df[show_cols] if show_cols else rapid_df, use_container_width=True, hide_index=True)
+
+        whale_result = cm_results.get("whales", {})
+        if whale_result.get("payload"):
+            whale_df = cryptometer_frame(whale_result["payload"])
+            st.markdown("**Whale trades**")
+            if whale_df.empty:
+                st.info("No whale-trade rows were returned.")
+            else:
+                if "usd_total" not in whale_df.columns and "total" in whale_df.columns:
+                    whale_df["usd_total"] = whale_df["total"]
+                whale_cols = [c for c in ["timestamp", "symbol", "pair", "exchange", "side", "price", "size", "usd_total"] if c in whale_df.columns]
+                st.dataframe(whale_df[whale_cols] if whale_cols else whale_df, use_container_width=True, hide_index=True)
+
+        volume_result = cm_results.get("volume_flow", {})
+        if volume_result.get("payload"):
+            flow_data = cryptometer_data(volume_result["payload"])
+            st.markdown("**Volume Flow**")
+            if isinstance(flow_data, dict):
+                flow_tabs = st.tabs(["Inflow", "Outflow", "Netflow"])
+                for tab, flow_name in zip(flow_tabs, ["inflow", "outflow", "netflow"]):
+                    with tab:
+                        flow_rows = flow_data.get(flow_name, [])
+                        flow_frame = pd.DataFrame(flow_rows if isinstance(flow_rows, list) else [])
+                        if flow_frame.empty:
+                            st.info(f"No {flow_name} rows returned.")
+                        else:
+                            st.dataframe(flow_frame, use_container_width=True, hide_index=True)
+            else:
+                st.json(flow_data)
+
+        liquidity_result = cm_results.get("liquidity", {})
+        if liquidity_result.get("payload"):
+            liquidity_data = cryptometer_data(liquidity_result["payload"])
+            st.markdown("**Liquidity Lens — coin-level netflow**")
+            if isinstance(liquidity_data, dict):
+                liquidity_df = pd.DataFrame([
+                    {"Symbol": symbol, **values}
+                    for symbol, values in liquidity_data.items() if isinstance(values, dict)
+                ])
+            elif isinstance(liquidity_data, list):
+                liquidity_df = pd.DataFrame(liquidity_data)
+            else:
+                liquidity_df = pd.DataFrame()
+            if liquidity_df.empty:
+                st.info("No liquidity-lens rows were returned.")
+            else:
+                if "netflow" in liquidity_df.columns:
+                    liquidity_df = liquidity_df.sort_values("netflow", ascending=False)
+                st.dataframe(liquidity_df, use_container_width=True, hide_index=True)
+
+        funding_result = cm_results.get("funding", {})
+        if funding_result.get("payload"):
+            funding_df = cryptometer_frame(funding_result["payload"])
+            st.markdown("**Funding rates**")
+            if funding_df.empty:
+                st.info("No funding-rate rows were returned.")
+            else:
+                funding_cols = [c for c in ["symbol", "pair", "exchange", "rate_percent", "annualized_percent", "interval_hours", "next_funding_at"] if c in funding_df.columns]
+                st.dataframe(funding_df[funding_cols] if funding_cols else funding_df, use_container_width=True, hide_index=True)
+
+        movers_result = cm_results.get("movers", {})
+        if movers_result.get("payload"):
+            movers_data = cryptometer_data(movers_result["payload"])
+            st.markdown("**Gainers & losers**")
+            if isinstance(movers_data, dict):
+                mover_tabs = st.tabs(["Gainers", "Losers"])
+                for tab, side_name in zip(mover_tabs, ["gainers", "losers"]):
+                    with tab:
+                        side_df = pd.DataFrame(movers_data.get(side_name, []))
+                        if side_df.empty:
+                            st.info(f"No {side_name} rows returned.")
+                        else:
+                            st.dataframe(side_df, use_container_width=True, hide_index=True)
+            else:
+                st.json(movers_data)
+
+        watchlist_df = cryptometer_watchlist(cm_results)
+        if not watchlist_df.empty:
+            st.markdown("**Cross-signal activity watchlist**")
+            st.caption(
+                "Transparent evidence score: Rapid Moves (+/−10), whale buy/sell USD dominance (+/−18), "
+                "and coin-level netflow (+/−15). A bullish/bearish label requires at least two independent evidence sources. "
+                "This score is not a calibrated probability and is not a buy recommendation."
+            )
+            st.dataframe(watchlist_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download CryptoMeter watchlist CSV",
+                data=watchlist_df.to_csv(index=False).encode("utf-8"),
+                file_name="cryptometer_activity_watchlist.csv",
+                mime="text/csv",
+                key="cm_watchlist_download",
+            )
+    else:
+        st.info("Click 'Fetch CryptoMeter intelligence' to request the free feeds. Paid feeds remain off until you select them above.")
+
+
 # Full data export
 st.divider()
 with st.expander("📋 Advanced view — full market dataset", expanded=False):
@@ -883,7 +1268,8 @@ with st.expander("📋 Advanced view — full market dataset", expanded=False):
 st.caption(
     "Data coverage depends on the connected APIs and their limits. "
     "CoinGecko market pages cover listed market assets; DEX search is query-based. "
-    "News requires an optional CryptoPanic token. This tool is informational only."
+    "CryptoMeter paid feeds require endpoint access in your plan. This tool is informational only, not financial advice."
 )
+
 
 

@@ -1,64 +1,24 @@
-# crypto-agent# Crypto Intelligence Scanner Pro
+Crypto Intelligence Scanner Pro — update notes
 
-یک داشبورد اسکن و بررسی بازار رمزارزها با Streamlit.
+Files:
+- app.py: updated Streamlit app, based on the supplied project file.
+- requirements.txt: runtime dependencies.
 
-## محتویات بسته
+Render environment variables:
+- COINGECKO_API_KEY (keep the existing value)
+- CRYPTOMETER_API_KEY (the new CryptoMeter key)
 
-- `app.py` — فایل اصلی برنامه
-- `requirements.txt` — وابستگی‌های پایتون
-- `README.md` — راهنمای نصب و اجرا
+Deploy:
+1. Replace app.py in the existing GitHub repository with this file.
+2. Add requirements.txt if the repository does not already have one. If one already exists, merge the dependencies instead of overwriting it.
+3. Commit and push to the existing main branch; Render should deploy from the connected repository.
+4. In the app, click “Fetch CryptoMeter intelligence”. Free feeds are requested then. Select paid feeds only if they are enabled/purchased in the CryptoMeter plan.
 
-## پیش‌نیازها
+Security:
+- Do not paste API keys into source code or commit them to GitHub.
+- Store keys only in Render Environment Variables.
 
-- Python 3.9 یا جدیدتر
-- اتصال اینترنت برای دریافت داده‌های بازار و سرویس‌های بیرونی
-
-## نصب در GitHub Codespaces یا محیط محلی
-
-ترمینال را در پوشه پروژه باز کنید و این دستورات را اجرا کنید:
-
-```bash
-python -m pip install -r requirements.txt
-python -m streamlit run app.py
-```
-
-پس از اجرا، Streamlit آدرس محلی برنامه را در ترمینال نمایش می‌دهد. در GitHub Codespaces:
-1. تب **PORTS** را باز کنید.
-2. پورت `8501` را پیدا کنید.
-3. اگر پورت نمایش داده نمی‌شود، گزینه **Add Port** را بزنید و `8501` را وارد کنید.
-4. روی آدرس Forward شده کلیک کنید.
-
-## توقف برنامه
-
-برای متوقف کردن سرور، در همان ترمینال `Ctrl + C` را بزنید.
-
-## نکات مهم
-
-- متن‌هایی مانند `Local URL` و `Network URL` خروجی ترمینال هستند؛ آن‌ها را به‌عنوان دستور وارد نکنید.
-- کدهای پایتون مانند `import ...` باید داخل فایل `app.py` باشند، نه مستقیماً در ترمینال.
-- اگر صفحه با خطای 404 باز شد، بررسی کنید برنامه هنوز در حال اجرا باشد و پورت `8501` در تب **PORTS** به‌درستی Forward شده باشد.
-- برنامه برای دریافت داده‌ها به اینترنت نیاز دارد. خطاهای API، محدودیت نرخ درخواست یا تغییرات سرویس‌های بیرونی ممکن است باعث نمایش خطا یا داده ناقص شوند.
-- اگر برنامه به توکن اختیاری یک سرویس خبری نیاز داشته باشد، آن قابلیت بدون توکن ممکن است غیرفعال بماند.
-
-## عیب‌یابی سریع
-
-### خطای `ModuleNotFoundError`
-وابستگی‌ها را دوباره نصب کنید:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-### خطای `streamlit: command not found`
-از اجرای ماژول پایتون استفاده کنید:
-
-```bash
-python -m streamlit run app.py
-```
-
-### خطای `bash: import: command not found`
-احتمالاً کد پایتون را در ترمینال وارد کرده‌اید. کد را داخل `app.py` قرار دهید و فقط دستور اجرای Streamlit را در ترمینال اجرا کنید.
-
-### خطای 404 در لینک Codespaces
-سرور را در ترمینال اجرا نگه دارید و از آدرس Forward شده پورت `8501` در تب **PORTS** استفاده کنید.
-
+Notes:
+- CryptoMeter data is cached for five minutes in the app.
+- Whale trades, Volume Flow, Liquidity Lens, Funding Rates and Gainers/Losers are configured as optional paid endpoint calls; they are not requested unless selected by the user.
+- The watchlist score is a transparent research heuristic, not a calibrated pump probability or trading instruction.

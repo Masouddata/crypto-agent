@@ -767,6 +767,7 @@ def fetch_cryptometer(endpoint: str, params: dict, api_key: str):
             f"{detail or 'No error details returned.'}"
         )
 
+
     try:
         payload = response.json()
     except ValueError:

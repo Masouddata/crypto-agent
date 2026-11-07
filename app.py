@@ -1040,6 +1040,32 @@ df = calculate_pre_pump_score(df)
 if data_source == "CoinGecko market" and use_bybit_derivatives:
     df = add_derivatives_score(df)
 
+# Evidence gate: a high cross-sectional turnover rank alone is NOT a pre-pump confirmation.
+# Require a measured volume expansion against the coin's own history before using that label.
+_volume_baseline = numeric(df.get("Volume_24h_vs_7d_Avg", pd.Series(np.nan, index=df.index)))
+_price24_gate = numeric(df.get("Change_24h_Percent", pd.Series(np.nan, index=df.index)))
+_price7_gate = numeric(df.get("Change_7d_Percent", pd.Series(np.nan, index=df.index)))
+df["Evidence_Status"] = np.select(
+    [_volume_baseline.isna(), _volume_baseline < 1.3, _price24_gate >= 15, _price7_gate >= 35],
+    ["Unconfirmed — no historical volume baseline", "No volume expansion vs baseline", "Already moved — chase risk", "Already moved — chase risk"],
+    default="Volume expansion detected — verify independent flows"
+)
+_confirmed_volume = _volume_baseline >= 1.3
+_is_already_moving = (_price24_gate >= 15) | (_price7_gate >= 35)
+df.loc[~_confirmed_volume & ~_is_already_moving, "Signal"] = "Unconfirmed — insufficient evidence"
+df.loc[_is_already_moving, "Signal"] = "Already moving — chase risk"
+
+# Exclude stablecoins and tokenized equities from the pump-candidate list.
+_STABLE_SYMBOLS = {"usdt", "usdc", "usde", "dai", "fdusd", "tusd", "usdp", "usdd", "frax", "usds", "rlusd", "usdy", "eurc", "eurcv", "eur", "eurt", "ustc", "ust", "usd1", "usdg", "usdx", "usdtb", "usdm", "usdb"}
+_STABLE_NAME_TERMS = ("usd coin", "tether", "trueusd", "first digital usd", "paypal usd", "global dollar", "ripple usd", "euro coin", "coinvertible", "stablecoin")
+_TOKENIZED_EQUITY_TERMS = ("tokenized stock", "tokenized equity", "bStocks", "xstock", "tracker certificate")
+_sym_all = df.get("Symbol", pd.Series("", index=df.index)).astype(str).str.lower()
+_name_all = df.get("Coin", pd.Series("", index=df.index)).astype(str).str.lower()
+_is_stable_all = _sym_all.isin(_STABLE_SYMBOLS) | _name_all.apply(lambda n: any(term in n for term in _STABLE_NAME_TERMS))
+_is_equity_all = _name_all.apply(lambda n: any(term.lower() in n for term in _TOKENIZED_EQUITY_TERMS))
+df.loc[_is_stable_all | _is_equity_all, "Signal"] = "Excluded — stablecoin / tokenized equity"
+df.loc[_is_stable_all | _is_equity_all, "Evidence_Status"] = "Excluded from pre-pump screening"
+
 # =========================================================
 # MAIN FILTERS / KPIS
 # =========================================================
@@ -1071,12 +1097,13 @@ if "Market_Cap_Rank" in filtered.columns:
     rank_max = st.slider("Maximum market-cap rank", 10, max(10, int(pd.to_numeric(df.get("Market_Cap_Rank", pd.Series([250])), errors="coerce").max() or 250)), value=min(250, max(10, int(pd.to_numeric(df.get("Market_Cap_Rank", pd.Series([250])), errors="coerce").max() or 250))))
     filtered = filtered[pd.to_numeric(filtered["Market_Cap_Rank"], errors="coerce").fillna(rank_max + 1) <= rank_max]
 # Stablecoins remain visible in the full market dataset, but are excluded from pump-candidate ranking.
-stable_symbols = {"usdt", "usdc", "usde", "dai", "fdusd", "tusd", "usdp", "usdd", "frax", "usds", "rlusd", "usdy", "eurc", "eur", "eurt", "ustc", "ust"}
-stable_name_terms = ("usd coin", "tether", "trueusd", "first digital usd", "paypal usd", "united stables", "ripple usd", "euro coin")
+stable_symbols = _STABLE_SYMBOLS
+stable_name_terms = _STABLE_NAME_TERMS
 name_lower = filtered["Coin"].astype(str).str.lower() if "Coin" in filtered.columns else pd.Series("", index=filtered.index)
 symbol_lower = filtered["Symbol"].astype(str).str.lower() if "Symbol" in filtered.columns else pd.Series("", index=filtered.index)
 is_stable = symbol_lower.isin(stable_symbols) | name_lower.apply(lambda n: any(term in n for term in stable_name_terms))
-filtered = filtered[~is_stable].copy()
+is_tokenized_equity = name_lower.apply(lambda n: any(term.lower() in n for term in _TOKENIZED_EQUITY_TERMS))
+filtered = filtered[~(is_stable | is_tokenized_equity)].copy()
 filtered = filtered[numeric(filtered["Pump_Potential_Score"]).fillna(0) >= min_score]
 
 if filtered.empty:
@@ -1096,7 +1123,7 @@ g.metric("⚠️ High-risk / overheated", int(df["Risk_Level"].astype(str).str.s
 
 st.divider()
 st.subheader("🛰️ Pre-pump candidates — before the big move")
-st.caption("Ranks coins with rising turnover while price is still relatively quiet. A high score is a research lead, not proof of an incoming pump.")
+st.caption("Ranks coins with rising turnover while price is still relatively quiet. A candidate is not confirmed unless its volume expansion is measured against its own historical baseline; missing history is explicitly marked unconfirmed.")
 if not filtered.empty:
     ranked = filtered.sort_values("PrePump_Score", ascending=False).copy()
     top_three = ranked.head(3)
@@ -1114,7 +1141,7 @@ if not filtered.empty:
             "Volume_24h", "Volume_to_Market_Cap", "Volume_Activity_Score", "Price_Still_Quiet_Score",
             "Volume_24h_vs_7d_Avg", "Market_Cap_Rank", "RSI_14", "Technical_PrePump_Score",
             "Funding_Rate_Percent", "Open_Interest_USD", "Bybit_Turnover_24h_USD",
-            "Derivatives_Context_Score", "PrePump_Score", "Pump_Potential_Score", "Signal", "Risk_Level", "Technical_Signal",
+            "Derivatives_Context_Score", "PrePump_Score", "Pump_Potential_Score", "Signal", "Evidence_Status", "Risk_Level", "Technical_Signal",
         ]
         cols = [c for c in preferred_cols if c in ranked.columns]
         display_names = {
@@ -1127,7 +1154,7 @@ if not filtered.empty:
             "Funding_Rate_Percent": "Bybit funding (%)", "Open_Interest_USD": "Open interest (USD)",
             "Bybit_Turnover_24h_USD": "Bybit perp turnover (USD)", "Derivatives_Context_Score": "Derivatives context",
             "PrePump_Score": "Pre-Pump score", "Pump_Potential_Score": "Legacy score (same value)",
-            "Signal": "Signal / interpretation", "Risk_Level": "Risk flag", "Technical_Signal": "Technical reading",
+            "Signal": "Signal / interpretation", "Evidence_Status": "Evidence check", "Risk_Level": "Risk flag", "Technical_Signal": "Technical reading",
         }
         display_df = ranked[cols].rename(columns=display_names)
         st.dataframe(display_df, width="stretch", hide_index=True)
@@ -1180,7 +1207,8 @@ st.caption("این جدول جدا از رتبه‌بندی پیش‌پامپ ا
 losers = df.copy()
 loser_name = losers["Coin"].astype(str).str.lower() if "Coin" in losers.columns else pd.Series("", index=losers.index)
 loser_symbol = losers["Symbol"].astype(str).str.lower() if "Symbol" in losers.columns else pd.Series("", index=losers.index)
-loser_stable = loser_symbol.isin(stable_symbols) | loser_name.apply(lambda n: any(term in n for term in stable_name_terms))
+loser_stable = (loser_symbol.isin(stable_symbols) | loser_name.apply(lambda n: any(term in n for term in stable_name_terms))
+                | loser_name.apply(lambda n: any(term.lower() in n for term in _TOKENIZED_EQUITY_TERMS)))
 losers["_change24"] = numeric(losers.get("Change_24h_Percent", pd.Series(np.nan, index=losers.index)))
 losers = losers[~loser_stable & losers["_change24"].notna() & (losers["_change24"] < 0)].nsmallest(10, "_change24")
 loser_cols = [c for c in ["Coin", "Symbol", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Market_Cap", "Risk_Level"] if c in losers.columns]

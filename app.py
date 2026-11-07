@@ -286,87 +286,110 @@ def technical_summary(prices, volumes=None):
     }
 
 
-def calculate_pre_pump_score(frame):
-    """Ranks quiet coins with unusual turnover, not coins that already pumped.
+STABLECOIN_SYMBOLS = {
+    "USDT", "USDC", "USDE", "USDS", "DAI", "FDUSD", "TUSD", "USDP",
+    "USDD", "PYUSD", "USD1", "USDX", "USDSC", "GUSD", "FRAX",
+    "LUSD", "USDB", "USDTB", "EURC", "EURS", "EUROC", "XAUT",
+    "PAXG", "USTC", "UST", "SUSD", "USDK", "USDF", "USD0",
+}
+STABLECOIN_NAME_HINTS = (
+    "tether", "usd coin", "usdc", "usdt", "first digital usd",
+    "paypal usd", "trueusd", "pax dollar", "dai stablecoin",
+    "frax", "liquity usd", "staked usde", "ethena usde",
+    "stablecoin", "usd1", "usdd", "gemini dollar",
+)
 
-    Inputs are public market snapshots. It is a screening heuristic, not a prediction.
-    """
+def mark_stablecoins(frame):
     out = frame.copy()
+    symbols = out.get("Symbol", pd.Series("", index=out.index)).astype(str).str.upper().str.strip()
+    names = out.get("Coin", pd.Series("", index=out.index)).astype(str).str.lower()
+    ids = out.get("CoinGecko_ID", pd.Series("", index=out.index)).astype(str).str.lower()
+    symbol_match = symbols.isin(STABLECOIN_SYMBOLS)
+    name_match = names.apply(lambda value: any(hint in value for hint in STABLECOIN_NAME_HINTS))
+    id_match = ids.str.contains(r"tether|usd-coin|first-digital-usd|paypal-usd|true-usd|pax-dollar|dai$|frax|ethena-usde|usd1", regex=True, na=False)
+    out["Is_Stablecoin"] = symbol_match | name_match | id_match
+    return out
+
+
+def calculate_pre_pump_score(frame):
+    """Strict early-activity screen. A confirmed watch requires historical volume expansion."""
+    out = mark_stablecoins(frame)
     ch24 = numeric(out.get("Change_24h_Percent", pd.Series(np.nan, index=out.index)))
     ch7 = numeric(out.get("Change_7d_Percent", pd.Series(np.nan, index=out.index)))
     volume = numeric(out.get("Volume_24h", pd.Series(np.nan, index=out.index)))
     market_cap = numeric(out.get("Market_Cap", pd.Series(np.nan, index=out.index)))
+    turnover = (volume / market_cap.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    out["Volume_to_Market_Cap"] = turnover
 
-    # Turnover relative to market cap is a better early-activity clue than raw volume.
-    out["Volume_to_Market_Cap"] = (volume / market_cap.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-    activity = out["Volume_to_Market_Cap"].rank(pct=True) * 100
+    eligible = ~out["Is_Stablecoin"]
+    activity = turnover.where(eligible).rank(pct=True) * 100
     out["Volume_Activity_Score"] = activity.fillna(0).clip(0, 100)
 
-    # Reward low/contained recent price movement; sharply rising coins lose points.
-    abs24 = ch24.abs()
-    abs7 = ch7.abs()
-    quiet24 = pd.Series(np.select(
-        [abs24 <= 2, abs24 <= 5, abs24 <= 10, abs24 <= 20],
-        [100, 85, 60, 25], default=0), index=out.index, dtype=float)
-    quiet7 = pd.Series(np.select(
-        [abs7 <= 5, abs7 <= 12, abs7 <= 25, abs7 <= 40],
-        [100, 80, 50, 20], default=0), index=out.index, dtype=float)
-    # Missing change data is neutral rather than silently treated as zero movement.
-    quiet24 = quiet24.where(ch24.notna(), 50)
-    quiet7 = quiet7.where(ch7.notna(), 50)
+    # Price must still be relatively quiet; missing price changes are not treated as proof.
+    abs24, abs7 = ch24.abs(), ch7.abs()
+    quiet24 = pd.Series(np.select([abs24 <= 2, abs24 <= 4, abs24 <= 7], [100, 75, 35], default=0), index=out.index, dtype=float)
+    quiet7 = pd.Series(np.select([abs7 <= 5, abs7 <= 12, abs7 <= 20], [100, 75, 35], default=0), index=out.index, dtype=float)
+    quiet24 = quiet24.where(ch24.notna(), 0)
+    quiet7 = quiet7.where(ch7.notna(), 0)
     out["Price_Still_Quiet_Score"] = (0.45 * quiet24 + 0.55 * quiet7).clip(0, 100)
 
-    # Liquidity/size guardrail: penalize thin markets without automatically preferring giants.
-    liquidity_score = pd.Series(np.select(
-        [market_cap >= 100_000_000, market_cap >= 20_000_000, market_cap >= 5_000_000,
-         market_cap >= 1_000_000],
-        [100, 85, 65, 35], default=10), index=out.index, dtype=float)
-    liquidity_score = liquidity_score.where(market_cap.notna(), 40)
-    volume_floor = pd.Series(np.select(
-        [volume >= 5_000_000, volume >= 1_000_000, volume >= 250_000, volume >= 100_000],
-        [100, 80, 60, 35], default=10), index=out.index, dtype=float)
-    volume_floor = volume_floor.where(volume.notna(), 40)
-    out["Liquidity_Quality_Score"] = (0.6 * liquidity_score + 0.4 * volume_floor).clip(0, 100)
+    cap_score = pd.Series(np.select([market_cap >= 250_000_000, market_cap >= 75_000_000,
+                                     market_cap >= 20_000_000, market_cap >= 10_000_000],
+                                    [100, 85, 70, 50], default=0), index=out.index, dtype=float)
+    vol_score = pd.Series(np.select([volume >= 10_000_000, volume >= 2_000_000,
+                                     volume >= 500_000, volume >= 300_000],
+                                    [100, 85, 65, 45], default=0), index=out.index, dtype=float)
+    out["Liquidity_Quality_Score"] = (0.55 * cap_score + 0.45 * vol_score).clip(0, 100)
 
-    # Technical factor is neutral until the user explicitly fetches history.
     rsi_value = numeric(out.get("RSI_14", pd.Series(np.nan, index=out.index)))
-    tech = (100 - (rsi_value - 55).abs() * 2.2).clip(0, 100)
     macd = numeric(out.get("MACD", pd.Series(np.nan, index=out.index)))
     macd_signal = numeric(out.get("MACD_Signal", pd.Series(np.nan, index=out.index)))
-    tech = tech + np.where(macd.notna() & macd_signal.notna(), np.where(macd > macd_signal, 8, -8), 0)
-    tech = pd.Series(tech, index=out.index).clip(0, 100).fillna(50)
-    vol_surge = numeric(out.get("Volume_24h_vs_7d_Avg", pd.Series(np.nan, index=out.index)))
-    surge_score = pd.Series(np.select(
-        [vol_surge >= 2.5, vol_surge >= 1.8, vol_surge >= 1.3, vol_surge >= 1.0],
-        [100, 85, 70, 55], default=25), index=out.index, dtype=float)
-    surge_score = surge_score.where(vol_surge.notna(), 50)
-    out["Technical_PrePump_Score"] = (0.75 * tech + 0.25 * surge_score).clip(0, 100)
+    tech = (100 - (rsi_value - 55).abs() * 2.0).clip(0, 100)
+    tech = pd.Series(tech, index=out.index).fillna(45)
+    tech += np.where(macd.notna() & macd_signal.notna(), np.where(macd > macd_signal, 10, -10), 0)
+    tech = tech.clip(0, 100)
+    surge = numeric(out.get("Volume_24h_vs_7d_Avg", pd.Series(np.nan, index=out.index)))
+    surge_score = pd.Series(np.select([surge >= 3, surge >= 2, surge >= 1.5, surge >= 1.2],
+                                      [100, 85, 70, 50], default=0), index=out.index, dtype=float)
+    # Missing volume history gets a neutral-low score, never a positive confirmation.
+    surge_score = surge_score.where(surge.notna(), 25)
+    out["Technical_PrePump_Score"] = (0.65 * tech + 0.35 * surge_score).clip(0, 100)
 
-    raw_score = (
-        0.35 * out["Volume_Activity_Score"] +
-        0.30 * out["Price_Still_Quiet_Score"] +
-        0.15 * out["Liquidity_Quality_Score"] +
-        0.20 * out["Technical_PrePump_Score"]
-    )
-    overheated = (ch24 >= 15) | (ch7 >= 35)
-    thin_market = (market_cap.fillna(0) < 5_000_000) | (volume.fillna(0) < 100_000)
-    # Harder penalties stop thin or already-pumped coins from dominating the shortlist.
-    out["PrePump_Risk_Penalty"] = (np.where(overheated, 20, 0) + np.where(thin_market, 25, 0))
-    out["PrePump_Score"] = (raw_score - out["PrePump_Risk_Penalty"]).clip(0, 100).round(1)
-    # Keep the legacy column for the existing charts/exports, but redefine it as Pre-Pump.
+    turnover_score = pd.Series(np.select([turnover >= 0.005, turnover >= 0.0025,
+                                          turnover >= 0.001], [90, 75, 55], default=10),
+                               index=out.index, dtype=float)
+    out["Turnover_Quality_Score"] = turnover_score
+    raw = (0.20 * out["Volume_Activity_Score"] + 0.25 * out["Price_Still_Quiet_Score"] +
+           0.20 * out["Liquidity_Quality_Score"] + 0.20 * out["Technical_PrePump_Score"] +
+           0.15 * out["Turnover_Quality_Score"])
+
+    overheated = (ch24 >= 8) | (ch7 >= 20) | (ch24 <= -18) | (ch7 <= -35)
+    thin = (market_cap.fillna(0) < 10_000_000) | (volume.fillna(0) < 300_000)
+    missing_market = market_cap.isna() | volume.isna() | ch24.isna() | ch7.isna()
+    no_activity = surge.isna() | (surge < 1.2)
+    extreme_turnover = turnover > 0.20
+    penalty = (np.where(overheated, 22, 0) + np.where(thin, 30, 0) +
+               np.where(missing_market, 20, 0) + np.where(extreme_turnover, 20, 0) +
+               np.where(no_activity, 10, 0))
+    out["PrePump_Risk_Penalty"] = penalty
+    score = (raw - penalty).clip(0, 100).where(eligible, 0)
+    out["PrePump_Score"] = score.round(1)
     out["Pump_Potential_Score"] = out["PrePump_Score"]
 
-    early = (out["PrePump_Score"] >= 70) & (ch24.fillna(0) < 8) & (ch7.fillna(0) < 20)
-    building = (out["PrePump_Score"] >= 60) & (ch24.fillna(0) < 12) & (ch7.fillna(0) < 30)
+    valid_setup = (eligible & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
+                   ch24.abs().le(5) & ch7.abs().le(12) & surge.ge(1.5) &
+                   turnover.between(0.001, 0.15) & score.ge(70))
+    watch_setup = (eligible & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
+                   ch24.abs().le(7) & ch7.abs().le(18) & turnover.between(0.001, 0.15) & score.ge(60))
     out["Signal"] = np.select(
-        [overheated, early, building],
-        ["Already moving — chase risk", "Pre-pump watch", "Building activity"],
-        default="Watch"
-    )
-    out["Risk_Level"] = np.where(
-        thin_market, "High / thin market",
-        np.where(overheated, "High / overheated", "Medium / review")
-    )
+        [out["Is_Stablecoin"], overheated, valid_setup, watch_setup, no_activity],
+        ["Excluded — stablecoin", "Already moving / abnormal volatility — caution",
+         "Pre-pump watch — volume confirmed", "Early activity — needs volume confirmation",
+         "Watch — historical volume missing"], default="Watch — not enough evidence")
+    out["Risk_Level"] = np.select(
+        [out["Is_Stablecoin"], thin, overheated, extreme_turnover, missing_market],
+        ["Excluded — stablecoin", "High / thin market", "High / volatile", "High / abnormal turnover", "Incomplete market data"],
+        default="Medium / review")
     return out
 
 
@@ -572,89 +595,132 @@ BYBIT_API = "https://api.bybit.com"
 
 @st.cache_data(ttl=90, show_spinner=False)
 def fetch_bybit_derivatives():
-    """Fetch public USDT perpetual tickers: funding, open interest and turnover."""
-    payload = safe_get(
-        f"{BYBIT_API}/v5/market/tickers",
-        params={"category": "linear"},
-        timeout=25,
-    )
-    if not isinstance(payload, dict) or payload.get("retCode") != 0:
-        message = payload.get("retMsg", "unexpected response") if isinstance(payload, dict) else "invalid response"
-        raise RuntimeError(f"Bybit public market endpoint: {message}")
-    rows = (payload.get("result") or {}).get("list") or []
-    records = []
-    for item in rows:
-        pair = str(item.get("symbol", "")).upper()
-        if not pair.endswith("USDT"):
-            continue
-        base = pair[:-4]
-        if not base:
-            continue
-        try:
-            funding = float(item.get("fundingRate")) * 100
-        except (TypeError, ValueError):
+    """Try Bybit, then OKX public SWAP data, then Gate.io public USDT futures."""
+    errors = []
+    # 1) Bybit
+    try:
+        payload = safe_get(f"{BYBIT_API}/v5/market/tickers", params={"category": "linear"}, timeout=15)
+        if not isinstance(payload, dict) or payload.get("retCode") != 0:
+            raise RuntimeError((payload or {}).get("retMsg", "unexpected Bybit response"))
+        records = []
+        for item in (payload.get("result") or {}).get("list") or []:
+            pair = str(item.get("symbol", "")).upper()
+            if not pair.endswith("USDT"):
+                continue
+            def fnum(key, scale=1.0):
+                try: return float(item.get(key)) * scale
+                except (TypeError, ValueError): return np.nan
+            records.append({"Symbol": pair[:-4], "Derivatives_Exchange": "Bybit",
+                "Derivatives_Pair": pair, "Funding_Rate_Percent": fnum("fundingRate", 100),
+                "Open_Interest_USD": fnum("openInterestValue"),
+                "Derivatives_Turnover_24h_USD": fnum("turnover24h"),
+                "Derivatives_Change_24h_Percent": fnum("price24hPcnt", 100),
+                "Next_Funding_Time": item.get("nextFundingTime")})
+        frame = pd.DataFrame(records)
+        if not frame.empty:
+            return frame.sort_values("Derivatives_Turnover_24h_USD", ascending=False).drop_duplicates("Symbol")
+        errors.append("Bybit returned no USDT perpetual tickers")
+    except Exception as exc:
+        errors.append(f"Bybit: {str(exc)[:100]}")
+
+    # 2) OKX public market endpoints. Tickers + open interest are bulk requests;
+    # funding is requested only for the 60 most active USDT perpetuals to respect rate limits.
+    try:
+        base = "https://www.okx.com"
+        tick_payload = safe_get(f"{base}/api/v5/market/tickers", params={"instType": "SWAP"}, timeout=18)
+        if str(tick_payload.get("code")) != "0":
+            raise RuntimeError(tick_payload.get("msg", "OKX ticker error"))
+        tickers = [x for x in tick_payload.get("data", []) if str(x.get("instId", "")).endswith("-USDT-SWAP")]
+        if not tickers:
+            raise RuntimeError("OKX returned no USDT perpetual tickers")
+        oi_payload = safe_get(f"{base}/api/v5/public/open-interest", params={"instType": "SWAP"}, timeout=18)
+        if str(oi_payload.get("code")) != "0":
+            raise RuntimeError(oi_payload.get("msg", "OKX open-interest error"))
+        oi_map = {x.get("instId"): x for x in oi_payload.get("data", [])}
+        tickers.sort(key=lambda x: float(x.get("volCcy24h") or 0) * float(x.get("last") or 0), reverse=True)
+        records = []
+        for item in tickers[:60]:
+            inst_id = item.get("instId", "")
+            symbol = inst_id.replace("-USDT-SWAP", "")
+            oi_item = oi_map.get(inst_id, {})
+            try: oi_usd = float(oi_item.get("oiUsd"))
+            except (TypeError, ValueError): oi_usd = np.nan
+            try: turnover = float(item.get("volCcy24h")) * float(item.get("last"))
+            except (TypeError, ValueError): turnover = np.nan
+            try: change = (float(item.get("last")) / float(item.get("open24h")) - 1) * 100
+            except (TypeError, ValueError, ZeroDivisionError): change = np.nan
             funding = np.nan
-        try:
-            oi_value = float(item.get("openInterestValue"))
-        except (TypeError, ValueError):
-            oi_value = np.nan
-        try:
-            turnover = float(item.get("turnover24h"))
-        except (TypeError, ValueError):
-            turnover = np.nan
-        try:
-            change_24h = float(item.get("price24hPcnt")) * 100
-        except (TypeError, ValueError):
-            change_24h = np.nan
-        records.append({
-            "Symbol": base,
-            "Bybit_Pair": pair,
-            "Funding_Rate_Percent": funding,
-            "Open_Interest_USD": oi_value,
-            "Bybit_Turnover_24h_USD": turnover,
-            "Bybit_Change_24h_Percent": change_24h,
-            "Next_Funding_Time": item.get("nextFundingTime"),
-        })
-    frame = pd.DataFrame(records)
-    if frame.empty:
-        raise RuntimeError("Bybit returned no USDT perpetual tickers.")
-    # Keep the most liquid contract where the exchange lists duplicate base symbols.
-    frame = frame.sort_values("Bybit_Turnover_24h_USD", ascending=False).drop_duplicates("Symbol")
-    return frame
+            try:
+                fp = safe_get(f"{base}/api/v5/public/funding-rate", params={"instId": inst_id}, timeout=12)
+                if str(fp.get("code")) == "0" and fp.get("data"):
+                    funding = float(fp["data"][0].get("fundingRate")) * 100
+            except Exception:
+                pass
+            records.append({"Symbol": symbol, "Derivatives_Exchange": "OKX",
+                "Derivatives_Pair": inst_id, "Funding_Rate_Percent": funding,
+                "Open_Interest_USD": oi_usd, "Derivatives_Turnover_24h_USD": turnover,
+                "Derivatives_Change_24h_Percent": change, "Next_Funding_Time": None})
+            time.sleep(0.10)
+        frame = pd.DataFrame(records)
+        if not frame.empty:
+            return frame.drop_duplicates("Symbol")
+        errors.append("OKX returned no usable USDT perpetuals")
+    except Exception as exc:
+        errors.append(f"OKX: {str(exc)[:100]}")
+
+    # 3) Gate.io public fallback
+    try:
+        gate_rows = safe_get("https://api.gateio.ws/api/v4/futures/usdt/tickers", timeout=18)
+        if not isinstance(gate_rows, list):
+            raise RuntimeError("Gate.io returned an unexpected ticker response")
+        records = []
+        for item in gate_rows:
+            pair = str(item.get("contract", "")).upper()
+            if not pair.endswith("_USDT"):
+                continue
+            try: funding = float(item.get("funding_rate")) * 100
+            except (TypeError, ValueError): funding = np.nan
+            try: oi_value = float(item.get("open_interest_usd"))
+            except (TypeError, ValueError): oi_value = np.nan
+            try: turnover = float(item.get("volume_24h_usd"))
+            except (TypeError, ValueError):
+                try: turnover = float(item.get("volume_24h_quote"))
+                except (TypeError, ValueError): turnover = np.nan
+            try: change_24h = float(item.get("change_percentage"))
+            except (TypeError, ValueError): change_24h = np.nan
+            records.append({"Symbol": pair[:-5], "Derivatives_Exchange": "Gate.io",
+                "Derivatives_Pair": pair, "Funding_Rate_Percent": funding,
+                "Open_Interest_USD": oi_value, "Derivatives_Turnover_24h_USD": turnover,
+                "Derivatives_Change_24h_Percent": change_24h, "Next_Funding_Time": None})
+        frame = pd.DataFrame(records)
+        if frame.empty:
+            raise RuntimeError("Gate.io returned no USDT perpetual tickers")
+        return frame.sort_values("Derivatives_Turnover_24h_USD", ascending=False).drop_duplicates("Symbol")
+    except Exception as exc:
+        errors.append(f"Gate.io: {str(exc)[:100]}")
+        raise RuntimeError("All public derivatives feeds failed. " + " | ".join(errors))
+
 
 
 def add_derivatives_score(frame):
-    """Add a modest derivatives context factor; never treat OI as cash inflow."""
+    """Add a small positioning context weight; never treat OI as cash inflow."""
     out = frame.copy()
     funding = numeric(out.get("Funding_Rate_Percent", pd.Series(np.nan, index=out.index)))
     oi = numeric(out.get("Open_Interest_USD", pd.Series(np.nan, index=out.index)))
-    oi_score = oi.rank(pct=True) * 100
-    oi_score = oi_score.where(oi.notna(), 50).fillna(50)
+    oi_score = (oi.rank(pct=True) * 100).where(oi.notna(), 50).fillna(50)
     funding_score = pd.Series(np.select(
-        [funding <= -0.10, funding <= -0.02, funding <= 0.01,
-         funding <= 0.05, funding <= 0.10],
+        [funding <= -0.10, funding <= -0.02, funding <= 0.01, funding <= 0.05, funding <= 0.10],
         [45, 82, 75, 55, 30], default=15
     ), index=out.index, dtype=float).where(funding.notna(), 50)
     out["OI_Relative_Score"] = oi_score.round(1)
     out["Funding_Positioning_Score"] = funding_score.round(1)
     has_derivatives = funding.notna() | oi.notna()
     out["Derivatives_Context_Score"] = (0.55 * oi_score + 0.45 * funding_score).round(1)
-    # Existing market/technical score retains 90% weight; derivatives only 10% when present.
     base = numeric(out.get("PrePump_Score", pd.Series(np.nan, index=out.index)))
     if base.notna().any():
-        combined = 0.90 * base + 0.10 * out["Derivatives_Context_Score"]
+        combined = 0.92 * base + 0.08 * out["Derivatives_Context_Score"]
         out["PrePump_Score"] = combined.where(has_derivatives, base).clip(0, 100).round(1)
         out["Pump_Potential_Score"] = out["PrePump_Score"]
-        ch24 = numeric(out.get("Change_24h_Percent", pd.Series(np.nan, index=out.index)))
-        ch7 = numeric(out.get("Change_7d_Percent", pd.Series(np.nan, index=out.index)))
-        overheated = (ch24 >= 15) | (ch7 >= 35)
-        early = (out["PrePump_Score"] >= 70) & (ch24.fillna(0) < 8) & (ch7.fillna(0) < 20)
-        building = (out["PrePump_Score"] >= 60) & (ch24.fillna(0) < 12) & (ch7.fillna(0) < 30)
-        out["Signal"] = np.select(
-            [overheated, early, building],
-            ["Already moving — chase risk", "Pre-pump watch", "Building activity"],
-            default="Watch"
-        )
     return out
 
 
@@ -822,15 +888,16 @@ def cryptometer_watchlist(results):
 # HEADER
 # =========================================================
 st.title("📡 Crypto Intelligence Scanner Pro")
-st.caption("Broad market scan • Technical indicators • News context • DEX discovery • Risk flags")
+st.caption("Broad market scan • Strict early-activity ranking • Volume expansion • Derivatives context • Risk flags")
+st.caption("Build 2026-11-07.2 • Pre-pump filter v2 • Stablecoins excluded from candidate ranking")
 st.warning(
     "Scores are screening heuristics, not calibrated probabilities or financial advice. "
     "A high score does not guarantee a pump; low-liquidity tokens can be manipulated."
 )
 with st.expander("📘 Quick guide — how to read the scanner", expanded=True):
     guide_a, guide_b, guide_c = st.columns(3)
-    guide_a.markdown("**1. Score (0–100)**\n\nA sorting aid based on recent market movement. It is **not** the chance that a coin will pump.")
-    guide_b.markdown("**2. Signal**\n\n`Pre-pump watch` means turnover is unusually strong while price movement is still contained. `Already moving — chase risk` means the price has already jumped.")
+    guide_a.markdown("**1. Pre-Pump Score (0–100)**\n\nA strict evidence score combining quiet price action, turnover, market quality and optional historical volume expansion. It is **not** a pump probability.")
+    guide_b.markdown("**2. Signal**\n\n`Pre-pump watch — volume confirmed` requires historical volume expansion while price remains relatively quiet. `Early activity — needs confirmation` is not yet a verified setup.")
     guide_c.markdown("**3. Risk**\n\nCheck liquidity, volume, volatility, and the project itself before drawing conclusions. Missing technical data means it has not been calculated.")
 
 # =========================================================
@@ -854,9 +921,9 @@ with st.sidebar:
     st.divider()
     st.subheader("🔬 Technical analysis")
     use_bybit_derivatives = st.checkbox(
-        "Add live funding rate + open interest (Bybit public data)",
+        "Add live funding rate + open interest (Bybit → OKX → Gate.io fallback)",
         value=True,
-        help="Reads public USDT perpetual market data. No Bybit login or API key is used. Availability depends on Render network access."
+        help="Uses public USDT perpetual data: Bybit first, then OKX, then Gate.io if blocked. No exchange API key is used."
     )
     technical_limit = st.selectbox(
         "Coins for detailed technical indicators",
@@ -878,7 +945,7 @@ with st.sidebar:
     dex_query = st.text_input("DEX search term", value="bitcoin", help="Searches pairs matching this term; not a complete list of all DEX tokens.")
     dex_button = st.button("Search DEX Screener")
     st.divider()
-    min_score = st.slider("Minimum Pre-Pump Score", 0, 100, 60)
+    min_score = st.slider("Minimum Pre-Pump Score", 0, 100, 70)
     min_liquidity = st.number_input("Minimum DEX liquidity (USD)", min_value=0, value=50000, step=10000)
     show_all = st.checkbox("Show all rows in main table", value=True)
 
@@ -976,10 +1043,10 @@ if data_source == "CoinGecko market" and use_bybit_derivatives:
             bybit_df = fetch_bybit_derivatives()
         df["Symbol"] = df["Symbol"].astype(str).str.upper()
         df = df.merge(bybit_df, on="Symbol", how="left")
-        bybit_status = f"matched {int(df['Funding_Rate_Percent'].notna().sum())} market coins"
+        bybit_status = f"{bybit_df['Derivatives_Exchange'].dropna().iloc[0] if bybit_df['Derivatives_Exchange'].notna().any() else 'public exchange'} matched {int(df['Funding_Rate_Percent'].notna().sum())} market coins"
     except Exception as exc:
         bybit_status = f"unavailable: {str(exc)[:180]}"
-        for col in ["Funding_Rate_Percent", "Open_Interest_USD", "Bybit_Turnover_24h_USD", "Bybit_Change_24h_Percent"]:
+        for col in ["Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange", "Derivatives_Change_24h_Percent", "Derivatives_Pair"]:
             df[col] = np.nan
 
 # =========================================================
@@ -1051,14 +1118,14 @@ st.info(
     "Pre-Pump Score uses turnover relative to market cap, contained 24h/7d price movement, "
     "market-size/liquidity guardrails and optional historical RSI/MACD + volume expansion. "
     "Volume expansion is only available for coins whose 7-day history was fetched. "
-    "Funding/OI are public Bybit derivatives context; open interest is outstanding contracts, not cash inflow. "
+    "Funding/OI use public Bybit → OKX → Gate.io derivatives context; open interest is outstanding contracts, not cash inflow. "
     "Market snapshots alone do not prove net inflows or identify wallets/whales."
 )
 if data_source == "CoinGecko market" and use_bybit_derivatives:
     if bybit_status.startswith("matched"):
-        st.success(f"Bybit derivatives feed: {bybit_status} • cached 90 seconds")
+        st.success(f"Public derivatives feed: {bybit_status} • cached 90 seconds")
     else:
-        st.warning(f"Bybit derivatives feed {bybit_status}. Scanner continues without it.")
+        st.warning(f"Public derivatives feed {bybit_status}. Scanner continues without it.")
 search = st.text_input("🔎 Search coin name or symbol", value="")
 filtered = df.copy()
 if search.strip():
@@ -1070,7 +1137,7 @@ if search.strip():
 if "Market_Cap_Rank" in filtered.columns:
     rank_max = st.slider("Maximum market-cap rank", 10, max(10, int(pd.to_numeric(df.get("Market_Cap_Rank", pd.Series([250])), errors="coerce").max() or 250)), value=min(250, max(10, int(pd.to_numeric(df.get("Market_Cap_Rank", pd.Series([250])), errors="coerce").max() or 250))))
     filtered = filtered[pd.to_numeric(filtered["Market_Cap_Rank"], errors="coerce").fillna(rank_max + 1) <= rank_max]
-filtered = filtered[numeric(filtered["Pump_Potential_Score"]).fillna(0) >= min_score]
+filtered = filtered[(numeric(filtered["PrePump_Score"]).fillna(0) >= min_score) & (~filtered["Is_Stablecoin"])]
 
 if filtered.empty:
     st.info("No coins match these filters. Lower the minimum score or broaden your search.")
@@ -1084,29 +1151,39 @@ d.metric("📊 Median score", fmt_num(numeric(df["Pump_Potential_Score"]).median
 
 e, f, g = st.columns(3)
 e.metric("💰 Total 24h volume", fmt_money(numeric(df["Volume_24h"]).sum(), currency))
-f.metric("🛰️ Pre-pump watch", int((df["Signal"] == "Pre-pump watch").sum()))
+f.metric("🛰️ Pre-pump watch", int(df["Signal"].astype(str).str.startswith("Pre-pump watch").sum()))
 g.metric("⚠️ High-risk / overheated", int(df["Risk_Level"].astype(str).str.startswith("High").sum()))
 
 st.divider()
 st.subheader("🛰️ Pre-pump candidates — before the big move")
-st.caption("Ranks coins with rising turnover while price is still relatively quiet. A high score is a research lead, not proof of an incoming pump.")
+st.caption("Stablecoins are excluded. A confirmed pre-pump watch now requires historical volume expansion; turnover-only setups are shown separately as unconfirmed research leads.")
 if not filtered.empty:
-    ranked = filtered.sort_values("PrePump_Score", ascending=False).copy()
-    top_three = ranked.head(3)
-    card_cols = st.columns(3)
-    for i, (_, coin_row) in enumerate(top_three.iterrows()):
-        with card_cols[i]:
-            st.markdown(f"### {str(coin_row.get('Coin', 'Unknown'))} ({str(coin_row.get('Symbol', '')).upper()})")
-            st.metric("Pre-Pump score", f"{fmt_num(coin_row.get('PrePump_Score'), 0)} / 100")
-            change = numeric(pd.Series([coin_row.get('Change_24h_Percent')])).iloc[0]
-            st.metric("Change in 24 hours", f"{fmt_num(change)}%" if pd.notna(change) else "N/A")
-            st.caption(f"Signal: {coin_row.get('Signal', 'Watch')}\n\nRisk: {coin_row.get('Risk_Level', 'Unassessed')}")
+    ranked = filtered.sort_values(["PrePump_Score", "Volume_24h_vs_7d_Avg"], ascending=[False, False], na_position="last").copy()
+    confirmed = ranked[ranked["Signal"].astype(str).str.startswith("Pre-pump watch — volume confirmed")]
+    early = ranked[ranked["Signal"].astype(str).str.startswith("Early activity")]
+    if not confirmed.empty:
+        st.markdown("**Confirmed volume-expansion setups (historical data available)**")
+        top_three = confirmed.head(3)
+        card_cols = st.columns(3)
+        for i, (_, coin_row) in enumerate(top_three.iterrows()):
+            with card_cols[i]:
+                st.markdown(f"### {str(coin_row.get('Coin', 'Unknown'))} ({str(coin_row.get('Symbol', '')).upper()})")
+                st.metric("Pre-Pump score", f"{fmt_num(coin_row.get('PrePump_Score'), 0)} / 100")
+                change = numeric(pd.Series([coin_row.get('Change_24h_Percent')])).iloc[0]
+                st.metric("24h change", f"{fmt_num(change)}%" if pd.notna(change) else "N/A")
+                st.caption(f"Signal: {coin_row.get('Signal')}\n\nRisk: {coin_row.get('Risk_Level')}")
+    else:
+        st.info("No confirmed pre-pump setup yet. The scanner will not promote a coin without historical volume expansion.")
+    if not early.empty:
+        with st.expander(f"Early activity — needs confirmation ({len(early)})", expanded=True):
+            early_cols = [c for c in ["Coin", "Symbol", "PrePump_Score", "Change_24h_Percent", "Change_7d_Percent", "Volume_to_Market_Cap", "Volume_24h_vs_7d_Avg", "Risk_Level"] if c in early.columns]
+            st.dataframe(early[early_cols].head(20), use_container_width=True, hide_index=True)
     with st.expander("📊 Detailed candidate table", expanded=True):
         preferred_cols = [
             "Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent",
             "Volume_24h", "Volume_to_Market_Cap", "Volume_Activity_Score", "Price_Still_Quiet_Score",
             "Volume_24h_vs_7d_Avg", "Market_Cap_Rank", "RSI_14", "Technical_PrePump_Score",
-            "Funding_Rate_Percent", "Open_Interest_USD", "Bybit_Turnover_24h_USD",
+            "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange",
             "Derivatives_Context_Score", "PrePump_Score", "Pump_Potential_Score", "Signal", "Risk_Level", "Technical_Signal",
         ]
         cols = [c for c in preferred_cols if c in ranked.columns]
@@ -1117,8 +1194,8 @@ if not filtered.empty:
             "Volume_to_Market_Cap": "Volume / market cap", "Volume_Activity_Score": "Turnover activity",
             "Price_Still_Quiet_Score": "Price still quiet", "Volume_24h_vs_7d_Avg": "24h volume vs 7d baseline",
             "RSI_14": "RSI (14)", "Technical_PrePump_Score": "Technical pre-pump",
-            "Funding_Rate_Percent": "Bybit funding (%)", "Open_Interest_USD": "Open interest (USD)",
-            "Bybit_Turnover_24h_USD": "Bybit perp turnover (USD)", "Derivatives_Context_Score": "Derivatives context",
+            "Funding_Rate_Percent": "Funding (%)", "Open_Interest_USD": "Open interest (USD)",
+            "Derivatives_Turnover_24h_USD": "Perp turnover (USD)", "Derivatives_Exchange": "Derivatives source", "Derivatives_Context_Score": "Derivatives context",
             "PrePump_Score": "Pre-Pump score", "Pump_Potential_Score": "Legacy score (same value)",
             "Signal": "Signal / interpretation", "Risk_Level": "Risk flag", "Technical_Signal": "Technical reading",
         }
@@ -1126,7 +1203,7 @@ if not filtered.empty:
         st.dataframe(display_df, use_container_width=True, hide_index=True)
         st.caption("RSI is typically interpreted from 0–100: readings above 70 can indicate an overheated move; below 30 can indicate a heavily sold market. Context matters.")
 else:
-    st.info("No candidates match the current filters. Lower the minimum score or broaden the market coverage.")
+    st.info("No verified early-activity candidates match these filters yet. Calculate historical indicators or lower the minimum score to inspect unconfirmed setups.")
 
 # Alerts for sharp moves
 st.subheader("🔔 Unusual market moves")
@@ -1258,7 +1335,7 @@ if data_source == "CoinGecko market" and use_bybit_derivatives:
     st.divider()
     st.subheader("📈 Derivatives positioning — Funding Rate & Open Interest")
     st.caption(
-        "Bybit public USDT perpetual snapshot. Funding is the current periodic rate, not an annual yield. "
+        "Public USDT perpetual snapshot (Bybit, with Gate.io fallback). Funding is the current periodic rate, not an annual yield. "
         "Open interest is the notional value of outstanding contracts; it is not net money entering spot markets."
     )
     deriv = df[df.get("Funding_Rate_Percent", pd.Series(np.nan, index=df.index)).notna()].copy()
@@ -1270,7 +1347,7 @@ if data_source == "CoinGecko market" and use_bybit_derivatives:
         d2.metric("Positive funding", int((numeric(deriv["Funding_Rate_Percent"]) > 0).sum()))
         d3.metric("Negative funding", int((numeric(deriv["Funding_Rate_Percent"]) < 0).sum()))
         deriv_view = deriv.sort_values("Derivatives_Context_Score", ascending=False)
-        deriv_cols = [c for c in ["Coin", "Symbol", "Funding_Rate_Percent", "Open_Interest_USD", "Bybit_Turnover_24h_USD", "Bybit_Change_24h_Percent", "Derivatives_Context_Score", "PrePump_Score", "Signal"] if c in deriv_view.columns]
+        deriv_cols = [c for c in ["Coin", "Symbol", "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange", "Derivatives_Change_24h_Percent", "Derivatives_Context_Score", "PrePump_Score", "Signal"] if c in deriv_view.columns]
         st.dataframe(deriv_view[deriv_cols].head(60), use_container_width=True, hide_index=True)
         st.caption("Interpretation: very positive funding can indicate crowded longs; negative funding can indicate crowded shorts. Combine with price, volume and OI changes—one snapshot alone cannot confirm a squeeze or a pump.")
 

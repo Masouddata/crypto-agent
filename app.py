@@ -238,7 +238,13 @@ def technical_summary(prices, volumes=None):
     if len(p) < 30:
         return {"RSI_14": np.nan, "MACD": np.nan, "MACD_Signal": np.nan,
                 "Trend_7d_Percent": np.nan, "Technical_Score": np.nan,
-                "Technical_Signal": "Insufficient history"}
+                "Technical_Signal": "Insufficient history",
+                "Volume_24h_vs_7d_Avg": np.nan,
+                "Price_Range_7d_Percent": np.nan,
+                "Price_Range_Last24h_Percent": np.nan,
+                "Range_Compression_Ratio": np.nan,
+                "Higher_Low_24h_Percent": np.nan,
+                "Accumulation_Price_Score": np.nan}
     ema12 = p.ewm(span=12, adjust=False).mean()
     ema26 = p.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
@@ -270,13 +276,50 @@ def technical_summary(prices, volumes=None):
     volume_ratio = np.nan
     if volumes is not None:
         v = pd.to_numeric(pd.Series(volumes), errors="coerce").dropna()
-        # CoinGecko's total_volumes series is a rolling 24h market-volume snapshot.
-        # Compare the latest day of hourly snapshots with the preceding observations.
+        # CoinGecko total_volumes is a rolling 24h snapshot, not hourly traded volume.
         if len(v) >= 48:
             recent_volume = v.tail(24).median()
             baseline_volume = v.iloc[:-24].median()
             if pd.notna(baseline_volume) and baseline_volume > 0:
                 volume_ratio = float(recent_volume / baseline_volume)
+
+    # Accumulation structure proxy: compare the latest ~24 samples with the
+    # preceding ~24 samples. It is not wallet-level accumulation evidence.
+    range_7d_pct = range_24h_pct = compression_ratio = higher_low_pct = np.nan
+    compression_score = higher_low_score = np.nan
+    if len(p) >= 48:
+        recent = p.tail(24)
+        previous = p.iloc[-48:-24]
+        median_7d = float(p.median())
+        median_recent = float(recent.median())
+        if median_7d > 0 and median_recent > 0:
+            range_7d_pct = float((p.max() - p.min()) / median_7d * 100)
+            range_24h_pct = float((recent.max() - recent.min()) / median_recent * 100)
+            if range_7d_pct > 0:
+                compression_ratio = range_24h_pct / range_7d_pct
+                compression_score = (100 if compression_ratio <= 0.35 else
+                                     80 if compression_ratio <= 0.50 else
+                                     60 if compression_ratio <= 0.70 else
+                                     40 if compression_ratio <= 0.90 else 20)
+        previous_low = float(previous.min())
+        recent_low = float(recent.min())
+        if previous_low > 0:
+            higher_low_pct = (recent_low / previous_low - 1) * 100
+            higher_low_score = (100 if higher_low_pct >= 1.0 else
+                                80 if higher_low_pct >= 0.3 else
+                                60 if higher_low_pct >= 0 else
+                                30 if higher_low_pct >= -0.5 else 0)
+
+    rsi_structure_score = np.nan
+    if pd.notna(latest_rsi):
+        rsi_structure_score = (100 if 45 <= latest_rsi <= 60 else
+                               80 if 40 <= latest_rsi <= 65 else
+                               55 if 35 <= latest_rsi <= 70 else 20)
+    price_parts = [(compression_score, 0.45), (higher_low_score, 0.35), (rsi_structure_score, 0.20)]
+    price_weight = sum(weight for value, weight in price_parts if pd.notna(value))
+    accumulation_price_score = (sum(value * weight for value, weight in price_parts if pd.notna(value)) / price_weight
+                                if price_weight > 0 else np.nan)
+
     return {
         "RSI_14": round(float(latest_rsi), 2) if pd.notna(latest_rsi) else np.nan,
         "MACD": round(float(macd.iloc[-1]), 8),
@@ -285,6 +328,11 @@ def technical_summary(prices, volumes=None):
         "Technical_Score": round(score, 2),
         "Technical_Signal": signal_text,
         "Volume_24h_vs_7d_Avg": round(volume_ratio, 3) if pd.notna(volume_ratio) else np.nan,
+        "Price_Range_7d_Percent": round(range_7d_pct, 3) if pd.notna(range_7d_pct) else np.nan,
+        "Price_Range_Last24h_Percent": round(range_24h_pct, 3) if pd.notna(range_24h_pct) else np.nan,
+        "Range_Compression_Ratio": round(compression_ratio, 3) if pd.notna(compression_ratio) else np.nan,
+        "Higher_Low_24h_Percent": round(higher_low_pct, 3) if pd.notna(higher_low_pct) else np.nan,
+        "Accumulation_Price_Score": round(accumulation_price_score, 1) if pd.notna(accumulation_price_score) else np.nan,
     }
 
 
@@ -391,6 +439,7 @@ def calculate_pre_pump_score(frame):
     net_buy = numeric(out.get("Net_Buy_USD", pd.Series(np.nan, index=out.index)))
     flow_available = buy_share.notna() & net_buy.notna()
     flow_score = ((buy_share - 50) * 4 + 50).clip(0, 100)
+    rsi_value = numeric(out.get("RSI_14", pd.Series(np.nan, index=out.index)))
     out["Buy_Flow_Score"] = flow_score.where(flow_available, np.nan)
     out["Buy_Flow_Status"] = np.select(
         [~flow_available, (net_buy > 0) & (buy_share >= 55), (net_buy > 0) & (buy_share > 50), net_buy < 0],
@@ -405,6 +454,47 @@ def calculate_pre_pump_score(frame):
         [100, 85, 75, 60, 45], default=15
     ), index=out.index, dtype=float).where(surge.notna(), np.nan)
     out["Volume_Acceleration_Score"] = surge_score
+
+    # Independent accumulation screen. This is kept separate from PrePump_Score
+    # so the existing seven-factor ranking remains comparable across versions.
+    price_structure = numeric(out.get("Accumulation_Price_Score", pd.Series(np.nan, index=out.index)))
+    flow_accumulation = flow_score.where(flow_available & (net_buy > 0), np.nan)
+    volume_accumulation = pd.Series(np.select(
+        [surge >= 2.0, surge >= 1.5, surge >= 1.2, surge >= 1.0],
+        [100, 85, 70, 50], default=20
+    ), index=out.index, dtype=float).where(surge.notna(), np.nan)
+    rsi_accumulation = pd.Series(np.select(
+        [rsi_value.between(45, 60), rsi_value.between(40, 65), rsi_value.between(35, 70)],
+        [100, 80, 55], default=20
+    ), index=out.index, dtype=float).where(rsi_value.notna(), np.nan)
+    # Weights: price structure 35, real net buying 35, volume expansion 20, RSI 10.
+    accumulation_parts = {
+        "Accumulation_Price_Score": (price_structure, 35.0),
+        "Accumulation_Flow_Score": (flow_accumulation, 35.0),
+        "Accumulation_Volume_Score": (volume_accumulation, 20.0),
+        "Accumulation_RSI_Score": (rsi_accumulation, 10.0),
+    }
+    accum_sum = pd.Series(0.0, index=out.index)
+    accum_weight = pd.Series(0.0, index=out.index)
+    for col, (values, weight) in accumulation_parts.items():
+        out[col] = values
+        accum_sum += values.fillna(0) * weight
+        accum_weight += values.notna().astype(float) * weight
+    out["Accumulation_Data_Coverage"] = accum_weight
+    out["Accumulation_Score"] = (accum_sum / accum_weight.replace(0, np.nan)).round(1)
+    positive_flow_for_accum = flow_available & (net_buy > 0) & (buy_share >= 52)
+    compressed_structure = numeric(out.get("Range_Compression_Ratio", pd.Series(np.nan, index=out.index))).le(0.70)
+    healthy_rsi = rsi_value.between(40, 65)
+    not_hot = (ch24 < 8) & (ch7 < 20)
+    out["Accumulation_Status"] = np.select(
+        [out["Accumulation_Score"].isna(),
+         (out["Accumulation_Score"] >= 75) & positive_flow_for_accum & compressed_structure & healthy_rsi & (surge >= 1.1) & not_hot & (market_cap >= 10_000_000) & (volume >= 300_000),
+         (out["Accumulation_Score"] >= 60) & compressed_structure & ~flow_available],
+        ["داده کافی برای ارزیابی انباشت نیست",
+         "نامزد انباشت: ساختار فشرده + خالص خرید مثبت",
+         "تراکم قیمت دیده می‌شود؛ خرید واقعی تأیید نشده"],
+        default="شواهد انباشت هنوز کافی نیست"
+    )
 
     # 3) Price momentum (15%): modest positive momentum is preferred over an already vertical move.
     momentum_score = (50 + 3.0 * ch24.clip(-10, 8) + 1.0 * ch7.clip(-20, 15)).clip(0, 100)
@@ -1038,8 +1128,8 @@ def cryptometer_watchlist(results):
 # HEADER
 # =========================================================
 st.title("📡 Crypto Intelligence Scanner Pro")
-st.caption("Broad market scan • Strict early-activity ranking • Volume expansion • Derivatives context • Risk flags")
-st.caption("Build 2026-11-07.6 • Conservative seven-factor strategy • Stablecoins excluded")
+st.caption("Broad market scan • Pre-pump ranking • Accumulation structure radar • Volume expansion • Risk flags")
+st.caption("Build 2026-11-07.7 • Seven-factor Pre-Pump + independent accumulation radar • Stablecoins excluded")
 st.warning(
     "امتیازها ابزار غربالگری‌اند، نه احتمال قطعی پامپ یا توصیه مالی. داده‌های ناقص به‌عنوان سیگنال مثبت فرض نمی‌شوند؛ درصد پوشش شواهد را کنار امتیاز ببین."
 )
@@ -1220,13 +1310,18 @@ if data_source == "CoinGecko market" and technical_limit > 0 and run_technicals:
             item.update({"RSI_14": np.nan, "MACD": np.nan, "MACD_Signal": np.nan,
                          "Trend_7d_Percent": np.nan, "Technical_Score": np.nan,
                          "Technical_Signal": f"API unavailable: {str(exc)[:80]}",
-                         "Volume_24h_vs_7d_Avg": np.nan})
+                         "Volume_24h_vs_7d_Avg": np.nan,
+                         "Price_Range_7d_Percent": np.nan,
+                         "Price_Range_Last24h_Percent": np.nan,
+                         "Range_Compression_Ratio": np.nan,
+                         "Higher_Low_24h_Percent": np.nan,
+                         "Accumulation_Price_Score": np.nan})
         results.append(item)
         progress.progress(i / max(1, len(candidates)), text=f"Indicators {i}/{len(candidates)}")
     progress.empty()
     tech = pd.DataFrame(results).drop_duplicates("CoinGecko_ID")
     st.session_state["scanner_technical_results"] = {"currency": currency, "data": tech.copy()}
-    df = df.drop(columns=[c for c in ["RSI_14", "MACD", "MACD_Signal", "Trend_7d_Percent", "Technical_Score", "Technical_Signal", "Volume_24h_vs_7d_Avg"] if c in df.columns])
+    df = df.drop(columns=[c for c in ["RSI_14", "MACD", "MACD_Signal", "Trend_7d_Percent", "Technical_Score", "Technical_Signal", "Volume_24h_vs_7d_Avg", "Price_Range_7d_Percent", "Price_Range_Last24h_Percent", "Range_Compression_Ratio", "Higher_Low_24h_Percent", "Accumulation_Price_Score"] if c in df.columns])
     df = df.merge(tech, on="CoinGecko_ID", how="left")
     # Legacy momentum blend retained for export compatibility; final ranking is recalculated below.
     market = numeric(df["Market_Momentum_Score"])
@@ -1243,7 +1338,7 @@ elif (data_source == "CoinGecko market" and technical_limit > 0
     if saved_tech.get("currency") == currency:
         tech = saved_tech.get("data", pd.DataFrame())
         if not tech.empty:
-            df = df.drop(columns=[c for c in ["RSI_14", "MACD", "MACD_Signal", "Trend_7d_Percent", "Technical_Score", "Technical_Signal", "Volume_24h_vs_7d_Avg"] if c in df.columns])
+            df = df.drop(columns=[c for c in ["RSI_14", "MACD", "MACD_Signal", "Trend_7d_Percent", "Technical_Score", "Technical_Signal", "Volume_24h_vs_7d_Avg", "Price_Range_7d_Percent", "Price_Range_Last24h_Percent", "Range_Compression_Ratio", "Higher_Low_24h_Percent", "Accumulation_Price_Score"] if c in df.columns])
             df = df.merge(tech, on="CoinGecko_ID", how="left")
             market = numeric(df["Market_Momentum_Score"])
             tech_score = numeric(df["Technical_Score"])
@@ -1273,7 +1368,7 @@ st.caption(
 st.info(
     "وزن‌ها: خرید واقعی ۳۰٪ • شتاب حجم ۲۰٪ • مومنتوم ۱۵٪ • نقدشوندگی ۱۵٪ • تکنیکال ۱۰٪ • رژیم BTC پنج درصد • خبر پنج درصد. "
     "داده ناموجود امتیاز مثبت نمی‌گیرد؛ امتیاز با وزن عواملِ واقعاً موجود نرمال می‌شود و پوشش شواهد جداگانه نشان داده می‌شود. "
-    "برای سیگنال Pre-Pump معتبر، خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه و شرایط مناسب بازار لازم است. OI و حجم معاملات به‌تنهایی ورود پول یا خرید نهنگ نیستند."
+    "رادار انباشت جداگانه فشردگی قیمت، کف‌های بالاتر، خرید خالص واقعی، حجم و RSI را می‌سنجد؛ فشردگی قیمت به‌تنهایی اثبات خرید نهنگ نیست. برای سیگنال Pre-Pump معتبر، خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه و شرایط مناسب بازار لازم است. OI و حجم معاملات به‌تنهایی ورود پول یا خرید نهنگ نیستند."
 )
 if data_source == "CoinGecko market" and use_bybit_derivatives:
     if bybit_status.startswith("matched"):
@@ -1307,6 +1402,35 @@ e, f, g = st.columns(3)
 e.metric("💰 Total 24h volume", fmt_money(numeric(df["Volume_24h"]).sum(), currency))
 f.metric("🛰️ Pre-pump watch", int(df["Signal"].astype(str).str.startswith("Pre-pump watch").sum()))
 g.metric("⚠️ High-risk / overheated", int(df["Risk_Level"].astype(str).str.startswith("High").sum()))
+
+st.divider()
+st.subheader("🧲 رادار انباشت قبل از شکست مقاومت")
+st.caption("این بخش جدا از امتیاز هفت‌عاملی است: فشردگی دامنه قیمت، کف‌های بالاتر، خرید خالص واقعی، شتاب حجم و RSI را می‌سنجد. فشردگی قیمت به‌تنهایی اثبات انباشت نهنگ‌ها نیست؛ برای تأیید خرید واقعی، داده خرید/فروش دلاری لازم است.")
+accumulation_view = df[~df["Is_Excluded_Asset"]].copy()
+if "Accumulation_Score" in accumulation_view.columns:
+    accumulation_view["Accumulation_Score"] = numeric(accumulation_view["Accumulation_Score"])
+    accumulation_view = accumulation_view[
+        accumulation_view["Accumulation_Score"].notna() &
+        (numeric(accumulation_view["Accumulation_Data_Coverage"]).fillna(0) >= 35)
+    ].sort_values(["Accumulation_Score", "Accumulation_Data_Coverage"], ascending=[False, False])
+    accumulation_cols = [c for c in [
+        "Coin", "Symbol", "Accumulation_Score", "Accumulation_Data_Coverage",
+        "Range_Compression_Ratio", "Higher_Low_24h_Percent", "Buy_Share_Percent",
+        "Net_Buy_USD", "Volume_24h_vs_7d_Avg", "RSI_14", "Accumulation_Status"
+    ] if c in accumulation_view.columns]
+    if not accumulation_view.empty and accumulation_cols:
+        accumulation_display = accumulation_view[accumulation_cols].head(20).rename(columns={
+            "Coin": "ارز", "Symbol": "نماد", "Accumulation_Score": "امتیاز انباشت",
+            "Accumulation_Data_Coverage": "پوشش داده انباشت٪", "Range_Compression_Ratio": "نسبت فشردگی دامنه",
+            "Higher_Low_24h_Percent": "تغییر کف ۲۴ساعته٪", "Buy_Share_Percent": "سهم خرید واقعی٪",
+            "Net_Buy_USD": "خالص خرید دلاری", "Volume_24h_vs_7d_Avg": "حجم ۲۴ساعت / مبنا",
+            "RSI_14": "RSI", "Accumulation_Status": "تفسیر وضعیت"
+        })
+        st.dataframe(accumulation_display, use_container_width=True, hide_index=True)
+    else:
+        st.info("برای محاسبه رادار انباشت، ابتدا از تنظیمات کناری دکمه «Calculate technical indicators» را اجرا کن.")
+else:
+    st.info("ستون‌های لازم برای ارزیابی انباشت هنوز موجود نیستند.")
 
 st.divider()
 st.subheader("🛰️ Pre-pump candidates — before the big move")
@@ -1365,6 +1489,8 @@ if not filtered.empty:
         preferred_cols = [
             "Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent",
             "Volume_24h", "Volume_to_Market_Cap", "Volume_Activity_Score", "Price_Still_Quiet_Score",
+            "Accumulation_Score", "Accumulation_Data_Coverage", "Accumulation_Status",
+            "Range_Compression_Ratio", "Higher_Low_24h_Percent",
             "Volume_24h_vs_7d_Avg", "Volume_Acceleration_Score", "Market_Cap_Rank", "RSI_14", "Technical_PrePump_Score",
             "Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent", "Buy_Flow_Status",
             "Momentum_Factor_Score", "Liquidity_Quality_Score", "BTC_Market_Context", "BTC_Regime_Score", "News_Factor_Score", "Evidence_Coverage_Percent",
@@ -1377,7 +1503,10 @@ if not filtered.empty:
             "Change_24h_Percent": "24h change (%)", "Change_7d_Percent": "7d change (%)",
             "Volume_24h": f"24h volume ({currency.upper()})", "Market_Cap_Rank": "Market rank",
             "Volume_to_Market_Cap": "Volume / market cap", "Volume_Activity_Score": "Turnover activity",
-            "Price_Still_Quiet_Score": "Price still quiet", "Volume_24h_vs_7d_Avg": "24h volume vs 7d baseline",
+            "Price_Still_Quiet_Score": "Price still quiet", "Accumulation_Score": "امتیاز انباشت",
+            "Accumulation_Data_Coverage": "پوشش داده انباشت (%)", "Accumulation_Status": "وضعیت انباشت",
+            "Range_Compression_Ratio": "نسبت فشردگی دامنه", "Higher_Low_24h_Percent": "تغییر کف ۲۴ساعته (%)",
+            "Volume_24h_vs_7d_Avg": "24h volume vs 7d baseline",
             "Volume_Acceleration_Score": "Volume acceleration score", "Momentum_Factor_Score": "Momentum score",
             "Liquidity_Quality_Score": "Liquidity score", "BTC_Regime_Score": "BTC regime score",
             "News_Factor_Score": "News score", "Evidence_Coverage_Percent": "Evidence coverage (%)",

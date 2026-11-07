@@ -739,9 +739,10 @@ CRYPTOMETER_API = "https://api.cryptometer.io"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_cryptometer(endpoint: str, params: dict, api_key: str):
-    """Fetch one CryptoMeter endpoint. The API key is never included in UI errors."""
+    """Fetch one CryptoMeter endpoint and safely report API errors."""
     query = dict(params or {})
     query["api_key"] = api_key
+
     try:
         response = requests.get(
             f"{CRYPTOMETER_API}/{endpoint.strip('/')}/",
@@ -749,16 +750,28 @@ def fetch_cryptometer(endpoint: str, params: dict, api_key: str):
             timeout=25,
         )
     except requests.RequestException as exc:
-        raise RuntimeError(f"Network error while calling CryptoMeter: {exc.__class__.__name__}") from None
+        raise RuntimeError(
+            f"Network error while calling CryptoMeter: {exc.__class__.__name__}"
+        ) from None
 
     if response.status_code in (401, 403):
-        raise RuntimeError("CryptoMeter rejected the key or this endpoint is not enabled for your plan (HTTP 401/403).")
+        raise RuntimeError(
+            "CryptoMeter rejected the API key or this endpoint is not enabled "
+            f"for your plan (HTTP {response.status_code})."
+        )
+
     if response.status_code == 429:
-        raise RuntimeError("CryptoMeter rate limit or monthly quota reached (HTTP 429).")
+        raise RuntimeError(
+            "CryptoMeter rate limit or monthly quota reached (HTTP 429)."
+        )
+
     if response.status_code >= 500:
-        raise RuntimeError(f"CryptoMeter server error (HTTP {response.status_code}). Try again later.")
+        raise RuntimeError(
+            f"CryptoMeter server error (HTTP {response.status_code}). Try again later."
+        )
+
     if not response.ok:
-           detail = (response.text or "").strip()
+        detail = (response.text or "").strip()
         if api_key:
             detail = detail.replace(api_key, "[REDACTED]")
         detail = " ".join(detail.split())[:300]
@@ -767,18 +780,30 @@ def fetch_cryptometer(endpoint: str, params: dict, api_key: str):
             f"{detail or 'No error details returned.'}"
         )
 
-
     try:
         payload = response.json()
     except ValueError:
-        raise RuntimeError("CryptoMeter returned a response that was not valid JSON.") from None
+        raise RuntimeError(
+            "CryptoMeter returned a response that was not valid JSON."
+        ) from None
 
     if isinstance(payload, dict):
         success = payload.get("success")
         error_flag = payload.get("error")
-        if str(success).strip().lower() == "false" or str(error_flag).strip().lower() == "true":
-            message = payload.get("message") or payload.get("msg") or payload.get("error_message")
-            raise RuntimeError(str(message or "CryptoMeter reported an API error.")[:240])
+        if (
+            str(success).strip().lower() == "false"
+            or str(error_flag).strip().lower() == "true"
+        ):
+            message = (
+                payload.get("message")
+                or payload.get("msg")
+                or payload.get("error_message")
+            )
+            safe_message = str(message or "CryptoMeter reported an API error.")
+            if api_key:
+                safe_message = safe_message.replace(api_key, "[REDACTED]")
+            raise RuntimeError(safe_message[:240])
+
     return payload
 
 

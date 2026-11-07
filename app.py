@@ -929,7 +929,7 @@ def cryptometer_watchlist(results):
 # =========================================================
 st.title("📡 Crypto Intelligence Scanner Pro")
 st.caption("Broad market scan • Strict early-activity ranking • Volume expansion • Derivatives context • Risk flags")
-st.caption("Build 2026-11-07.2 • Pre-pump filter v2 • Stablecoins excluded from candidate ranking")
+st.caption("Build 2026-11-07.3 • CryptoMeter API key variable aligned • Pre-pump filter v2")
 st.warning(
     "Scores are screening heuristics, not calibrated probabilities or financial advice. "
     "A high score does not guarantee a pump; low-liquidity tokens can be manipulated."

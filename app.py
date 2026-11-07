@@ -1107,6 +1107,13 @@ df = calculate_pre_pump_score(df)
 if data_source == "CoinGecko market" and use_bybit_derivatives:
     df = add_derivatives_score(df)
 
+# Always create this optional history column. It is absent when technical
+# history has not been fetched (or when the API returns no history).
+if "Volume_24h_vs_7d_Avg" not in df.columns:
+    df["Volume_24h_vs_7d_Avg"] = np.nan
+else:
+    df["Volume_24h_vs_7d_Avg"] = numeric(df["Volume_24h_vs_7d_Avg"])
+
 # =========================================================
 # MAIN FILTERS / KPIS
 # =========================================================
@@ -1158,6 +1165,8 @@ st.divider()
 st.subheader("🛰️ Pre-pump candidates — before the big move")
 st.caption("Stablecoins are excluded. A confirmed pre-pump watch now requires historical volume expansion; turnover-only setups are shown separately as unconfirmed research leads.")
 if not filtered.empty:
+    if "Volume_24h_vs_7d_Avg" not in filtered.columns:
+        filtered["Volume_24h_vs_7d_Avg"] = np.nan
     ranked = filtered.sort_values(["PrePump_Score", "Volume_24h_vs_7d_Avg"], ascending=[False, False], na_position="last").copy()
     confirmed = ranked[ranked["Signal"].astype(str).str.startswith("Pre-pump watch — volume confirmed")]
     early = ranked[ranked["Signal"].astype(str).str.startswith("Early activity")]

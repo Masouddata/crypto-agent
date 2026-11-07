@@ -758,7 +758,14 @@ def fetch_cryptometer(endpoint: str, params: dict, api_key: str):
     if response.status_code >= 500:
         raise RuntimeError(f"CryptoMeter server error (HTTP {response.status_code}). Try again later.")
     if not response.ok:
-        raise RuntimeError(f"CryptoMeter request failed (HTTP {response.status_code}). Check endpoint access and parameters.")
+           detail = (response.text or "").strip()
+        if api_key:
+            detail = detail.replace(api_key, "[REDACTED]")
+        detail = " ".join(detail.split())[:300]
+        raise RuntimeError(
+            f"CryptoMeter request failed (HTTP {response.status_code}): "
+            f"{detail or 'No error details returned.'}"
+        )
 
     try:
         payload = response.json()

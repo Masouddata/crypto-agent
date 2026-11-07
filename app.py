@@ -1377,9 +1377,14 @@ st.caption(
     "CryptoMeter feeds add market evidence to the CoinGecko scanner. A signal is a research watchlist, "
     "not a guaranteed pump prediction or an instruction to buy."
 )
-cm_key = secret_or_env("CRYPTOMETER_API_KEY")
+# CryptoMeter credential compatibility:
+# Prefer the dedicated variable; accept the user's existing Render API-secret variable as fallback.
+cm_key = (
+    secret_or_env("CRYPTOMETER_API_KEY")
+    or secret_or_env("CRYPTO_AGENT_BITQUERY_CLIENT_SECRET")
+)
 if not cm_key:
-    st.warning("CryptoMeter API key not found. Add CRYPTOMETER_API_KEY in Render → Environment, then save and redeploy.")
+    st.warning("CryptoMeter API credential not found. Add CRYPTOMETER_API_KEY or set CRYPTO_AGENT_BITQUERY_CLIENT_SECRET in Render → Environment, then save and redeploy.")
 else:
     cm_a, cm_b, cm_c = st.columns(3)
     with cm_a:

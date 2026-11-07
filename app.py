@@ -290,12 +290,12 @@ STABLECOIN_SYMBOLS = {
     "USDT", "USDC", "USDE", "USDS", "DAI", "FDUSD", "TUSD", "USDP",
     "USDD", "PYUSD", "USD1", "USDX", "USDSC", "GUSD", "FRAX",
     "LUSD", "USDB", "USDTB", "EURC", "EURS", "EUROC", "XAUT",
-    "PAXG", "USTC", "UST", "SUSD", "USDK", "USDF", "USD0",
+    "PAXG", "USTC", "UST", "SUSD", "USDK", "USDF", "USD0", "EURCV",
 }
 STABLECOIN_NAME_HINTS = (
     "tether", "usd coin", "usdc", "usdt", "first digital usd",
     "paypal usd", "trueusd", "pax dollar", "dai stablecoin",
-    "frax", "liquity usd", "staked usde", "ethena usde",
+    "frax", "liquity usd", "staked usde", "ethena usde", "euro coinvertible", "eur coinvertible",
     "stablecoin", "usd1", "usdd", "gemini dollar",
 )
 
@@ -308,6 +308,13 @@ def mark_stablecoins(frame):
     name_match = names.apply(lambda value: any(hint in value for hint in STABLECOIN_NAME_HINTS))
     id_match = ids.str.contains(r"tether|usd-coin|first-digital-usd|paypal-usd|true-usd|pax-dollar|dai$|frax|ethena-usde|usd1", regex=True, na=False)
     out["Is_Stablecoin"] = symbol_match | name_match | id_match
+
+    # Tokenized equities are not cryptocurrencies and should not compete in this ranking.
+    equity_hints = ("tokenized stock", "tokenised stock", "bstocks", "xstocks", "tracker certificate")
+    equity_name_match = names.apply(lambda value: any(hint in value for hint in equity_hints))
+    equity_symbol_match = symbols.str.endswith("B", na=False) & names.str.contains("stock|equity|share", na=False)
+    out["Is_Tokenized_Equity"] = equity_name_match | equity_symbol_match
+    out["Is_Excluded_Asset"] = out["Is_Stablecoin"] | out["Is_Tokenized_Equity"]
     return out
 
 
@@ -321,7 +328,7 @@ def calculate_pre_pump_score(frame):
     turnover = (volume / market_cap.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
     out["Volume_to_Market_Cap"] = turnover
 
-    eligible = ~out["Is_Stablecoin"]
+    eligible = ~out["Is_Excluded_Asset"]
     activity = turnover.where(eligible).rank(pct=True) * 100
     out["Volume_Activity_Score"] = activity.fillna(0).clip(0, 100)
 
@@ -382,13 +389,13 @@ def calculate_pre_pump_score(frame):
     watch_setup = (eligible & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
                    ch24.abs().le(7) & ch7.abs().le(18) & turnover.between(0.001, 0.15) & score.ge(60))
     out["Signal"] = np.select(
-        [out["Is_Stablecoin"], overheated, valid_setup, watch_setup, no_activity],
-        ["Excluded — stablecoin", "Already moving / abnormal volatility — caution",
+        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], overheated, valid_setup, watch_setup, no_activity],
+        ["Excluded — stablecoin", "Excluded — tokenized equity", "Already moving / abnormal volatility — caution",
          "Pre-pump watch — volume confirmed", "Early activity — needs volume confirmation",
          "Watch — historical volume missing"], default="Watch — not enough evidence")
     out["Risk_Level"] = np.select(
-        [out["Is_Stablecoin"], thin, overheated, extreme_turnover, missing_market],
-        ["Excluded — stablecoin", "High / thin market", "High / volatile", "High / abnormal turnover", "Incomplete market data"],
+        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], thin, overheated, extreme_turnover, missing_market],
+        ["Excluded — stablecoin", "Excluded — tokenized equity", "High / thin market", "High / volatile", "High / abnormal turnover", "Incomplete market data"],
         default="Medium / review")
     return out
 
@@ -912,8 +919,8 @@ with st.sidebar:
             "Market coverage",
             options=[1, 2, 4, 8],
             format_func=lambda n: f"Up to {n * 250:,} market coins",
-            index=0,
-            help="More pages cover more listed coins but use more API requests and may hit rate limits.",
+            index=2,
+            help="Starts with up to 1,000 market coins. Reduce to 250 or 500 if CoinGecko rate limits occur.",
         )
         refresh_seconds = st.selectbox("Refresh interval", [60, 120, 300, 600], index=1)
         st_autorefresh(interval=refresh_seconds * 1000, key="scanner_refresh")
@@ -927,9 +934,9 @@ with st.sidebar:
     )
     technical_limit = st.selectbox(
         "Coins for detailed technical indicators",
-        [0, 10, 20, 30],
-        index=1,
-        help="Historical price and volume history is fetched for the highest turnover-to-market-cap candidates. Start with 10 to limit API calls. 0 disables detailed indicators.",
+        [0, 10, 20, 30, 50],
+        index=3,
+        help="Fetches 7-day price and volume history for the highest turnover-to-market-cap candidates. 30 is a practical balance; 50 uses more API calls. 0 disables detailed indicators.",
     )
     run_technicals = st.button("Calculate technical indicators", type="primary")
     st.divider()
@@ -1144,7 +1151,7 @@ if search.strip():
 if "Market_Cap_Rank" in filtered.columns:
     rank_max = st.slider("Maximum market-cap rank", 10, max(10, int(pd.to_numeric(df.get("Market_Cap_Rank", pd.Series([250])), errors="coerce").max() or 250)), value=min(250, max(10, int(pd.to_numeric(df.get("Market_Cap_Rank", pd.Series([250])), errors="coerce").max() or 250))))
     filtered = filtered[pd.to_numeric(filtered["Market_Cap_Rank"], errors="coerce").fillna(rank_max + 1) <= rank_max]
-filtered = filtered[(numeric(filtered["PrePump_Score"]).fillna(0) >= min_score) & (~filtered["Is_Stablecoin"])]
+filtered = filtered[(numeric(filtered["PrePump_Score"]).fillna(0) >= min_score) & (~filtered["Is_Excluded_Asset"])]
 
 if filtered.empty:
     st.info("No coins match these filters. Lower the minimum score or broaden your search.")

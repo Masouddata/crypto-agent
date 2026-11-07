@@ -375,7 +375,7 @@ def _btc_market_context(frame):
     return 0.0, "BTC neutral / mixed"
 
 def calculate_pre_pump_score(frame):
-    """Strict early-activity screen. A confirmed watch requires historical volume expansion."""
+    """Conservative seven-factor early-activity score; missing evidence is not bullish."""
     out = mark_stablecoins(frame)
     out = attach_actual_buy_sell_flow(out)
     ch24 = numeric(out.get("Change_24h_Percent", pd.Series(np.nan, index=out.index)))
@@ -384,52 +384,12 @@ def calculate_pre_pump_score(frame):
     market_cap = numeric(out.get("Market_Cap", pd.Series(np.nan, index=out.index)))
     turnover = (volume / market_cap.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
     out["Volume_to_Market_Cap"] = turnover
-
     eligible = ~out["Is_Excluded_Asset"]
-    activity = turnover.where(eligible).rank(pct=True) * 100
-    out["Volume_Activity_Score"] = activity.fillna(0).clip(0, 100)
 
-    # Price must still be relatively quiet; missing price changes are not treated as proof.
-    abs24, abs7 = ch24.abs(), ch7.abs()
-    quiet24 = pd.Series(np.select([abs24 <= 2, abs24 <= 4, abs24 <= 7], [100, 75, 35], default=0), index=out.index, dtype=float)
-    quiet7 = pd.Series(np.select([abs7 <= 5, abs7 <= 12, abs7 <= 20], [100, 75, 35], default=0), index=out.index, dtype=float)
-    quiet24 = quiet24.where(ch24.notna(), 0)
-    quiet7 = quiet7.where(ch7.notna(), 0)
-    out["Price_Still_Quiet_Score"] = (0.45 * quiet24 + 0.55 * quiet7).clip(0, 100)
-
-    cap_score = pd.Series(np.select([market_cap >= 250_000_000, market_cap >= 75_000_000,
-                                     market_cap >= 20_000_000, market_cap >= 10_000_000],
-                                    [100, 85, 70, 50], default=0), index=out.index, dtype=float)
-    vol_score = pd.Series(np.select([volume >= 10_000_000, volume >= 2_000_000,
-                                     volume >= 500_000, volume >= 300_000],
-                                    [100, 85, 65, 45], default=0), index=out.index, dtype=float)
-    out["Liquidity_Quality_Score"] = (0.55 * cap_score + 0.45 * vol_score).clip(0, 100)
-
-    rsi_value = numeric(out.get("RSI_14", pd.Series(np.nan, index=out.index)))
-    macd = numeric(out.get("MACD", pd.Series(np.nan, index=out.index)))
-    macd_signal = numeric(out.get("MACD_Signal", pd.Series(np.nan, index=out.index)))
-    tech = (100 - (rsi_value - 55).abs() * 2.0).clip(0, 100)
-    tech = pd.Series(tech, index=out.index).fillna(45)
-    tech += np.where(macd.notna() & macd_signal.notna(), np.where(macd > macd_signal, 10, -10), 0)
-    tech = tech.clip(0, 100)
-    surge = numeric(out.get("Volume_24h_vs_7d_Avg", pd.Series(np.nan, index=out.index)))
-    surge_score = pd.Series(np.select([surge >= 3, surge >= 2, surge >= 1.5, surge >= 1.2],
-                                      [100, 85, 70, 50], default=0), index=out.index, dtype=float)
-    # Missing volume history gets a neutral-low score, never a positive confirmation.
-    surge_score = surge_score.where(surge.notna(), 25)
-    out["Technical_PrePump_Score"] = (0.65 * tech + 0.35 * surge_score).clip(0, 100)
-
-    turnover_score = pd.Series(np.select([turnover >= 0.005, turnover >= 0.0025,
-                                          turnover >= 0.001], [90, 75, 55], default=10),
-                               index=out.index, dtype=float)
-    out["Turnover_Quality_Score"] = turnover_score
-    # Base screen is provisional until genuine buy/sell USD data is available.
-    base_raw = (0.25 * out["Volume_Activity_Score"] + 0.25 * out["Price_Still_Quiet_Score"] +
-                0.25 * out["Liquidity_Quality_Score"] + 0.25 * out["Technical_PrePump_Score"])
+    # 1) REAL reported buy/sell traded volume (30%). Never infer it from trade counts.
     buy_share = numeric(out.get("Buy_Share_Percent", pd.Series(np.nan, index=out.index)))
     net_buy = numeric(out.get("Net_Buy_USD", pd.Series(np.nan, index=out.index)))
     flow_available = buy_share.notna() & net_buy.notna()
-    # Buy-side dominance score: 50 is balanced, >50 is net buying, <50 is net selling.
     flow_score = ((buy_share - 50) * 4 + 50).clip(0, 100)
     out["Buy_Flow_Score"] = flow_score.where(flow_available, np.nan)
     out["Buy_Flow_Status"] = np.select(
@@ -437,39 +397,110 @@ def calculate_pre_pump_score(frame):
         ["حجم خرید/فروش واقعی دریافت نشده", "غلبه خرید واقعی", "خرید کمی بیشتر از فروش", "غلبه فروش واقعی"],
         default="خرید و فروش تقریباً متعادل"
     )
-    # When flow is present it receives 35% of the score; otherwise show a provisional
-    # score from the other evidence, but never call it a confirmed pre-pump setup.
-    raw = base_raw.where(~flow_available, 0.65 * base_raw + 0.35 * flow_score)
+
+    # 2) Volume acceleration vs the coin's own 7-day baseline (20%).
+    surge = numeric(out.get("Volume_24h_vs_7d_Avg", pd.Series(np.nan, index=out.index)))
+    surge_score = pd.Series(np.select(
+        [surge >= 3, surge >= 2, surge >= 1.5, surge >= 1.2, surge >= 1.0],
+        [100, 85, 75, 60, 45], default=15
+    ), index=out.index, dtype=float).where(surge.notna(), np.nan)
+    out["Volume_Acceleration_Score"] = surge_score
+
+    # 3) Price momentum (15%): modest positive momentum is preferred over an already vertical move.
+    momentum_score = (50 + 3.0 * ch24.clip(-10, 8) + 1.0 * ch7.clip(-20, 15)).clip(0, 100)
+    out["Momentum_Factor_Score"] = momentum_score.where(ch24.notna() & ch7.notna(), np.nan)
+
+    # 4) Liquidity / market quality (15%).
+    cap_score = pd.Series(np.select(
+        [market_cap >= 250_000_000, market_cap >= 75_000_000, market_cap >= 20_000_000, market_cap >= 10_000_000],
+        [100, 85, 70, 50], default=15
+    ), index=out.index, dtype=float).where(market_cap.notna(), np.nan)
+    vol_score = pd.Series(np.select(
+        [volume >= 10_000_000, volume >= 2_000_000, volume >= 500_000, volume >= 300_000],
+        [100, 85, 65, 45], default=15
+    ), index=out.index, dtype=float).where(volume.notna(), np.nan)
+    liquidity_score = (0.55 * cap_score + 0.45 * vol_score)
+    out["Liquidity_Quality_Score"] = liquidity_score
+    out["Volume_Activity_Score"] = (turnover.rank(pct=True) * 100).where(turnover.notna(), np.nan)
+
+    # 5) Technical analysis (10%). RSI/MACD are not fabricated when history is missing.
+    tech = numeric(out.get("Technical_Score", pd.Series(np.nan, index=out.index)))
+    rsi_value = numeric(out.get("RSI_14", pd.Series(np.nan, index=out.index)))
+    macd = numeric(out.get("MACD", pd.Series(np.nan, index=out.index)))
+    macd_signal = numeric(out.get("MACD_Signal", pd.Series(np.nan, index=out.index)))
+    derived_tech = (100 - (rsi_value - 58).abs() * 2.2).clip(0, 100)
+    derived_tech = derived_tech + np.where(macd.notna() & macd_signal.notna(), np.where(macd > macd_signal, 10, -10), 0)
+    derived_tech = pd.Series(derived_tech, index=out.index).clip(0, 100)
+    tech = tech.where(tech.notna(), derived_tech.where(rsi_value.notna() | (macd.notna() & macd_signal.notna())))
+    out["Technical_PrePump_Score"] = tech
+
+    # 6) BTC regime (5%): market-wide risk filter, not an altcoin-specific catalyst.
     btc_adjustment, btc_context = _btc_market_context(out)
     out["BTC_Market_Context"] = btc_context
-    raw = (raw + btc_adjustment).clip(0, 100)
+    btc_score_value = 55.0 + btc_adjustment * 3.0
+    out["BTC_Regime_Score"] = btc_score_value
+
+    # 7) News / fundamentals (5%): only use a supplied/API-computed 0-100 score.
+    news_score = numeric(out.get("News_Score", pd.Series(np.nan, index=out.index))).clip(0, 100)
+    out["News_Factor_Score"] = news_score
+
+    weights = {
+        "Buy_Flow_Score": 30.0,
+        "Volume_Acceleration_Score": 20.0,
+        "Momentum_Factor_Score": 15.0,
+        "Liquidity_Quality_Score": 15.0,
+        "Technical_PrePump_Score": 10.0,
+        "BTC_Regime_Score": 5.0,
+        "News_Factor_Score": 5.0,
+    }
+    weighted_sum = pd.Series(0.0, index=out.index)
+    available_weight = pd.Series(0.0, index=out.index)
+    for column, weight in weights.items():
+        value = numeric(out[column])
+        present = value.notna()
+        weighted_sum = weighted_sum + value.fillna(0) * weight
+        available_weight = available_weight + present.astype(float) * weight
+    # Renormalize only over observed evidence; publish coverage so a 90 with 40% coverage
+    # cannot be mistaken for a fully researched 90. Missing factors are never treated as positive.
+    out["Evidence_Coverage_Percent"] = available_weight.round(1)
+    raw_score = (weighted_sum / available_weight.replace(0, np.nan)).clip(0, 100)
+
+    abs24, abs7 = ch24.abs(), ch7.abs()
+    quiet24 = pd.Series(np.select([abs24 <= 2, abs24 <= 4, abs24 <= 7], [100, 75, 35], default=0), index=out.index, dtype=float).where(ch24.notna(), np.nan)
+    quiet7 = pd.Series(np.select([abs7 <= 5, abs7 <= 12, abs7 <= 20], [100, 75, 35], default=0), index=out.index, dtype=float).where(ch7.notna(), np.nan)
+    out["Price_Still_Quiet_Score"] = (0.45 * quiet24 + 0.55 * quiet7)
 
     overheated = (ch24 >= 8) | (ch7 >= 20) | (ch24 <= -18) | (ch7 <= -35)
     thin = (market_cap.fillna(0) < 10_000_000) | (volume.fillna(0) < 300_000)
     missing_market = market_cap.isna() | volume.isna() | ch24.isna() | ch7.isna()
-    no_activity = surge.isna() | (surge < 1.2)
+    no_acceleration = surge.isna() | (surge < 1.2)
     extreme_turnover = turnover > 0.20
     penalty = (np.where(overheated, 22, 0) + np.where(thin, 30, 0) +
                np.where(missing_market, 20, 0) + np.where(extreme_turnover, 20, 0) +
-               np.where(no_activity, 10, 0))
+               np.where(no_acceleration, 10, 0))
     out["PrePump_Risk_Penalty"] = penalty
-    score = (raw - penalty).clip(0, 100).where(eligible, 0)
+    score = (raw_score - penalty).clip(0, 100).where(eligible, 0)
     out["PrePump_Score"] = score.round(1)
     out["Pump_Potential_Score"] = out["PrePump_Score"]
 
     positive_flow = flow_available & (net_buy > 0) & (buy_share >= 52)
+    strong_coverage = available_weight >= 75
+    btc_not_bearish = btc_context not in ("BTC weak — risk-off", "BTC mildly weak")
     valid_setup = (eligible & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
                    ch24.abs().le(5) & ch7.abs().le(12) & surge.ge(1.5) &
-                   turnover.between(0.001, 0.15) & score.ge(70) & positive_flow)
+                   turnover.between(0.001, 0.15) & score.ge(70) & positive_flow &
+                   rsi_value.between(40, 68) & strong_coverage & btc_not_bearish)
     watch_setup = (eligible & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
-                   ch24.abs().le(7) & ch7.abs().le(18) & turnover.between(0.001, 0.15) & score.ge(60))
+                   ch24.abs().le(7) & ch7.abs().le(18) & turnover.between(0.001, 0.15) & score.ge(55))
     out["Signal"] = np.select(
         [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], overheated, valid_setup,
-         watch_setup & ~flow_available, watch_setup & flow_available & ~positive_flow, watch_setup],
+         watch_setup & ~flow_available, watch_setup & flow_available & ~positive_flow,
+         watch_setup & ~surge.notna(), watch_setup],
         ["Excluded — stablecoin", "Excluded — tokenized equity", "Already moving / abnormal volatility — caution",
          "Pre-pump watch — real buying + volume confirmed",
          "Early activity — real buy/sell data missing",
          "Early activity — buy pressure not confirmed",
+         "Early activity — volume history missing",
          "Early activity — monitor"], default="Watch — not enough evidence")
     out["Risk_Level"] = np.select(
         [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], thin, overheated, extreme_turnover, missing_market],
@@ -801,11 +832,9 @@ def add_derivatives_score(frame):
     out["Funding_Positioning_Score"] = funding_score.round(1)
     has_derivatives = funding.notna() | oi.notna()
     out["Derivatives_Context_Score"] = (0.55 * oi_score + 0.45 * funding_score).round(1)
-    base = numeric(out.get("PrePump_Score", pd.Series(np.nan, index=out.index)))
-    if base.notna().any():
-        combined = 0.92 * base + 0.08 * out["Derivatives_Context_Score"]
-        out["PrePump_Score"] = combined.where(has_derivatives, base).clip(0, 100).round(1)
-        out["Pump_Potential_Score"] = out["PrePump_Score"]
+    # Derivatives are a separate positioning/risk overlay; they are not part of the
+    # agreed seven-factor score and must not overwrite its fixed weights.
+    out["Derivatives_Data_Available"] = has_derivatives
     return out
 
 
@@ -1010,16 +1039,15 @@ def cryptometer_watchlist(results):
 # =========================================================
 st.title("📡 Crypto Intelligence Scanner Pro")
 st.caption("Broad market scan • Strict early-activity ranking • Volume expansion • Derivatives context • Risk flags")
-st.caption("Build 2026-11-07.5 • Real buy-flow integrated into Pre-Pump ranking • Stablecoins excluded")
+st.caption("Build 2026-11-07.6 • Conservative seven-factor strategy • Stablecoins excluded")
 st.warning(
-    "Scores are screening heuristics, not calibrated probabilities or financial advice. "
-    "A high score does not guarantee a pump; low-liquidity tokens can be manipulated."
+    "امتیازها ابزار غربالگری‌اند، نه احتمال قطعی پامپ یا توصیه مالی. داده‌های ناقص به‌عنوان سیگنال مثبت فرض نمی‌شوند؛ درصد پوشش شواهد را کنار امتیاز ببین."
 )
 with st.expander("📘 Quick guide — how to read the scanner", expanded=True):
     guide_a, guide_b, guide_c = st.columns(3)
-    guide_a.markdown("**1. Pre-Pump Score (0–100)**\n\nA strict evidence score combining quiet price action, turnover, market quality and optional historical volume expansion. It is **not** a pump probability.")
-    guide_b.markdown("**2. Signal**\n\n`Pre-pump watch — volume confirmed` requires historical volume expansion while price remains relatively quiet. `Early activity — needs confirmation` is not yet a verified setup.")
-    guide_c.markdown("**3. Risk**\n\nCheck liquidity, volume, volatility, and the project itself before drawing conclusions. Missing technical data means it has not been calculated.")
+    guide_a.markdown("**۱. امتیاز هفت‌عاملی**\n\nخرید واقعی ۳۰٪، شتاب حجم ۲۰٪، مومنتوم ۱۵٪، نقدشوندگی ۱۵٪، تکنیکال ۱۰٪، وضعیت BTC پنج درصد و خبر پنج درصد. عواملِ بدون داده از محاسبه کنار می‌روند و پوشش شواهد نمایش داده می‌شود.")
+    guide_b.markdown("**۲. ورود ترکیبی و محافظه‌کارانه**\n\nورود اولیه حداکثر ۲۵٪ حجم موقعیت؛ ۷۵٪ باقی‌مانده فقط پس از شکست مقاومت و تثبیت با حجم مناسب. سیگنال Watch به معنی ورود نیست.")
+    guide_c.markdown("**۳. مدیریت ریسک**\n\nریسک پیشنهادی هر معامله حداکثر ۰٫۵٪ سرمایه؛ حداقل نسبت سود به زیان ۲ به ۱. اگر داده کافی یا حدضرر ساختاری نداریم، ورود صادر نمی‌شود.")
 
 # =========================================================
 # SIDEBAR
@@ -1243,9 +1271,9 @@ st.caption(
     f"Display refreshed: {pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S UTC')}"
 )
 st.info(
-    "امتیاز اولیه از فعالیت حجم، آرام بودن قیمت، نقدشوندگی و شاخص‌های تکنیکال ساخته می‌شود. "
-    "اگر داده واقعی خرید/فروش CryptoMeter قبلاً دریافت شده باشد، ۳۵٪ امتیاز به غلبه خرید واقعی اختصاص می‌یابد. "
-    "بدون این داده، سیگنال تأییدشده صادر نمی‌شود. حجم معاملات و Open Interest به‌تنهایی ورود پول خالص یا خرید نهنگ را ثابت نمی‌کنند."
+    "وزن‌ها: خرید واقعی ۳۰٪ • شتاب حجم ۲۰٪ • مومنتوم ۱۵٪ • نقدشوندگی ۱۵٪ • تکنیکال ۱۰٪ • رژیم BTC پنج درصد • خبر پنج درصد. "
+    "داده ناموجود امتیاز مثبت نمی‌گیرد؛ امتیاز با وزن عواملِ واقعاً موجود نرمال می‌شود و پوشش شواهد جداگانه نشان داده می‌شود. "
+    "برای سیگنال Pre-Pump معتبر، خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه و شرایط مناسب بازار لازم است. OI و حجم معاملات به‌تنهایی ورود پول یا خرید نهنگ نیستند."
 )
 if data_source == "CoinGecko market" and use_bybit_derivatives:
     if bybit_status.startswith("matched"):
@@ -1282,12 +1310,39 @@ g.metric("⚠️ High-risk / overheated", int(df["Risk_Level"].astype(str).str.s
 
 st.divider()
 st.subheader("🛰️ Pre-pump candidates — before the big move")
-st.caption("استیبل‌کوین‌ها حذف شده‌اند. سیگنال تأییدشده علاوه بر آرام بودن قیمت و رشد حجم تاریخی، به غلبه حجم خرید واقعی بر فروش نیاز دارد. اگر داده خرید/فروش موجود نباشد، نتیجه فقط یک سرنخ اولیه است.")
+st.caption("استیبل‌کوین‌ها حذف شده‌اند. سیگنال معتبر نیازمند خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه، نقدشوندگی مناسب و بازار BTC غیرنزولی است. درصد پوشش نشان می‌دهد چه مقدار از هفت عامل واقعاً داده داشته‌اند.")
 if not filtered.empty:
     if "Volume_24h_vs_7d_Avg" not in filtered.columns:
         filtered["Volume_24h_vs_7d_Avg"] = np.nan
     ranked = filtered.sort_values(["PrePump_Score", "Volume_24h_vs_7d_Avg"], ascending=[False, False], na_position="last").copy()
-    confirmed = ranked[ranked["Signal"].astype(str).str.startswith("Pre-pump watch — volume confirmed")]
+    # Radar view of the leading candidates. Missing factors stay blank, not zero or a fabricated neutral.
+    radar_factors = [
+        ("Buy_Flow_Score", "خرید واقعی"),
+        ("Volume_Acceleration_Score", "شتاب حجم"),
+        ("Momentum_Factor_Score", "مومنتوم"),
+        ("Liquidity_Quality_Score", "نقدشوندگی"),
+        ("Technical_PrePump_Score", "تکنیکال"),
+        ("BTC_Regime_Score", "وضعیت BTC"),
+        ("News_Factor_Score", "اخبار"),
+    ]
+    radar_rows = ranked.head(3)
+    if not radar_rows.empty:
+        radar_fig = go.Figure()
+        theta = [label for _, label in radar_factors]
+        for _, radar_row in radar_rows.iterrows():
+            values = [float(radar_row[col]) if col in radar_row.index and pd.notna(radar_row[col]) else None for col, _ in radar_factors]
+            radar_fig.add_trace(go.Scatterpolar(
+                r=values, theta=theta, fill="toself", name=f"{radar_row.get('Symbol', '')}"
+            ))
+        radar_fig.update_layout(
+            title="مقایسه عوامل هفت‌گانه سه گزینه برتر",
+            polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+            template="plotly_white", height=420, margin=dict(l=35, r=35, t=55, b=35),
+            legend=dict(orientation="h", y=-0.15),
+        )
+        st.plotly_chart(radar_fig, width="stretch")
+        st.caption("هر محور فقط در صورت وجود داده رسم می‌شود؛ خالی بودن محور یعنی داده نداریم، نه اینکه امتیاز آن صفر یا ۵۰ باشد.")
+    confirmed = ranked[ranked["Signal"].astype(str).str.startswith("Pre-pump watch — real buying")]
     early = ranked[ranked["Signal"].astype(str).str.startswith("Early activity")]
     if not confirmed.empty:
         st.markdown("**Confirmed volume-expansion setups (historical data available)**")
@@ -1310,9 +1365,10 @@ if not filtered.empty:
         preferred_cols = [
             "Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent",
             "Volume_24h", "Volume_to_Market_Cap", "Volume_Activity_Score", "Price_Still_Quiet_Score",
-            "Volume_24h_vs_7d_Avg", "Market_Cap_Rank", "RSI_14", "Technical_PrePump_Score",
+            "Volume_24h_vs_7d_Avg", "Volume_Acceleration_Score", "Market_Cap_Rank", "RSI_14", "Technical_PrePump_Score",
             "Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent", "Buy_Flow_Status",
-            "BTC_Market_Context", "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange",
+            "Momentum_Factor_Score", "Liquidity_Quality_Score", "BTC_Market_Context", "BTC_Regime_Score", "News_Factor_Score", "Evidence_Coverage_Percent",
+            "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange",
             "Derivatives_Context_Score", "PrePump_Score", "Pump_Potential_Score", "Signal", "Risk_Level", "Technical_Signal",
         ]
         cols = [c for c in preferred_cols if c in ranked.columns]
@@ -1322,6 +1378,9 @@ if not filtered.empty:
             "Volume_24h": f"24h volume ({currency.upper()})", "Market_Cap_Rank": "Market rank",
             "Volume_to_Market_Cap": "Volume / market cap", "Volume_Activity_Score": "Turnover activity",
             "Price_Still_Quiet_Score": "Price still quiet", "Volume_24h_vs_7d_Avg": "24h volume vs 7d baseline",
+            "Volume_Acceleration_Score": "Volume acceleration score", "Momentum_Factor_Score": "Momentum score",
+            "Liquidity_Quality_Score": "Liquidity score", "BTC_Regime_Score": "BTC regime score",
+            "News_Factor_Score": "News score", "Evidence_Coverage_Percent": "Evidence coverage (%)",
             "RSI_14": "RSI (14)", "Technical_PrePump_Score": "Technical pre-pump",
              "Buy_Volume_USD": "حجم خرید واقعی (USDT)", "Sell_Volume_USD": "حجم فروش واقعی (USDT)",
             "Net_Buy_USD": "خالص خرید (USDT)", "Buy_Share_Percent": "سهم خرید (%)",
@@ -1333,9 +1392,22 @@ if not filtered.empty:
         }
         display_df = ranked[cols].rename(columns=display_names)
         st.dataframe(display_df, use_container_width=True, hide_index=True)
-        st.caption("RSI is typically interpreted from 0–100: readings above 70 can indicate an overheated move; below 30 can indicate a heavily sold market. Context matters.")
+        st.caption("RSI از صفر تا ۱۰۰ است: بالای ۷۰ می‌تواند نشانه داغ‌شدن حرکت و زیر ۳۰ نشانه فشار فروش شدید باشد؛ به‌تنهایی سیگنال خرید نیست. MACD بالای خط سیگنال یعنی مومنتوم صعودی‌تر، اما باید با حجم و ساختار قیمت تأیید شود.")
+        st.caption("روش ورود: ۲۵٪ اولیه فقط در ناحیه ساختاری مناسب؛ ۷۵٪ پس از شکست و تثبیت مقاومت. حدضرر پشت کف/حمایت ساختاری؛ اگر داده تاریخی برای تعیین آن نداریم، سطح ورود و خروج ساخته نمی‌شود. سقف ریسک هر معامله ۰٫۵٪ سرمایه و حداقل R/R برابر ۲ است.")
 else:
     st.info("No verified early-activity candidates match these filters yet. Calculate historical indicators or lower the minimum score to inspect unconfirmed setups.")
+
+# Separate watchlist for deeply declined assets (not mixed with pre-pump candidates).
+st.subheader("📉 ارزهای با بیشترین ریزش")
+st.caption("این فهرست فقط برای بررسی احتمال برگشت است؛ ریزش زیاد به‌تنهایی دلیل خرید نیست.")
+drop_view = df[~df["Is_Excluded_Asset"]].copy()
+drop_view["_drop_rank"] = numeric(drop_view["Change_7d_Percent"])
+drop_view = drop_view.dropna(subset=["_drop_rank"]).sort_values("_drop_rank").head(15)
+if not drop_view.empty:
+    drop_cols = [c for c in ["Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "RSI_14", "PrePump_Score", "Buy_Flow_Status", "Risk_Level"] if c in drop_view.columns]
+    st.dataframe(drop_view[drop_cols], width="stretch", hide_index=True)
+else:
+    st.info("داده کافی برای رتبه‌بندی ریزش هفتگی موجود نیست.")
 
 # Alerts for sharp moves
 st.subheader("🔔 Unusual market moves")

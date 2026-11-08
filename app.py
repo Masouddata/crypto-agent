@@ -676,6 +676,25 @@ def fetch_market_pages(currency, pages, api_key):
               "Market_Cap", "Market_Cap_Rank", "Circulating_Supply", "Total_Supply",
               "ATH_Change_Percent"]:
         df[c] = numeric(df[c])
+
+    # CoinGecko can omit the 24h percentage while still returning the absolute
+    # 24h price change. Reconstruct the percentage from those two documented
+    # market fields, but never replace a percentage already supplied by the API.
+    if "price_change_24h" in raw.columns:
+        absolute_24h = numeric(raw["price_change_24h"])
+        current_price = numeric(raw["current_price"])
+        previous_price = current_price - absolute_24h
+        fallback_24h = (absolute_24h / previous_price.replace(0, np.nan)) * 100
+        missing_24h = df["Change_24h_Percent"].isna() & fallback_24h.notna()
+        df.loc[missing_24h, "Change_24h_Percent"] = fallback_24h.loc[missing_24h]
+
+    # Accept alternate 7d field spellings if the API response supplies one.
+    for alt_7d in ["price_change_percentage_7d", "price_change_percentage_7d_in_currency"]:
+        if alt_7d in raw.columns:
+            fallback_7d = numeric(raw[alt_7d])
+            missing_7d = df["Change_7d_Percent"].isna() & fallback_7d.notna()
+            df.loc[missing_7d, "Change_7d_Percent"] = fallback_7d.loc[missing_7d]
+
     # Market-only preliminary score. It is explicitly not a calibrated probability.
     ch24 = df["Change_24h_Percent"].fillna(0)
     ch7 = df["Change_7d_Percent"].fillna(0)

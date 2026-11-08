@@ -89,6 +89,9 @@ small, .stMarkdown small { color: #465b75 !important; font-size: .86rem !importa
 [data-testid="stVerticalBlock"] { gap: .8rem; }
 [data-testid="stHorizontalBlock"] { gap: .85rem; }
 @media (max-width: 768px) {
+  /* CryptoMeter touch-submit sizing */
+  div[data-testid="stFormSubmitButton"] button { width: 100% !important; min-height: 3.2rem !important; touch-action: manipulation; }
+
   .block-container { padding: .85rem .65rem 1.8rem; }
   h1 { font-size: 1.45rem !important; }
   h2 { font-size: 1.2rem !important; }
@@ -96,7 +99,13 @@ small, .stMarkdown small { color: #465b75 !important; font-size: .86rem !importa
   [data-testid="stMarkdownContainer"] p, [data-testid="stCaptionContainer"] { font-size: .92rem !important; }
   [data-testid="stMetric"] { padding: 10px 11px !important; border-radius: 11px !important; }
   [data-testid="stMetricValue"] { font-size: 1.18rem !important; }
-  .stButton > button, .stDownloadButton > button { width: 100%; min-height: 2.85rem; }
+  .stButton > button, .stDownloadButton > button,
+  div[data-testid="stButton"] > button,
+  div[data-testid="stFormSubmitButton"] > button {
+    width: 100% !important; min-height: 3.15rem !important;
+    touch-action: manipulation !important; pointer-events: auto !important;
+    position: relative; z-index: 2; cursor: pointer;
+  }
   input, textarea, [data-baseweb="select"] > div { min-height: 2.85rem; }
   [data-testid="stDataFrame"] { overflow-x: auto; }
   div[data-testid="stRadio"] > div[role="radiogroup"] { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); }
@@ -1175,7 +1184,6 @@ with st.sidebar:
             help="Starts with up to 1,000 market coins. Reduce to 250 or 500 if CoinGecko rate limits occur.",
         )
         refresh_seconds = st.selectbox("فاصله به‌روزرسانی", [60, 120, 300, 600], index=1)
-        st_autorefresh(interval=refresh_seconds * 1000, key="scanner_refresh")
     uploaded = st.file_uploader("انتخاب فایل داده CSV", type=["csv"])
     st.divider()
     st.subheader("🔬 تحلیل تکنیکال")
@@ -1389,6 +1397,10 @@ section = st.radio(
     label_visibility="collapsed",
     key="scanner_section_navigation",
 )
+# Keep scheduled refreshes away from the CryptoMeter panel so they cannot
+# interrupt a user-initiated mobile/API request.
+if section != "🐋 جریان پول و مشتقات" and data_source == "CoinGecko market":
+    st_autorefresh(interval=refresh_seconds * 1000, key="scanner_refresh")
 st.caption({
     "🏠 نمای کلی": "خلاصه وضعیت بازار و شاخص‌های اصلی اسکنر",
     "🧲 رادار انباشت و پیش‌پامپ": "ارزهایی که نشانه‌های اولیه انباشت یا فعالیت پیش از رشد دارند",
@@ -1865,7 +1877,17 @@ if section == "🐋 جریان پول و مشتقات":
             "If your plan does not include an endpoint, leave it unselected."
         )
 
-        if st.button("🔄 Fetch CryptoMeter intelligence", type="primary", key="cm_fetch_button"):
+        st.caption("برای دریافت داده‌ها، دکمه زیر را لمس کن؛ هنگام دریافت، پیام انتظار نمایش داده می‌شود. در این بخش به‌روزرسانی خودکار موقتاً متوقف است.")
+        # Use Streamlit's form-submit event for a more reliable touch action on
+        # mobile browsers; unlike a normal button, the browser submits the form.
+        with st.form("cm_fetch_form", clear_on_submit=False):
+            cm_fetch_clicked = st.form_submit_button(
+                "🔄 Fetch CryptoMeter intelligence",
+                type="primary",
+                use_container_width=True,
+                help="درخواست فیدهای رایگان و فیدهای پولی انتخاب‌شده از CryptoMeter",
+            )
+        if cm_fetch_clicked:
             endpoint_jobs = {
                 "account": ("info", {}),
                 "trend": ("trend-indicator-v3", {}),

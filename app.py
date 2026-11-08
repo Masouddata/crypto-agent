@@ -22,150 +22,82 @@ st.set_page_config(
 st.markdown("""
 <style>
 :root {
-  --bg: #f7f9fc;
+  --bg: #f4f7fb;
   --panel: #ffffff;
-  --panel-soft: #f2f6fc;
-  --border: #dce5f0;
-  --text: #172b4d;
-  --muted: #62748b;
-  --blue: #2878ee;
-  --teal: #13a98f;
+  --panel-soft: #eaf1fa;
+  --border: #cbd8e8;
+  --text: #14243b;
+  --muted: #465b75;
+  --blue: #1769d2;
+  --teal: #087f6b;
 }
-.stApp {
-  background: linear-gradient(180deg, #ffffff 0%, #f5f8fd 100%);
-  color: var(--text);
+.stApp { background: #f4f7fb !important; color: #14243b !important; }
+[data-testid="stHeader"] { background: rgba(244,247,251,.98) !important; }
+[data-testid="stSidebar"] { background: #eaf1fa !important; border-right: 1px solid #cbd8e8; }
+[data-testid="stSidebar"] * { color: #14243b !important; }
+.block-container { width: 100%; max-width: 1600px; padding: 1.1rem 1.35rem 2.4rem; }
+h1,h2,h3,h4 { color: #102846 !important; font-weight: 800 !important; line-height: 1.35 !important; }
+h1 { font-size: 1.9rem !important; }
+h2 { font-size: 1.48rem !important; }
+h3 { font-size: 1.18rem !important; }
+h4 { font-size: 1.04rem !important; }
+.stMarkdown, [data-testid="stMarkdownContainer"] { color: #14243b !important; }
+[data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li,
+[data-testid="stWidgetLabel"], label, .stText, .stMarkdown p {
+  color: #243a55 !important; font-size: .96rem !important; line-height: 1.65 !important;
 }
-[data-testid="stHeader"] { background: rgba(255,255,255,.96); }
-[data-testid="stSidebar"] {
-  background: #f1f6fc;
-  border-right: 1px solid var(--border);
+[data-testid="stCaptionContainer"], .stCaption, [data-testid="stCaptionContainer"] * {
+  color: #465b75 !important; font-size: .88rem !important; line-height: 1.6 !important;
 }
-[data-testid="stSidebar"] * { color: var(--text) !important; }
-.block-container {
-  width: 100%;
-  max-width: 1600px;
-  padding: 1.5rem 1.5rem 2.5rem;
-}
-h1 { color: #14294a !important; font-size: 2rem !important; line-height: 1.25 !important; letter-spacing: -.025em; }
-h2 { color: #14294a !important; font-size: 1.5rem !important; }
-h3 { color: #18385f !important; font-size: 1.2rem !important; }
-h4 { color: #18385f !important; font-size: 1.05rem !important; }
-p, label, [data-testid="stMarkdownContainer"], [data-testid="stWidgetLabel"] {
-  color: var(--text) !important;
-  font-size: .96rem !important;
-  line-height: 1.55 !important;
-}
-[data-testid="stCaptionContainer"], .stCaption {
-  color: var(--muted) !important;
-  font-size: .84rem !important;
-}
-[data-testid="stMetric"] {
-  background: #ffffff;
-  border: 1px solid var(--border);
-  padding: 15px 16px;
-  border-radius: 14px;
-  box-shadow: 0 4px 14px rgba(27, 57, 93, .06);
-}
-[data-testid="stMetric"] label {
-  color: #526783 !important;
-  font-size: .88rem !important;
-  font-weight: 650 !important;
-}
-[data-testid="stMetricValue"] {
-  color: #14294a !important;
-  font-size: 1.55rem !important;
-  font-weight: 750 !important;
-}
-[data-testid="stMetricDelta"] { font-size: .82rem !important; }
-[data-testid="stDataFrame"], [data-testid="stTable"] {
-  background: #ffffff;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-}
+[data-testid="stMetric"] { background: #fff !important; border: 1px solid #cbd8e8 !important;
+  padding: 14px 16px !important; border-radius: 14px !important; box-shadow: 0 3px 12px rgba(25,55,90,.07); }
+[data-testid="stMetric"] label { color: #344c68 !important; font-weight: 700 !important; }
+[data-testid="stMetricValue"] { color: #102846 !important; font-size: 1.5rem !important; font-weight: 800 !important; }
+[data-testid="stMetricDelta"] { font-weight: 700 !important; }
+[data-testid="stDataFrame"], [data-testid="stTable"] { background: #fff !important; border: 1px solid #cbd8e8 !important; border-radius: 12px !important; overflow: hidden; }
 [data-testid="stDataFrame"] * { font-size: 13px !important; }
-[data-testid="stExpander"] {
-  background: #ffffff !important;
-  border: 1px solid #d5e2f1 !important;
-  border-radius: 12px !important;
-  overflow: hidden;
-}
-[data-testid="stExpander"] summary,
-[data-testid="stExpander"] summary p,
-[data-testid="stExpander"] summary span {
-  color: #18385f !important;
-  background: #f1f6fd !important;
-  font-size: .96rem !important;
-  font-weight: 700 !important;
-}
-[data-testid="stExpander"] details,
-[data-testid="stExpander"] > details > div {
-  background: #ffffff !important;
-  color: var(--text) !important;
-}
-.stButton > button, .stDownloadButton > button,
-[data-testid="stFormSubmitButton"] button {
-  min-height: 2.7rem;
-  padding: .55rem 1rem;
-  font-size: .94rem !important;
-  border-radius: 10px;
-  border: 1px solid #2878ee;
-  font-weight: 700;
-  background: linear-gradient(135deg, #2878ee, #1762cb);
-  color: #ffffff !important;
-}
-.stButton > button:hover, .stDownloadButton > button:hover {
-  border-color: #13a98f;
-  box-shadow: 0 0 0 3px rgba(19,169,143,.12);
-}
-input, textarea, [data-baseweb="select"] > div {
-  background-color: #ffffff !important;
-  color: #172b4d !important;
-  border: 1px solid #cbd8e7 !important;
-  border-radius: 10px !important;
-  font-size: .96rem !important;
-  min-height: 2.7rem;
-}
-input::placeholder, textarea::placeholder { color: #8292a8 !important; }
-[data-testid="stSlider"] [data-testid="stWidgetLabel"] {
-  color: #18385f !important;
-  font-size: .94rem !important;
-  font-weight: 650 !important;
-}
-[data-testid="stTabs"] button {
-  color: #526783 !important;
-  font-size: .94rem !important;
-  font-weight: 650;
-}
-[data-testid="stTabs"] button[aria-selected="true"] { color: #176bd8 !important; }
-[data-testid="stAlert"] {
-  background: #f0f8f6;
-  border: 1px solid #bfe9dd;
-  border-radius: 11px;
-  color: #175f51 !important;
-  font-size: .94rem;
-}
-[data-testid="stProgressBar"] > div > div {
-  background: linear-gradient(90deg, #2878ee, #13b89a);
-}
-hr { border-color: #e1e8f1; margin: 1rem 0; }
-a { color: #176bd8 !important; }
-small, .stMarkdown small { color: var(--muted); font-size: .84rem; }
-[data-testid="stVerticalBlock"] { gap: .85rem; }
-[data-testid="stHorizontalBlock"] { gap: .9rem; }
-
-/* Mobile layout: readable type, full-width controls, and tighter gutters. */
+[data-testid="stExpander"] { background: #fff !important; border: 1px solid #cbd8e8 !important; border-radius: 12px !important; overflow: hidden; }
+[data-testid="stExpander"] summary, [data-testid="stExpander"] summary p,
+[data-testid="stExpander"] summary span { color: #102846 !important; background: #eaf1fa !important;
+  font-size: .98rem !important; font-weight: 800 !important; }
+[data-testid="stExpander"] details, [data-testid="stExpander"] > details > div { background: #fff !important; color: #14243b !important; }
+.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] button {
+  min-height: 2.65rem; padding: .55rem 1rem; font-size: .94rem !important; border-radius: 10px;
+  border: 1px solid #1769d2; font-weight: 750; background: #1769d2; color: #fff !important; }
+.stButton > button:hover, .stDownloadButton > button:hover { background: #0e55b4; border-color: #087f6b; box-shadow: 0 0 0 3px rgba(8,127,107,.13); }
+input, textarea, [data-baseweb="select"] > div { background: #fff !important; color: #14243b !important;
+  border: 1px solid #b9c9dc !important; border-radius: 10px !important; font-size: .96rem !important; min-height: 2.65rem; }
+input::placeholder, textarea::placeholder { color: #60748d !important; opacity: 1 !important; }
+[data-testid="stSlider"] [data-testid="stWidgetLabel"] { color: #243a55 !important; font-weight: 750 !important; }
+[data-testid="stRadio"] label, [data-testid="stCheckbox"] label { color: #243a55 !important; }
+/* Icon navigation: clear selected state and touch-friendly targets. */
+div[data-testid="stRadio"] > div[role="radiogroup"] { gap: .45rem; flex-wrap: wrap; }
+ div[data-testid="stRadio"] > div[role="radiogroup"] label { background: #fff !important; border: 1px solid #c5d3e3 !important;
+  border-radius: 12px !important; padding: .5rem .85rem !important; min-height: 2.8rem; }
+div[data-testid="stRadio"] > div[role="radiogroup"] label:has(input:checked) { background: #dceaff !important;
+  border: 1.5px solid #1769d2 !important; box-shadow: 0 2px 8px rgba(23,105,210,.12); }
+div[data-testid="stRadio"] > div[role="radiogroup"] label p { color: #173653 !important; font-weight: 750 !important; }
+[data-testid="stAlert"] { border-radius: 11px !important; font-size: .94rem !important; }
+[data-testid="stAlert"] p { color: #18334f !important; }
+[data-testid="stProgressBar"] > div > div { background: linear-gradient(90deg, #1769d2, #087f6b); }
+hr { border-color: #d6e0ec !important; margin: .9rem 0 !important; }
+a { color: #075fbd !important; font-weight: 650; }
+small, .stMarkdown small { color: #465b75 !important; font-size: .86rem !important; }
+[data-testid="stVerticalBlock"] { gap: .8rem; }
+[data-testid="stHorizontalBlock"] { gap: .85rem; }
 @media (max-width: 768px) {
-  .block-container { padding: 1rem .75rem 2rem; }
-  h1 { font-size: 1.5rem !important; }
-  h2 { font-size: 1.25rem !important; }
-  h3 { font-size: 1.08rem !important; }
-  p, label, [data-testid="stMarkdownContainer"] { font-size: .93rem !important; }
-  [data-testid="stMetric"] { padding: 11px 12px; border-radius: 12px; }
-  [data-testid="stMetricValue"] { font-size: 1.25rem !important; }
-  .stButton > button, .stDownloadButton > button { width: 100%; min-height: 2.9rem; }
-  input, textarea, [data-baseweb="select"] > div { min-height: 2.9rem; }
+  .block-container { padding: .85rem .65rem 1.8rem; }
+  h1 { font-size: 1.45rem !important; }
+  h2 { font-size: 1.2rem !important; }
+  h3 { font-size: 1.05rem !important; }
+  [data-testid="stMarkdownContainer"] p, [data-testid="stCaptionContainer"] { font-size: .92rem !important; }
+  [data-testid="stMetric"] { padding: 10px 11px !important; border-radius: 11px !important; }
+  [data-testid="stMetricValue"] { font-size: 1.18rem !important; }
+  .stButton > button, .stDownloadButton > button { width: 100%; min-height: 2.85rem; }
+  input, textarea, [data-baseweb="select"] > div { min-height: 2.85rem; }
   [data-testid="stDataFrame"] { overflow-x: auto; }
+  div[data-testid="stRadio"] > div[role="radiogroup"] { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); }
+  div[data-testid="stRadio"] > div[role="radiogroup"] label { justify-content: center; }
 }
 </style>
 """, unsafe_allow_html=True)
@@ -1127,13 +1059,13 @@ def cryptometer_watchlist(results):
 # =========================================================
 # HEADER
 # =========================================================
-st.title("📡 Crypto Intelligence Scanner Pro")
-st.caption("Broad market scan • Pre-pump ranking • Accumulation structure radar • Volume expansion • Risk flags")
-st.caption("Build 2026-11-07.7 • Seven-factor Pre-Pump + independent accumulation radar • Stablecoins excluded")
+st.title("📡 اسکنر هوشمند بازار ارزهای دیجیتال")
+st.caption("پایش گسترده بازار • شناسایی فرصت‌های پیش از رشد • رادار انباشت • افزایش حجم • کنترل ریسک")
+st.caption("Build 2026-11-08.1 • Icon navigation + high-contrast light UI • Analysis engine preserved")
 st.warning(
     "امتیازها ابزار غربالگری‌اند، نه احتمال قطعی پامپ یا توصیه مالی. داده‌های ناقص به‌عنوان سیگنال مثبت فرض نمی‌شوند؛ درصد پوشش شواهد را کنار امتیاز ببین."
 )
-with st.expander("📘 Quick guide — how to read the scanner", expanded=True):
+with st.expander("📘 راهنمای سریع استفاده از اسکنر", expanded=False):
     guide_a, guide_b, guide_c = st.columns(3)
     guide_a.markdown("**۱. امتیاز هفت‌عاملی**\n\nخرید واقعی ۳۰٪، شتاب حجم ۲۰٪، مومنتوم ۱۵٪، نقدشوندگی ۱۵٪، تکنیکال ۱۰٪، وضعیت BTC پنج درصد و خبر پنج درصد. عواملِ بدون داده از محاسبه کنار می‌روند و پوشش شواهد نمایش داده می‌شود.")
     guide_b.markdown("**۲. ورود ترکیبی و محافظه‌کارانه**\n\nورود اولیه حداکثر ۲۵٪ حجم موقعیت؛ ۷۵٪ باقی‌مانده فقط پس از شکست مقاومت و تثبیت با حجم مناسب. سیگنال Watch به معنی ورود نیست.")
@@ -1143,50 +1075,50 @@ with st.expander("📘 Quick guide — how to read the scanner", expanded=True):
 # SIDEBAR
 # =========================================================
 with st.sidebar:
-    st.header("⚙️ Scanner settings")
-    data_source = st.radio("Market source", ["CoinGecko market", "Upload CSV"], index=0)
-    currency = st.selectbox("Quote currency", ["usd", "eur", "gbp"], index=0)
+    st.header("⚙️ تنظیمات اسکنر")
+    data_source = st.radio("منبع اطلاعات بازار", ["CoinGecko market", "Upload CSV"], index=0, format_func=lambda x: "بازار زنده CoinGecko" if x == "CoinGecko market" else "بارگذاری فایل CSV")
+    currency = st.selectbox("واحد نمایش قیمت", ["usd", "eur", "gbp"], index=0, format_func=lambda x: x.upper())
     if data_source == "CoinGecko market":
         pages = st.selectbox(
-            "Market coverage",
+            "تعداد ارزهای مورد بررسی",
             options=[1, 2, 4, 8],
             format_func=lambda n: f"Up to {n * 250:,} market coins",
             index=2,
             help="Starts with up to 1,000 market coins. Reduce to 250 or 500 if CoinGecko rate limits occur.",
         )
-        refresh_seconds = st.selectbox("Refresh interval", [60, 120, 300, 600], index=1)
+        refresh_seconds = st.selectbox("فاصله به‌روزرسانی", [60, 120, 300, 600], index=1)
         st_autorefresh(interval=refresh_seconds * 1000, key="scanner_refresh")
-    uploaded = st.file_uploader("Upload CSV dataset", type=["csv"])
+    uploaded = st.file_uploader("انتخاب فایل داده CSV", type=["csv"])
     st.divider()
-    st.subheader("🔬 Technical analysis")
+    st.subheader("🔬 تحلیل تکنیکال")
     use_bybit_derivatives = st.checkbox(
-        "Add live funding rate + open interest (Bybit → OKX → Gate.io fallback)",
+        "دریافت نرخ فاندینگ و سود باز قراردادها",
         value=True,
         help="Uses public USDT perpetual data: Bybit first, then OKX, then Gate.io if blocked. No exchange API key is used."
     )
     technical_limit = st.selectbox(
-        "Coins for detailed technical indicators",
+        "تعداد ارز برای محاسبه شاخص‌های تکنیکال",
         [0, 10, 20, 30, 50],
         index=3,
         help="Fetches 7-day price and volume history for the highest turnover-to-market-cap candidates. 30 is a practical balance; 50 uses more API calls. 0 disables detailed indicators.",
     )
-    run_technicals = st.button("Calculate technical indicators", type="primary")
+    run_technicals = st.button("محاسبه شاخص‌های تکنیکال", type="primary")
     st.divider()
-    st.subheader("📰 News")
+    st.subheader("📰 اخبار بازار")
     news_key_input = st.text_input(
-        "CryptoPanic API token (optional)",
+        "کلید API اخبار (اختیاری)",
         value=secret_or_env("CRYPTOPANIC_API_KEY"),
         type="password",
         help="Set CRYPTOPANIC_API_KEY in Streamlit secrets or enter it here for this session.",
     )
     st.divider()
-    st.subheader("🧪 DEX discovery")
-    dex_query = st.text_input("DEX search term", value="bitcoin", help="Searches pairs matching this term; not a complete list of all DEX tokens.")
+    st.subheader("🧪 جست‌وجوی صرافی‌های غیرمتمرکز")
+    dex_query = st.text_input("نام ارز یا جفت معاملاتی", value="bitcoin", help="جفت‌های معاملاتی منطبق با عبارت جست‌وجو را پیدا می‌کند.")
     dex_button = st.button("Search DEX Screener")
     st.divider()
-    min_score = st.slider("Minimum Pre-Pump Score", 0, 100, 70)
-    min_liquidity = st.number_input("Minimum DEX liquidity (USD)", min_value=0, value=50000, step=10000)
-    show_all = st.checkbox("Show all rows in main table", value=True)
+    min_score = st.slider("حداقل امتیاز پیش از رشد", 0, 100, 70)
+    min_liquidity = st.number_input("حداقل نقدشوندگی DEX (دلار)", min_value=0, value=50000, step=10000)
+    show_all = st.checkbox("نمایش همه ردیف‌های جدول داده", value=True)
 
 cg_key = secret_or_env("COINGECKO_API_KEY")
 # =========================================================
@@ -1359,735 +1291,762 @@ else:
     df["Volume_24h_vs_7d_Avg"] = numeric(df["Volume_24h_vs_7d_Avg"])
 
 # =========================================================
-# MAIN FILTERS / KPIS
+# منوی اصلی بخش‌های اسکنر
 # =========================================================
-st.caption(
-    f"Source: {dataset_name} • Rows loaded: {len(df):,} • "
-    f"Display refreshed: {pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S UTC')}"
+filtered = df[(numeric(df["PrePump_Score"]).fillna(0) >= min_score) & (~df["Is_Excluded_Asset"])].copy()  # پیش‌فرض برای بخش‌های دیگر
+section = st.radio(
+    "انتخاب بخش اسکنر",
+    ["🏠 نمای کلی", "🧲 رادار انباشت و پیش‌پامپ", "📊 نمودارها و ریزش‌ها", "📰 اخبار و DEX", "🐋 جریان پول و مشتقات", "📁 داده‌ها"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="scanner_section_navigation",
 )
-st.info(
-    "وزن‌ها: خرید واقعی ۳۰٪ • شتاب حجم ۲۰٪ • مومنتوم ۱۵٪ • نقدشوندگی ۱۵٪ • تکنیکال ۱۰٪ • رژیم BTC پنج درصد • خبر پنج درصد. "
-    "داده ناموجود امتیاز مثبت نمی‌گیرد؛ امتیاز با وزن عواملِ واقعاً موجود نرمال می‌شود و پوشش شواهد جداگانه نشان داده می‌شود. "
-    "رادار انباشت جداگانه فشردگی قیمت، کف‌های بالاتر، خرید خالص واقعی، حجم و RSI را می‌سنجد؛ فشردگی قیمت به‌تنهایی اثبات خرید نهنگ نیست. برای سیگنال Pre-Pump معتبر، خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه و شرایط مناسب بازار لازم است. OI و حجم معاملات به‌تنهایی ورود پول یا خرید نهنگ نیستند."
-)
-if data_source == "CoinGecko market" and use_bybit_derivatives:
-    if bybit_status.startswith("matched"):
-        st.success(f"Public derivatives feed: {bybit_status} • cached 90 seconds")
-    else:
-        st.warning(f"Public derivatives feed {bybit_status}. Scanner continues without it.")
-search = st.text_input("🔎 Search coin name or symbol", value="")
-filtered = df.copy()
-if search.strip():
-    q = search.strip().lower()
-    filtered = filtered[
-        filtered["Coin"].astype(str).str.lower().str.contains(q, na=False) |
-        filtered["Symbol"].astype(str).str.lower().str.contains(q, na=False)
-    ]
-if "Market_Cap_Rank" in filtered.columns:
-    rank_max = st.slider("Maximum market-cap rank", 10, max(10, int(pd.to_numeric(df.get("Market_Cap_Rank", pd.Series([250])), errors="coerce").max() or 250)), value=min(250, max(10, int(pd.to_numeric(df.get("Market_Cap_Rank", pd.Series([250])), errors="coerce").max() or 250))))
-    filtered = filtered[pd.to_numeric(filtered["Market_Cap_Rank"], errors="coerce").fillna(rank_max + 1) <= rank_max]
-filtered = filtered[(numeric(filtered["PrePump_Score"]).fillna(0) >= min_score) & (~filtered["Is_Excluded_Asset"])]
-
-if filtered.empty:
-    st.info("No coins match these filters. Lower the minimum score or broaden your search.")
-    # Do not stop: DEX and news panels may still be useful.
-
-a, b, c, d = st.columns(4)
-a.metric("🪙 Coins loaded", f"{len(df):,}")
-b.metric("🔎 Matching signals", f"{len(filtered):,}")
-c.metric("🟢 Positive 24h", int((numeric(df["Change_24h_Percent"]) > 0).sum()))
-d.metric("📊 Median score", fmt_num(numeric(df["Pump_Potential_Score"]).median()))
-
-e, f, g = st.columns(3)
-e.metric("💰 Total 24h volume", fmt_money(numeric(df["Volume_24h"]).sum(), currency))
-f.metric("🛰️ Pre-pump watch", int(df["Signal"].astype(str).str.startswith("Pre-pump watch").sum()))
-g.metric("⚠️ High-risk / overheated", int(df["Risk_Level"].astype(str).str.startswith("High").sum()))
-
+st.caption({
+    "🏠 نمای کلی": "خلاصه وضعیت بازار و شاخص‌های اصلی اسکنر",
+    "🧲 رادار انباشت و پیش‌پامپ": "ارزهایی که نشانه‌های اولیه انباشت یا فعالیت پیش از رشد دارند",
+    "📊 نمودارها و ریزش‌ها": "بررسی ساختار قیمت، شاخص‌های تکنیکال و ارزهای با افت شدید",
+    "📰 اخبار و DEX": "اخبار، فعالیت صرافی‌های غیرمتمرکز و فشار خرید و فروش",
+    "🐋 جریان پول و مشتقات": "جریان پول، خرید و فروش واقعی، فاندینگ و سود باز",
+    "📁 داده‌ها": "مشاهده و دریافت داده خام بازار",
+}[section])
 st.divider()
-st.subheader("🧲 رادار انباشت قبل از شکست مقاومت")
-st.caption("این بخش جدا از امتیاز هفت‌عاملی است: فشردگی دامنه قیمت، کف‌های بالاتر، خرید خالص واقعی، شتاب حجم و RSI را می‌سنجد. فشردگی قیمت به‌تنهایی اثبات انباشت نهنگ‌ها نیست؛ برای تأیید خرید واقعی، داده خرید/فروش دلاری لازم است.")
-accumulation_view = df[~df["Is_Excluded_Asset"]].copy()
-if "Accumulation_Score" in accumulation_view.columns:
-    accumulation_view["Accumulation_Score"] = numeric(accumulation_view["Accumulation_Score"])
-    accumulation_view = accumulation_view[
-        accumulation_view["Accumulation_Score"].notna() &
-        (numeric(accumulation_view["Accumulation_Data_Coverage"]).fillna(0) >= 35)
-    ].sort_values(["Accumulation_Score", "Accumulation_Data_Coverage"], ascending=[False, False])
-    accumulation_cols = [c for c in [
-        "Coin", "Symbol", "Accumulation_Score", "Accumulation_Data_Coverage",
-        "Range_Compression_Ratio", "Higher_Low_24h_Percent", "Buy_Share_Percent",
-        "Net_Buy_USD", "Volume_24h_vs_7d_Avg", "RSI_14", "Accumulation_Status"
-    ] if c in accumulation_view.columns]
-    if not accumulation_view.empty and accumulation_cols:
-        accumulation_display = accumulation_view[accumulation_cols].head(20).rename(columns={
-            "Coin": "ارز", "Symbol": "نماد", "Accumulation_Score": "امتیاز انباشت",
-            "Accumulation_Data_Coverage": "پوشش داده انباشت٪", "Range_Compression_Ratio": "نسبت فشردگی دامنه",
-            "Higher_Low_24h_Percent": "تغییر کف ۲۴ساعته٪", "Buy_Share_Percent": "سهم خرید واقعی٪",
-            "Net_Buy_USD": "خالص خرید دلاری", "Volume_24h_vs_7d_Avg": "حجم ۲۴ساعت / مبنا",
-            "RSI_14": "RSI", "Accumulation_Status": "تفسیر وضعیت"
-        })
-        st.dataframe(accumulation_display, use_container_width=True, hide_index=True)
-    else:
-        st.info("برای محاسبه رادار انباشت، ابتدا از تنظیمات کناری دکمه «Calculate technical indicators» را اجرا کن.")
-else:
-    st.info("ستون‌های لازم برای ارزیابی انباشت هنوز موجود نیستند.")
-
-st.divider()
-st.subheader("🛰️ Pre-pump candidates — before the big move")
-st.caption("استیبل‌کوین‌ها حذف شده‌اند. سیگنال معتبر نیازمند خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه، نقدشوندگی مناسب و بازار BTC غیرنزولی است. درصد پوشش نشان می‌دهد چه مقدار از هفت عامل واقعاً داده داشته‌اند.")
-if not filtered.empty:
-    if "Volume_24h_vs_7d_Avg" not in filtered.columns:
-        filtered["Volume_24h_vs_7d_Avg"] = np.nan
-    ranked = filtered.sort_values(["PrePump_Score", "Volume_24h_vs_7d_Avg"], ascending=[False, False], na_position="last").copy()
-    # Radar view of the leading candidates. Missing factors stay blank, not zero or a fabricated neutral.
-    radar_factors = [
-        ("Buy_Flow_Score", "خرید واقعی"),
-        ("Volume_Acceleration_Score", "شتاب حجم"),
-        ("Momentum_Factor_Score", "مومنتوم"),
-        ("Liquidity_Quality_Score", "نقدشوندگی"),
-        ("Technical_PrePump_Score", "تکنیکال"),
-        ("BTC_Regime_Score", "وضعیت BTC"),
-        ("News_Factor_Score", "اخبار"),
-    ]
-    radar_rows = ranked.head(3)
-    if not radar_rows.empty:
-        radar_fig = go.Figure()
-        theta = [label for _, label in radar_factors]
-        for _, radar_row in radar_rows.iterrows():
-            values = [float(radar_row[col]) if col in radar_row.index and pd.notna(radar_row[col]) else None for col, _ in radar_factors]
-            radar_fig.add_trace(go.Scatterpolar(
-                r=values, theta=theta, fill="toself", name=f"{radar_row.get('Symbol', '')}"
-            ))
-        radar_fig.update_layout(
-            title="مقایسه عوامل هفت‌گانه سه گزینه برتر",
-            polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
-            template="plotly_white", height=420, margin=dict(l=35, r=35, t=55, b=35),
-            legend=dict(orientation="h", y=-0.15),
-        )
-        st.plotly_chart(radar_fig, width="stretch")
-        st.caption("هر محور فقط در صورت وجود داده رسم می‌شود؛ خالی بودن محور یعنی داده نداریم، نه اینکه امتیاز آن صفر یا ۵۰ باشد.")
-    confirmed = ranked[ranked["Signal"].astype(str).str.startswith("Pre-pump watch — real buying")]
-    early = ranked[ranked["Signal"].astype(str).str.startswith("Early activity")]
-    if not confirmed.empty:
-        st.markdown("**Confirmed volume-expansion setups (historical data available)**")
-        top_three = confirmed.head(3)
-        card_cols = st.columns(3)
-        for i, (_, coin_row) in enumerate(top_three.iterrows()):
-            with card_cols[i]:
-                st.markdown(f"### {str(coin_row.get('Coin', 'Unknown'))} ({str(coin_row.get('Symbol', '')).upper()})")
-                st.metric("Pre-Pump score", f"{fmt_num(coin_row.get('PrePump_Score'), 0)} / 100")
-                change = numeric(pd.Series([coin_row.get('Change_24h_Percent')])).iloc[0]
-                st.metric("24h change", f"{fmt_num(change)}%" if pd.notna(change) else "N/A")
-                st.caption(f"Signal: {coin_row.get('Signal')}\n\nRisk: {coin_row.get('Risk_Level')}")
-    else:
-        st.info("No confirmed pre-pump setup yet. The scanner will not promote a coin without historical volume expansion.")
-    if not early.empty:
-        with st.expander(f"Early activity — needs confirmation ({len(early)})", expanded=True):
-            early_cols = [c for c in ["Coin", "Symbol", "PrePump_Score", "Change_24h_Percent", "Change_7d_Percent", "Volume_to_Market_Cap", "Volume_24h_vs_7d_Avg", "Risk_Level"] if c in early.columns]
-            st.dataframe(early[early_cols].head(20), use_container_width=True, hide_index=True)
-    with st.expander("📊 Detailed candidate table", expanded=True):
-        preferred_cols = [
-            "Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent",
-            "Volume_24h", "Volume_to_Market_Cap", "Volume_Activity_Score", "Price_Still_Quiet_Score",
-            "Accumulation_Score", "Accumulation_Data_Coverage", "Accumulation_Status",
-            "Range_Compression_Ratio", "Higher_Low_24h_Percent",
-            "Volume_24h_vs_7d_Avg", "Volume_Acceleration_Score", "Market_Cap_Rank", "RSI_14", "Technical_PrePump_Score",
-            "Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent", "Buy_Flow_Status",
-            "Momentum_Factor_Score", "Liquidity_Quality_Score", "BTC_Market_Context", "BTC_Regime_Score", "News_Factor_Score", "Evidence_Coverage_Percent",
-            "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange",
-            "Derivatives_Context_Score", "PrePump_Score", "Pump_Potential_Score", "Signal", "Risk_Level", "Technical_Signal",
-        ]
-        cols = [c for c in preferred_cols if c in ranked.columns]
-        display_names = {
-            "Coin": "Coin", "Symbol": "Ticker", "Price": f"Price ({currency.upper()})",
-            "Change_24h_Percent": "24h change (%)", "Change_7d_Percent": "7d change (%)",
-            "Volume_24h": f"24h volume ({currency.upper()})", "Market_Cap_Rank": "Market rank",
-            "Volume_to_Market_Cap": "Volume / market cap", "Volume_Activity_Score": "Turnover activity",
-            "Price_Still_Quiet_Score": "Price still quiet", "Accumulation_Score": "امتیاز انباشت",
-            "Accumulation_Data_Coverage": "پوشش داده انباشت (%)", "Accumulation_Status": "وضعیت انباشت",
-            "Range_Compression_Ratio": "نسبت فشردگی دامنه", "Higher_Low_24h_Percent": "تغییر کف ۲۴ساعته (%)",
-            "Volume_24h_vs_7d_Avg": "24h volume vs 7d baseline",
-            "Volume_Acceleration_Score": "Volume acceleration score", "Momentum_Factor_Score": "Momentum score",
-            "Liquidity_Quality_Score": "Liquidity score", "BTC_Regime_Score": "BTC regime score",
-            "News_Factor_Score": "News score", "Evidence_Coverage_Percent": "Evidence coverage (%)",
-            "RSI_14": "RSI (14)", "Technical_PrePump_Score": "Technical pre-pump",
-             "Buy_Volume_USD": "حجم خرید واقعی (USDT)", "Sell_Volume_USD": "حجم فروش واقعی (USDT)",
-            "Net_Buy_USD": "خالص خرید (USDT)", "Buy_Share_Percent": "سهم خرید (%)",
-            "Buy_Flow_Status": "وضعیت جریان خرید", "BTC_Market_Context": "وضعیت بازار BTC",
-            "Funding_Rate_Percent": "Funding (%)", "Open_Interest_USD": "Open interest (USD)",
-            "Derivatives_Turnover_24h_USD": "Perp turnover (USD)", "Derivatives_Exchange": "Derivatives source", "Derivatives_Context_Score": "Derivatives context",
-            "PrePump_Score": "Pre-Pump score", "Pump_Potential_Score": "Legacy score (same value)",
-            "Signal": "Signal / interpretation", "Risk_Level": "Risk flag", "Technical_Signal": "Technical reading",
-        }
-        display_df = ranked[cols].rename(columns=display_names)
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-        st.caption("RSI از صفر تا ۱۰۰ است: بالای ۷۰ می‌تواند نشانه داغ‌شدن حرکت و زیر ۳۰ نشانه فشار فروش شدید باشد؛ به‌تنهایی سیگنال خرید نیست. MACD بالای خط سیگنال یعنی مومنتوم صعودی‌تر، اما باید با حجم و ساختار قیمت تأیید شود.")
-        st.caption("روش ورود: ۲۵٪ اولیه فقط در ناحیه ساختاری مناسب؛ ۷۵٪ پس از شکست و تثبیت مقاومت. حدضرر پشت کف/حمایت ساختاری؛ اگر داده تاریخی برای تعیین آن نداریم، سطح ورود و خروج ساخته نمی‌شود. سقف ریسک هر معامله ۰٫۵٪ سرمایه و حداقل R/R برابر ۲ است.")
-else:
-    st.info("No verified early-activity candidates match these filters yet. Calculate historical indicators or lower the minimum score to inspect unconfirmed setups.")
-
-# Separate watchlist for deeply declined assets (not mixed with pre-pump candidates).
-st.subheader("📉 ارزهای با بیشترین ریزش")
-st.caption("این فهرست فقط برای بررسی احتمال برگشت است؛ ریزش زیاد به‌تنهایی دلیل خرید نیست.")
-drop_view = df[~df["Is_Excluded_Asset"]].copy()
-drop_view["_drop_rank"] = numeric(drop_view["Change_7d_Percent"])
-drop_view = drop_view.dropna(subset=["_drop_rank"]).sort_values("_drop_rank").head(15)
-if not drop_view.empty:
-    drop_cols = [c for c in ["Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "RSI_14", "PrePump_Score", "Buy_Flow_Status", "Risk_Level"] if c in drop_view.columns]
-    st.dataframe(drop_view[drop_cols], width="stretch", hide_index=True)
-else:
-    st.info("داده کافی برای رتبه‌بندی ریزش هفتگی موجود نیست.")
-
-# Alerts for sharp moves
-st.subheader("🔔 Unusual market moves")
-alerts = df[(numeric(df["Change_24h_Percent"]).abs() >= 5) | (numeric(df["Change_7d_Percent"]).abs() >= 15)].copy()
-if not alerts.empty:
-    alerts = alerts.sort_values("Change_24h_Percent", ascending=False)
-    st.dataframe(alerts[["Coin", "Symbol", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Pump_Potential_Score", "Risk_Level"]].head(30), use_container_width=True, hide_index=True)
-else:
-    st.info("No moves crossed the default alert thresholds.")
-
-# Market chart
-chart_source = filtered if not filtered.empty else df.head(50)
-if not chart_source.empty:
-    st.subheader("🌌 Market momentum map")
-    chart_source = chart_source.copy()
-    chart_source["_volume_size"] = np.log10(numeric(chart_source["Volume_24h"]).fillna(0).clip(lower=0) + 1)
-    fig = px.scatter(
-        chart_source,
-        x="Change_24h_Percent", y="Change_7d_Percent",
-        size="_volume_size", color="Pump_Potential_Score",
-        hover_name="Symbol", hover_data=["Coin", "Volume_24h", "Risk_Level"],
-        color_continuous_scale="Turbo", template="plotly_white",
-        labels={"Change_24h_Percent": "24h change (%)", "Change_7d_Percent": "7d change (%)", "Pump_Potential_Score": "Pre-Pump Score"},
-    )
-    fig.update_layout(paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font_color="#172b4d", height=520, xaxis=dict(gridcolor="#e5edf6"), yaxis=dict(gridcolor="#e5edf6"))
-    st.plotly_chart(fig, use_container_width=True)
-
-# Historical chart + Persian technical indicators
-st.divider()
-st.subheader("📈 نمودار قیمت و تحلیل تکنیکال به زبان فارسی")
-st.caption("نمودارها از داده‌های تاریخی بازار ساخته می‌شوند. تفسیرها آموزشی‌اند و به‌تنهایی سیگنال قطعی خرید یا فروش نیستند.")
-if data_source == "CoinGecko market" and "CoinGecko_ID" in df.columns:
-    hist_candidates = df.dropna(subset=["CoinGecko_ID"]).copy()
-    if not hist_candidates.empty:
-        hist_candidates["_opt"] = hist_candidates["Symbol"].astype(str) + " — " + hist_candidates["Coin"].astype(str)
-        choice = st.selectbox("ارز موردنظر برای تحلیل نمودار", hist_candidates["_opt"].tolist(), key="fa_chart_coin")
-        selected = hist_candidates[hist_candidates["_opt"] == choice].iloc[0]
-        hist_days = st.selectbox("بازه زمانی نمودار", [1, 7, 30, 90], index=1,
-                                 format_func=lambda x: {1: "۱ روز اخیر", 7: "۷ روز اخیر", 30: "۳۰ روز اخیر", 90: "۹۰ روز اخیر"}[x],
-                                 key="fa_chart_days")
-        if st.button("نمایش نمودار و تحلیل", type="primary", key="load_fa_technical_chart"):
-            try:
-                hist = fetch_history(str(selected["CoinGecko_ID"]), currency, hist_days, cg_key)
-                if hist.empty or len(hist) < 20:
-                    st.warning("داده تاریخی کافی برای رسم همه شاخص‌ها دریافت نشد. بازه زمانی دیگری را امتحان کن.")
-                else:
-                    hist = hist.copy().sort_values("Time")
-                    close = pd.to_numeric(hist["price"], errors="coerce")
-                    delta = close.diff()
-                    gain = delta.clip(lower=0).rolling(14, min_periods=14).mean()
-                    loss = (-delta.clip(upper=0)).rolling(14, min_periods=14).mean()
-                    rs = gain / loss.replace(0, np.nan)
-                    hist["RSI"] = 100 - (100 / (1 + rs))
-                    hist.loc[(loss == 0) & (gain > 0), "RSI"] = 100
-                    hist.loc[(gain == 0) & (loss > 0), "RSI"] = 0
-                    ema12 = close.ewm(span=12, adjust=False).mean()
-                    ema26 = close.ewm(span=26, adjust=False).mean()
-                    hist["MACD"] = ema12 - ema26
-                    hist["MACD_Signal"] = hist["MACD"].ewm(span=9, adjust=False).mean()
-                    hist["MACD_Hist"] = hist["MACD"] - hist["MACD_Signal"]
-                    hist["Volume"] = pd.to_numeric(hist.get("volume_24h", pd.Series(index=hist.index, dtype=float)), errors="coerce")
-
-                    last_price = close.iloc[-1]
-                    last_rsi = hist["RSI"].iloc[-1]
-                    last_macd = hist["MACD"].iloc[-1]
-                    last_signal = hist["MACD_Signal"].iloc[-1]
-                    if pd.isna(last_rsi):
-                        rsi_text = "داده کافی برای تفسیر شاخص قدرت خرید و فروش وجود ندارد."
-                        rsi_status = "داده ناکافی"
-                    elif last_rsi < 30:
-                        rsi_text = "فشار فروش زیاد بوده و بازار در محدوده اشباع فروش است؛ این وضعیت فقط احتمال برگشت را مطرح می‌کند و تأیید خرید نیست."
-                        rsi_status = "اشباع فروش؛ منتظر تأیید برگشت"
-                    elif last_rsi > 70:
-                        rsi_text = "قدرت خرید بالا و بازار در محدوده اشباع خرید است؛ احتمال اصلاح یا کندشدن رشد را در نظر بگیر."
-                        rsi_status = "اشباع خرید؛ احتیاط"
-                    elif last_rsi >= 50:
-                        rsi_text = "قدرت خریداران کمی بیشتر است و شاخص در محدوده نسبتاً مثبت قرار دارد. پایداری روند را با حجم و MACD بررسی کن."
-                        rsi_status = "تمایل نسبی به خریداران"
-                    else:
-                        rsi_text = "قدرت فروشندگان هنوز بیشتر است؛ برای بررسی خرید بهتر است نشانه برگشت و عبور شاخص از محدوده میانی دیده شود."
-                        rsi_status = "فشار فروش بیشتر"
-
-                    if pd.isna(last_macd) or pd.isna(last_signal):
-                        macd_text = "داده کافی برای تفسیر مکدی وجود ندارد."
-                        macd_status = "داده ناکافی"
-                    elif last_macd > last_signal:
-                        macd_text = "خط مکدی بالاتر از خط سیگنال است؛ مومنتوم کوتاه‌مدت مثبت‌تر شده، اما بهتر است حجم و روند قیمت هم آن را تأیید کنند."
-                        macd_status = "تقاطع/وضعیت صعودی"
-                    else:
-                        macd_text = "خط مکدی پایین‌تر از خط سیگنال است؛ مومنتوم هنوز ضعیف یا نزولی است و ورود عجولانه ریسک دارد."
-                        macd_status = "وضعیت نزولی"
-
-                    st.markdown(f"**{choice} — قیمت آخرین داده:** `{fmt_money(last_price)}` {currency.upper()}")
-                    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.055,
-                                        row_heights=[0.38, 0.16, 0.21, 0.25],
-                                        subplot_titles=("قیمت", "حجم معاملات", "شاخص قدرت خرید و فروش (RSI)", "مکدی؛ قدرت و جهت حرکت (MACD)"))
-                    fig.add_trace(go.Scatter(x=hist["Time"], y=close, mode="lines", name="قیمت", line=dict(color="#2878ee", width=2)), row=1, col=1)
-                    if hist["Volume"].notna().any():
-                        fig.add_trace(go.Bar(x=hist["Time"], y=hist["Volume"], name="حجم معاملات ۲۴ ساعته", marker_color="#9bb8df", opacity=0.72), row=2, col=1)
-                    fig.add_trace(go.Scatter(x=hist["Time"], y=hist["RSI"], mode="lines", name="RSI", line=dict(color="#805ad5", width=2)), row=3, col=1)
-                    fig.add_hrect(y0=70, y1=100, fillcolor="#f56565", opacity=0.09, line_width=0, row=3, col=1)
-                    fig.add_hrect(y0=0, y1=30, fillcolor="#13a98f", opacity=0.10, line_width=0, row=3, col=1)
-                    fig.add_hline(y=70, line_dash="dash", line_color="#d9534f", row=3, col=1)
-                    fig.add_hline(y=50, line_dash="dot", line_color="#9aa9bc", row=3, col=1)
-                    fig.add_hline(y=30, line_dash="dash", line_color="#13a98f", row=3, col=1)
-                    hist_colors = np.where(hist["MACD_Hist"].fillna(0) >= 0, "#13a98f", "#e06b75")
-                    fig.add_trace(go.Bar(x=hist["Time"], y=hist["MACD_Hist"], name="قدرت میله‌ها", marker_color=hist_colors), row=4, col=1)
-                    fig.add_trace(go.Scatter(x=hist["Time"], y=hist["MACD"], mode="lines", name="خط مکدی", line=dict(color="#2878ee", width=2)), row=4, col=1)
-                    fig.add_trace(go.Scatter(x=hist["Time"], y=hist["MACD_Signal"], mode="lines", name="خط سیگنال", line=dict(color="#f0a33a", width=2)), row=4, col=1)
-                    fig.update_yaxes(title_text=f"قیمت ({currency.upper()})", row=1, col=1, gridcolor="#e5edf6")
-                    fig.update_yaxes(title_text="حجم", row=2, col=1, gridcolor="#e5edf6")
-                    fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1, gridcolor="#e5edf6")
-                    fig.update_yaxes(title_text="مکدی", row=4, col=1, gridcolor="#e5edf6")
-                    fig.update_xaxes(title_text="زمان", gridcolor="#e5edf6", row=4, col=1)
-                    fig.update_layout(height=980, template="plotly_white", paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-                                      font=dict(family="Arial", color="#172b4d", size=12), legend=dict(orientation="h", y=1.02, x=0),
-                                      margin=dict(l=20, r=20, t=90, b=30), hovermode="x unified",
-                                      title=dict(text="نقشه تکنیکال قیمت، حجم، RSI و MACD", x=0.5))
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.markdown("#### 🧭 تفسیر ساده نمودار")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown(f"**RSI — {rsi_status}**")
-                        st.write(rsi_text)
-                        if pd.notna(last_rsi):
-                            st.metric("مقدار RSI", f"{last_rsi:.1f} از ۱۰۰")
-                    with c2:
-                        st.markdown(f"**MACD — {macd_status}**")
-                        st.write(macd_text)
-                        if pd.notna(last_macd) and pd.notna(last_signal):
-                            st.metric("فاصله مکدی از خط سیگنال", f"{(last_macd-last_signal):.6g}")
-                    st.info("حجم نشان می‌دهد چه مقدار معامله انجام شده، نه اینکه دقیقاً چه مقدار پول خالص وارد ارز شده است. برای تشخیص ورود پول واقعی یا فعالیت نهنگ‌ها به داده جریان سفارش یا داده آن‌چین نیاز داریم.")
-                    st.caption("نکته: در بازه‌های ۱، ۷، ۳۰ و ۹۰ روزه، فاصله زمانی نقاط داده ممکن است متفاوت باشد. این نمودار بر اساس داده تاریخی دریافتی از CoinGecko رسم می‌شود و معادل کندل زنده صرافی بیت‌پین نیست.")
-            except Exception as exc:
-                st.error(f"خطا در دریافت یا رسم نمودار: {exc}")
-else:
-    st.info("برای نمایش نمودارهای تکنیکال، منبع داده CoinGecko را انتخاب کن.")
-
-# News panel
-st.divider()
-st.subheader("📰 Fundamental news")
-news_symbol = st.text_input("News currency code (e.g. BTC, ETH, SOL)", value="BTC").strip().upper()
-if st.button("Fetch latest news"):
-    with st.spinner("Fetching news..."):
-        news_df, news_status = fetch_news(news_key_input, news_symbol or None)
-    if news_df.empty:
-        st.info(f"No news returned. {news_status}")
-    else:
-        # Lightweight headline sentiment proxy; never represented as a trained sentiment model.
-        pos_words = ("approval", "adoption", "partnership", "launch", "upgrade", "inflow", "bullish", "listing")
-        neg_words = ("hack", "exploit", "lawsuit", "ban", "delist", "outflow", "bearish", "scam", "breach")
-        def headline_score(title):
-            t = str(title).lower()
-            return sum(w in t for w in pos_words) - sum(w in t for w in neg_words)
-        news_df["Headline_Sentiment_Proxy"] = news_df["Title"].apply(headline_score).map(
-            lambda x: "Positive keyword" if x > 0 else ("Negative keyword" if x < 0 else "Neutral / unclassified")
-        )
-        st.dataframe(news_df, use_container_width=True, hide_index=True)
-        st.caption("Headline sentiment is a simple keyword proxy, not a trained NLP model or a fact-check.")
-
-# DEX panel
-st.divider()
-st.subheader("🧪 DEX flows, buy/sell pressure & whale-watch clues")
-st.caption("Searches DEX Screener pairs matching your query. This is a market-activity screen, not complete on-chain whale tracking.")
-st.info(
-    "What these numbers mean: DEX volume is traded value, not net money entering a token. "
-    "Buy/sell counts are transaction counts. Estimated buy/sell volume below is only a rough proxy "
-    "that splits total volume by transaction-count share; it is NOT actual USD flow. "
-    "Real whale detection needs wallet-level/on-chain trade data from a suitable provider."
-)
-if dex_button:
-    if not dex_query.strip():
-        st.warning("Enter a search term.")
-    else:
-        try:
-            with st.spinner(f"Searching DEX pairs for {dex_query}..."):
-                dex_df = fetch_dex_search(dex_query.strip())
-            if dex_df.empty:
-                st.info("No DEX pairs found for that search term.")
-            else:
-                dex_df = dex_df[numeric(dex_df["Liquidity_USD"]).fillna(0) >= min_liquidity]
-                if dex_df.empty:
-                    st.warning("No pairs passed the minimum liquidity filter. Lower the liquidity filter and search again.")
-                else:
-                    top = dex_df.iloc[0]
-                    k1, k2, k3, k4 = st.columns(4)
-                    k1.metric("DEX pairs found", f"{len(dex_df):,}")
-                    k2.metric("Top pair 24h volume", f"${fmt_num(top.get('Volume_24h_USD'), 0)}")
-                    k3.metric("Top pair liquidity", f"${fmt_num(top.get('Liquidity_USD'), 0)}")
-                    k4.metric("Top pair buy-count share", f"{fmt_num(top.get('Buy_Count_Share_Percent'), 1)}%")
-                    st.caption("Buy-count share = buys ÷ (buys + sells). It counts transactions, not their dollar size.")
-                    display_cols = [
-                        "Token", "Symbol", "Chain", "DEX", "Price_USD", "Change_1h_Percent",
-                        "Change_24h_Percent", "Volume_24h_USD", "Liquidity_USD", "Transactions_24h",
-                        "Buys_24h", "Sells_24h", "Buy_Count_Share_Percent",
-                        "Estimated_Buy_Volume_Proxy_USD", "Estimated_Sell_Volume_Proxy_USD",
-                        "Volume_to_Liquidity_Ratio", "Activity_Flag", "DEX_Screen_Score", "Risk_Flag", "Pair_URL"
-                    ]
-                    display_cols = [c for c in display_cols if c in dex_df.columns]
-                    st.dataframe(dex_df[display_cols].head(100), use_container_width=True, hide_index=True)
-                    st.caption(
-                        "Whale-watch clue only: unusually high volume relative to liquidity plus many transactions can merit review, "
-                        "but does not prove that whales traded or that net inflows occurred. Check wallet-level data separately."
-                    )
-                st.download_button(
-                    "⬇️ Download DEX search CSV",
-                    data=dex_df.to_csv(index=False).encode("utf-8"),
-                    file_name="dex_screener_search.csv",
-                    mime="text/csv",
-                )
-        except Exception as exc:
-            st.error(f"DEX Screener error: {exc}")
 
 # =========================================================
-# LIVE FUNDING + OPEN INTEREST PANEL
-# =========================================================
-if data_source == "CoinGecko market" and use_bybit_derivatives:
-    st.divider()
-    st.subheader("📈 Derivatives positioning — Funding Rate & Open Interest")
+if section == "🏠 نمای کلی":
+    # MAIN FILTERS / KPIS
+    # =========================================================
     st.caption(
-        "Public USDT perpetual snapshot (Bybit, with Gate.io fallback). Funding is the current periodic rate, not an annual yield. "
-        "Open interest is the notional value of outstanding contracts; it is not net money entering spot markets."
-    )
-    deriv = df[df.get("Funding_Rate_Percent", pd.Series(np.nan, index=df.index)).notna()].copy()
-    if deriv.empty:
-        st.info("No matching Bybit perpetual symbols were returned for the loaded market list.")
-    else:
-        d1, d2, d3 = st.columns(3)
-        d1.metric("Matched perpetuals", f"{len(deriv):,}")
-        d2.metric("Positive funding", int((numeric(deriv["Funding_Rate_Percent"]) > 0).sum()))
-        d3.metric("Negative funding", int((numeric(deriv["Funding_Rate_Percent"]) < 0).sum()))
-        deriv_view = deriv.sort_values("Derivatives_Context_Score", ascending=False)
-        deriv_cols = [c for c in ["Coin", "Symbol", "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange", "Derivatives_Change_24h_Percent", "Derivatives_Context_Score", "PrePump_Score", "Signal"] if c in deriv_view.columns]
-        st.dataframe(deriv_view[deriv_cols].head(60), use_container_width=True, hide_index=True)
-        st.caption("Interpretation: very positive funding can indicate crowded longs; negative funding can indicate crowded shorts. Combine with price, volume and OI changes—one snapshot alone cannot confirm a squeeze or a pump.")
-
-
-# =========================================================
-# CRYPTOMETER INTELLIGENCE PANEL
-# =========================================================
-st.divider()
-st.subheader("🧭 CryptoMeter intelligence — whale activity, flows & rapid moves")
-st.caption(
-    "CryptoMeter feeds add market evidence to the CoinGecko scanner. A signal is a research watchlist, "
-    "not a guaranteed pump prediction or an instruction to buy."
-)
-cm_key = secret_or_env("CRYPTOMETER_API_KEY")
-if not cm_key:
-    st.warning("CryptoMeter API key not found. Add CRYPTOMETER_API_KEY in Render → Environment, then save and redeploy.")
-else:
-    cm_a, cm_b, cm_c = st.columns(3)
-    with cm_a:
-        cm_symbol_filter = st.text_input(
-            "Whale / funding symbol filter (optional)", value="", key="cm_symbol_filter",
-            help="Leave blank to request the latest market-wide records where the endpoint supports it."
-        ).strip().lower()
-    with cm_b:
-        cm_timeframe = st.selectbox("Flow timeframe", ["15m", "1h", "4h", "d"], index=2, key="cm_flow_timeframe")
-    with cm_c:
-        cm_mover_timeframe = st.selectbox("Gainers/losers timeframe", ["5m", "15m", "1h", "1d", "1w"], index=2, key="cm_mover_timeframe")
-
-    st.markdown("**Free feeds** — account status, market trend pressure and the Rapid Movements feed.")
-    st.caption("The Rapid Movements endpoint is the original 4-hour movement feed. The richer Rapid Movements V2 feed is a paid endpoint.")
-
-    paid_options = {
-        "Whale trades (xtrades) — paid": "whales",
-        "Volume flow — paid": "volume_flow",
-        "Liquidity Lens / netflow — paid": "liquidity",
-        "Funding rates — paid": "funding",
-        "Gainers & losers — paid": "movers",
-    }
-    paid_selected_labels = st.multiselect(
-        "Optional paid feeds (select only endpoints included in your CryptoMeter plan)",
-        options=list(paid_options.keys()),
-        default=[],
-        help="Do not select these unless you have enabled/purchased the corresponding endpoint in CryptoMeter Manage API."
+        f"Source: {dataset_name} • Rows loaded: {len(df):,} • "
+        f"Display refreshed: {pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
     st.info(
-        "Whale trades, Volume Flow, Liquidity Lens, Funding Rates and Gainers/Losers are marked Paid in CryptoMeter's API documentation. "
-        "If your plan does not include an endpoint, leave it unselected."
+        "وزن‌ها: خرید واقعی ۳۰٪ • شتاب حجم ۲۰٪ • مومنتوم ۱۵٪ • نقدشوندگی ۱۵٪ • تکنیکال ۱۰٪ • رژیم BTC پنج درصد • خبر پنج درصد. "
+        "داده ناموجود امتیاز مثبت نمی‌گیرد؛ امتیاز با وزن عواملِ واقعاً موجود نرمال می‌شود و پوشش شواهد جداگانه نشان داده می‌شود. "
+        "رادار انباشت جداگانه فشردگی قیمت، کف‌های بالاتر، خرید خالص واقعی، حجم و RSI را می‌سنجد؛ فشردگی قیمت به‌تنهایی اثبات خرید نهنگ نیست. برای سیگنال Pre-Pump معتبر، خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه و شرایط مناسب بازار لازم است. OI و حجم معاملات به‌تنهایی ورود پول یا خرید نهنگ نیستند."
     )
+    if data_source == "CoinGecko market" and use_bybit_derivatives:
+        if bybit_status.startswith("matched"):
+            st.success(f"Public derivatives feed: {bybit_status} • cached 90 seconds")
+        else:
+            st.warning(f"Public derivatives feed {bybit_status}. Scanner continues without it.")
+    search = st.text_input("🔎 Search coin name or symbol", value="")
+    filtered = df.copy()
+    if search.strip():
+        q = search.strip().lower()
+        filtered = filtered[
+            filtered["Coin"].astype(str).str.lower().str.contains(q, na=False) |
+            filtered["Symbol"].astype(str).str.lower().str.contains(q, na=False)
+        ]
+    if "Market_Cap_Rank" in filtered.columns:
+        rank_max = st.slider("Maximum market-cap rank", 10, max(10, int(pd.to_numeric(df.get("Market_Cap_Rank", pd.Series([250])), errors="coerce").max() or 250)), value=min(250, max(10, int(pd.to_numeric(df.get("Market_Cap_Rank", pd.Series([250])), errors="coerce").max() or 250))))
+        filtered = filtered[pd.to_numeric(filtered["Market_Cap_Rank"], errors="coerce").fillna(rank_max + 1) <= rank_max]
+    filtered = filtered[(numeric(filtered["PrePump_Score"]).fillna(0) >= min_score) & (~filtered["Is_Excluded_Asset"])]
 
-    if st.button("🔄 Fetch CryptoMeter intelligence", type="primary", key="cm_fetch_button"):
-        endpoint_jobs = {
-            "account": ("info", {}),
-            "trend": ("trend-indicator-v3", {}),
-            "rapid": ("rapid-movements", {}),
-        }
-        for label in paid_selected_labels:
-            result_key = paid_options[label]
-            if result_key == "whales":
-                params = {"symbol": cm_symbol_filter} if cm_symbol_filter else {}
-                endpoint_jobs[result_key] = ("xtrades", params)
-            elif result_key == "volume_flow":
-                endpoint_jobs[result_key] = ("volume-flow", {"timeframe": cm_timeframe})
-            elif result_key == "liquidity":
-                endpoint_jobs[result_key] = ("liquidity-lens", {"timeframe": cm_timeframe})
-            elif result_key == "funding":
-                params = {"symbol": cm_symbol_filter} if cm_symbol_filter else {}
-                endpoint_jobs[result_key] = ("funding-rates", params)
-            elif result_key == "movers":
-                endpoint_jobs[result_key] = ("gainers-losers", {"timeframe": cm_mover_timeframe})
+    if filtered.empty:
+        st.info("No coins match these filters. Lower the minimum score or broaden your search.")
+        # Do not stop: DEX and news panels may still be useful.
 
-        collected = {}
-        with st.spinner("Requesting selected CryptoMeter feeds..."):
-            for result_key, (endpoint, params) in endpoint_jobs.items():
-                try:
-                    collected[result_key] = {
-                        "payload": fetch_cryptometer(endpoint, params, cm_key),
-                        "error": None,
-                        "endpoint": endpoint,
-                    }
-                except Exception as exc:
-                    collected[result_key] = {
-                        "payload": None,
-                        "error": str(exc),
-                        "endpoint": endpoint,
-                    }
-        st.session_state["cryptometer_results"] = collected
-        st.session_state["cryptometer_last_fetch"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
+    a, b, c, d = st.columns(4)
+    a.metric("🪙 Coins loaded", f"{len(df):,}")
+    b.metric("🔎 Matching signals", f"{len(filtered):,}")
+    c.metric("🟢 Positive 24h", int((numeric(df["Change_24h_Percent"]) > 0).sum()))
+    d.metric("📊 Median score", fmt_num(numeric(df["Pump_Potential_Score"]).median()))
 
-    cm_results = st.session_state.get("cryptometer_results", {})
-    if cm_results:
-        st.caption(f"Last requested: {st.session_state.get('cryptometer_last_fetch', 'unknown')} • Responses are cached for 5 minutes.")
-        errors = [(key, value) for key, value in cm_results.items() if value.get("error")]
-        if errors:
-            with st.expander("⚠️ Feed access / API errors", expanded=True):
-                for key, value in errors:
-                    st.warning(f"{value.get('endpoint', key)}: {value['error']}")
+    e, f, g = st.columns(3)
+    e.metric("💰 Total 24h volume", fmt_money(numeric(df["Volume_24h"]).sum(), currency))
+    f.metric("🛰️ Pre-pump watch", int(df["Signal"].astype(str).str.startswith("Pre-pump watch").sum()))
+    g.metric("⚠️ High-risk / overheated", int(df["Risk_Level"].astype(str).str.startswith("High").sum()))
 
-        account_result = cm_results.get("account", {})
-        if account_result.get("payload"):
-            account_df = cryptometer_frame(account_result["payload"])
-            if not account_df.empty:
-                account = account_df.iloc[0]
-                q1, q2, q3, q4 = st.columns(4)
-                q1.metric("CryptoMeter plan", str(account.get("plan", "N/A")))
-                q2.metric("API status", str(account.get("status", "N/A")))
-                q3.metric("Monthly quota", fmt_num(account.get("quota"), 0))
-                q4.metric("Requests used", fmt_num(account.get("total_requests"), 0))
-                extras = account.get("extra_endpoints")
-                if isinstance(extras, list) and extras:
-                    st.caption("Additional enabled endpoints reported by account: " + ", ".join(map(str, extras)))
-
-        trend_result = cm_results.get("trend", {})
-        if trend_result.get("payload"):
-            trend_df = cryptometer_frame(trend_result["payload"])
-            if not trend_df.empty:
-                trend = trend_df.iloc[-1]
-                st.markdown("**Market-wide trend pressure**")
-                t1, t2, t3 = st.columns(3)
-                t1.metric("Trend score", fmt_num(trend.get("trend_score")))
-                t2.metric("Buy pressure", f"{fmt_num(trend.get('buy_pressure'))}%")
-                t3.metric("Sell pressure", f"{fmt_num(trend.get('sell_pressure'))}%")
-                if trend.get("timestamp"):
-                    st.caption(f"Provider timestamp: {trend.get('timestamp')}. Treat this as broad market context, not a coin-specific signal.")
-
-        rapid_result = cm_results.get("rapid", {})
-        if rapid_result.get("payload"):
-            rapid_df = cryptometer_frame(rapid_result["payload"])
-            st.markdown("**Rapid Movements — last four hours**")
-            if rapid_df.empty:
-                st.info("No rapid-movement records were returned.")
-            else:
-                show_cols = [c for c in ["pair", "exchange", "change_detected", "side", "timestamp"] if c in rapid_df.columns]
-                st.dataframe(rapid_df[show_cols] if show_cols else rapid_df, use_container_width=True, hide_index=True)
-
-        whale_result = cm_results.get("whales", {})
-        if whale_result.get("payload"):
-            whale_df = cryptometer_frame(whale_result["payload"])
-            st.markdown("**Whale trades**")
-            if whale_df.empty:
-                st.info("No whale-trade rows were returned.")
-            else:
-                if "usd_total" not in whale_df.columns and "total" in whale_df.columns:
-                    whale_df["usd_total"] = whale_df["total"]
-                whale_cols = [c for c in ["timestamp", "symbol", "pair", "exchange", "side", "price", "size", "usd_total"] if c in whale_df.columns]
-                st.dataframe(whale_df[whale_cols] if whale_cols else whale_df, use_container_width=True, hide_index=True)
-
-        volume_result = cm_results.get("volume_flow", {})
-        if volume_result.get("payload"):
-            flow_data = cryptometer_data(volume_result["payload"])
-            st.markdown("**Volume Flow**")
-            if isinstance(flow_data, dict):
-                flow_tabs = st.tabs(["Inflow", "Outflow", "Netflow"])
-                for tab, flow_name in zip(flow_tabs, ["inflow", "outflow", "netflow"]):
-                    with tab:
-                        flow_rows = flow_data.get(flow_name, [])
-                        flow_frame = pd.DataFrame(flow_rows if isinstance(flow_rows, list) else [])
-                        if flow_frame.empty:
-                            st.info(f"No {flow_name} rows returned.")
-                        else:
-                            st.dataframe(flow_frame, use_container_width=True, hide_index=True)
-            else:
-                st.json(flow_data)
-
-        # ---------------------------------------------------------
-        # ACTUAL PROVIDER BUY/SELL TRADED VOLUME (NOT TXN-COUNT PROXY)
-        # ---------------------------------------------------------
-        st.markdown("**خرید و فروش واقعی ثبت‌شده در صرافی (۲۴ ساعت)**")
-        st.caption(
-            "این بخش از endpoint اختصاصی 24h-trade-volume-v2 استفاده می‌کند؛ "
-            "حجم خرید و فروش را از داده صرافی می‌گیرد، نه از نسبت تعداد معاملات. "
-            "این داده فقط برای جفت و صرافی انتخاب‌شده است و به‌تنهایی ورود نهنگ یا خرید کیف‌پول خاص را ثابت نمی‌کند."
-        )
-        cm_symbols = []
-        if "Symbol" in df.columns:
-            cm_symbols = [str(x).upper() for x in df["Symbol"].dropna().unique() if str(x).strip()]
-        if not cm_symbols:
-            cm_symbols = ["BTC", "ETH", "SOL"]
-        ranked_symbols = []
-        if "PrePump_Score" in df.columns and "Symbol" in df.columns:
-            ranked_symbols = (
-                df.assign(_cm_rank=numeric(df["PrePump_Score"]))
-                  .sort_values("_cm_rank", ascending=False)["Symbol"]
-                  .dropna().astype(str).str.upper().drop_duplicates().head(5).tolist()
-            )
-        default_symbols = [x for x in ranked_symbols if x in cm_symbols][:5] or cm_symbols[:5]
-        buy_col1, buy_col2 = st.columns([2, 1])
-        with buy_col1:
-            selected_buy_symbols = st.multiselect(
-                "ارزها برای بررسی حجم خرید/فروش", options=cm_symbols, default=default_symbols,
-                max_selections=10, key="cm_actual_buy_symbols"
-            )
-        with buy_col2:
-            buy_exchange = st.selectbox(
-                "صرافی مرجع", ["binance", "bybit_spot", "okx", "kucoin", "coinbase_pro", "kraken"],
-                index=0, key="cm_actual_buy_exchange"
-            )
-        if st.button("محاسبه حجم واقعی خرید و فروش", key="cm_actual_buy_fetch", type="primary"):
-            if not selected_buy_symbols:
-                st.warning("حداقل یک ارز انتخاب کن.")
-            else:
-                actual_rows = []
-                with st.spinner("در حال دریافت حجم خرید و فروش از صرافی..."):
-                    for symbol in selected_buy_symbols:
-                        try:
-                            actual_rows.append(fetch_cryptometer_buy_sell_volume(symbol, buy_exchange, cm_key))
-                        except Exception as exc:
-                            actual_rows.append({
-                                "Symbol": symbol, "Pair": f"{symbol}-USDT", "Exchange": buy_exchange,
-                                "Buy volume (USDT)": np.nan, "Sell volume (USDT)": np.nan,
-                                "Net buy (USDT)": np.nan, "Buy share (%)": np.nan,
-                                "Data status": str(exc)[:140]
-                            })
-                        time.sleep(0.16)
-                st.session_state["cm_actual_buy_sell_rows"] = actual_rows
-                st.session_state["cm_actual_buy_sell_time"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
-        actual_rows = st.session_state.get("cm_actual_buy_sell_rows", [])
-        if actual_rows:
-            actual_df = pd.DataFrame(actual_rows)
-            st.caption("آخرین دریافت: " + str(st.session_state.get("cm_actual_buy_sell_time", "نامشخص")))
-            valid_actual = actual_df.dropna(subset=["Buy volume (USDT)", "Sell volume (USDT)"])
-            if valid_actual.empty:
-                st.warning("برای ارزهای انتخاب‌شده داده خرید/فروش برنگشت. ممکن است جفت USDT در صرافی یا دسترسی این endpoint در پلن شما موجود نباشد؛ عدد صفر فرض نمی‌شود.")
-            else:
-                show_actual = actual_df.copy()
-                for col in ["Buy volume (USDT)", "Sell volume (USDT)", "Net buy (USDT)"]:
-                    show_actual[col] = show_actual[col].map(lambda v: fmt_num(v, 0) if pd.notna(v) else "—")
-                show_actual["Buy share (%)"] = show_actual["Buy share (%)"].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
-                show_actual = show_actual.rename(columns={
-                    "Symbol": "ارز", "Pair": "جفت", "Exchange": "صرافی",
-                    "Buy volume (USDT)": "حجم خرید (USDT)",
-                    "Sell volume (USDT)": "حجم فروش (USDT)",
-                    "Net buy (USDT)": "خالص خرید (USDT)",
-                    "Buy share (%)": "سهم خرید", "Data status": "وضعیت داده"
-                })
-                st.dataframe(show_actual, width="stretch", hide_index=True)
-                st.caption("خالص خرید مثبت یعنی حجم خرید ثبت‌شده از فروش بیشتر بوده است. برای تأیید سیگنال، روند قیمت، نقدشوندگی و چند بازه زمانی را هم بررسی کن.")
-
-        liquidity_result = cm_results.get("liquidity", {})
-        if liquidity_result.get("payload"):
-            liquidity_data = cryptometer_data(liquidity_result["payload"])
-            st.markdown("**Liquidity Lens — coin-level netflow**")
-            if isinstance(liquidity_data, dict):
-                liquidity_df = pd.DataFrame([
-                    {"Symbol": symbol, **values}
-                    for symbol, values in liquidity_data.items() if isinstance(values, dict)
-                ])
-            elif isinstance(liquidity_data, list):
-                liquidity_df = pd.DataFrame(liquidity_data)
-            else:
-                liquidity_df = pd.DataFrame()
-            if liquidity_df.empty:
-                st.info("No liquidity-lens rows were returned.")
-            else:
-                if "netflow" in liquidity_df.columns:
-                    liquidity_df = liquidity_df.sort_values("netflow", ascending=False)
-                st.dataframe(liquidity_df, use_container_width=True, hide_index=True)
-
-        funding_result = cm_results.get("funding", {})
-        if funding_result.get("payload"):
-            funding_df = cryptometer_frame(funding_result["payload"])
-            st.markdown("**Funding rates**")
-            if funding_df.empty:
-                st.info("No funding-rate rows were returned.")
-            else:
-                funding_cols = [c for c in ["symbol", "pair", "exchange", "rate_percent", "annualized_percent", "interval_hours", "next_funding_at"] if c in funding_df.columns]
-                st.dataframe(funding_df[funding_cols] if funding_cols else funding_df, use_container_width=True, hide_index=True)
-
-        movers_result = cm_results.get("movers", {})
-        if movers_result.get("payload"):
-            movers_data = cryptometer_data(movers_result["payload"])
-            st.markdown("**Gainers & losers**")
-            if isinstance(movers_data, dict):
-                mover_tabs = st.tabs(["Gainers", "Losers"])
-                for tab, side_name in zip(mover_tabs, ["gainers", "losers"]):
-                    with tab:
-                        side_df = pd.DataFrame(movers_data.get(side_name, []))
-                        if side_df.empty:
-                            st.info(f"No {side_name} rows returned.")
-                        else:
-                            st.dataframe(side_df, use_container_width=True, hide_index=True)
-            else:
-                st.json(movers_data)
-
-        watchlist_df = cryptometer_watchlist(cm_results)
-        if not watchlist_df.empty:
-            st.markdown("**Cross-signal activity watchlist**")
-            st.caption(
-                "Transparent evidence score: Rapid Moves (+/−10), whale buy/sell USD dominance (+/−18), "
-                "and coin-level netflow (+/−15). A bullish/bearish label requires at least two independent evidence sources. "
-                "This score is not a calibrated probability and is not a buy recommendation."
-            )
-            st.dataframe(watchlist_df, use_container_width=True, hide_index=True)
-            st.download_button(
-                "⬇️ Download CryptoMeter watchlist CSV",
-                data=watchlist_df.to_csv(index=False).encode("utf-8"),
-                file_name="cryptometer_activity_watchlist.csv",
-                mime="text/csv",
-                key="cm_watchlist_download",
-            )
+    st.divider()
+if section == "🧲 رادار انباشت و پیش‌پامپ":
+    st.subheader("🧲 رادار انباشت قبل از شکست مقاومت")
+    st.caption("این بخش جدا از امتیاز هفت‌عاملی است: فشردگی دامنه قیمت، کف‌های بالاتر، خرید خالص واقعی، شتاب حجم و RSI را می‌سنجد. فشردگی قیمت به‌تنهایی اثبات انباشت نهنگ‌ها نیست؛ برای تأیید خرید واقعی، داده خرید/فروش دلاری لازم است.")
+    accumulation_view = df[~df["Is_Excluded_Asset"]].copy()
+    if "Accumulation_Score" in accumulation_view.columns:
+        accumulation_view["Accumulation_Score"] = numeric(accumulation_view["Accumulation_Score"])
+        accumulation_view = accumulation_view[
+            accumulation_view["Accumulation_Score"].notna() &
+            (numeric(accumulation_view["Accumulation_Data_Coverage"]).fillna(0) >= 35)
+        ].sort_values(["Accumulation_Score", "Accumulation_Data_Coverage"], ascending=[False, False])
+        accumulation_cols = [c for c in [
+            "Coin", "Symbol", "Accumulation_Score", "Accumulation_Data_Coverage",
+            "Range_Compression_Ratio", "Higher_Low_24h_Percent", "Buy_Share_Percent",
+            "Net_Buy_USD", "Volume_24h_vs_7d_Avg", "RSI_14", "Accumulation_Status"
+        ] if c in accumulation_view.columns]
+        if not accumulation_view.empty and accumulation_cols:
+            accumulation_display = accumulation_view[accumulation_cols].head(20).rename(columns={
+                "Coin": "ارز", "Symbol": "نماد", "Accumulation_Score": "امتیاز انباشت",
+                "Accumulation_Data_Coverage": "پوشش داده انباشت٪", "Range_Compression_Ratio": "نسبت فشردگی دامنه",
+                "Higher_Low_24h_Percent": "تغییر کف ۲۴ساعته٪", "Buy_Share_Percent": "سهم خرید واقعی٪",
+                "Net_Buy_USD": "خالص خرید دلاری", "Volume_24h_vs_7d_Avg": "حجم ۲۴ساعت / مبنا",
+                "RSI_14": "RSI", "Accumulation_Status": "تفسیر وضعیت"
+            })
+            st.dataframe(accumulation_display, use_container_width=True, hide_index=True)
+        else:
+            st.info("برای محاسبه رادار انباشت، ابتدا از تنظیمات کناری دکمه «Calculate technical indicators» را اجرا کن.")
     else:
-        st.info("Click 'Fetch CryptoMeter intelligence' to request the free feeds. Paid feeds remain off until you select them above.")
+        st.info("ستون‌های لازم برای ارزیابی انباشت هنوز موجود نیستند.")
 
+    st.divider()
+    st.subheader("🛰️ فرصت‌های احتمالی پیش از رشد")
+    st.caption("استیبل‌کوین‌ها حذف شده‌اند. سیگنال معتبر نیازمند خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه، نقدشوندگی مناسب و بازار BTC غیرنزولی است. درصد پوشش نشان می‌دهد چه مقدار از هفت عامل واقعاً داده داشته‌اند.")
+    if not filtered.empty:
+        if "Volume_24h_vs_7d_Avg" not in filtered.columns:
+            filtered["Volume_24h_vs_7d_Avg"] = np.nan
+        ranked = filtered.sort_values(["PrePump_Score", "Volume_24h_vs_7d_Avg"], ascending=[False, False], na_position="last").copy()
+        # Radar view of the leading candidates. Missing factors stay blank, not zero or a fabricated neutral.
+        radar_factors = [
+            ("Buy_Flow_Score", "خرید واقعی"),
+            ("Volume_Acceleration_Score", "شتاب حجم"),
+            ("Momentum_Factor_Score", "مومنتوم"),
+            ("Liquidity_Quality_Score", "نقدشوندگی"),
+            ("Technical_PrePump_Score", "تکنیکال"),
+            ("BTC_Regime_Score", "وضعیت BTC"),
+            ("News_Factor_Score", "اخبار"),
+        ]
+        radar_rows = ranked.head(3)
+        if not radar_rows.empty:
+            radar_fig = go.Figure()
+            theta = [label for _, label in radar_factors]
+            for _, radar_row in radar_rows.iterrows():
+                values = [float(radar_row[col]) if col in radar_row.index and pd.notna(radar_row[col]) else None for col, _ in radar_factors]
+                radar_fig.add_trace(go.Scatterpolar(
+                    r=values, theta=theta, fill="toself", name=f"{radar_row.get('Symbol', '')}"
+                ))
+            radar_fig.update_layout(
+                title="مقایسه عوامل هفت‌گانه سه گزینه برتر",
+                polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+                template="plotly_white", height=420, margin=dict(l=35, r=35, t=55, b=35),
+                legend=dict(orientation="h", y=-0.15),
+            )
+            st.plotly_chart(radar_fig, width="stretch")
+            st.caption("هر محور فقط در صورت وجود داده رسم می‌شود؛ خالی بودن محور یعنی داده نداریم، نه اینکه امتیاز آن صفر یا ۵۰ باشد.")
+        confirmed = ranked[ranked["Signal"].astype(str).str.startswith("Pre-pump watch — real buying")]
+        early = ranked[ranked["Signal"].astype(str).str.startswith("Early activity")]
+        if not confirmed.empty:
+            st.markdown("**Confirmed volume-expansion setups (historical data available)**")
+            top_three = confirmed.head(3)
+            card_cols = st.columns(3)
+            for i, (_, coin_row) in enumerate(top_three.iterrows()):
+                with card_cols[i]:
+                    st.markdown(f"### {str(coin_row.get('Coin', 'Unknown'))} ({str(coin_row.get('Symbol', '')).upper()})")
+                    st.metric("Pre-Pump score", f"{fmt_num(coin_row.get('PrePump_Score'), 0)} / 100")
+                    change = numeric(pd.Series([coin_row.get('Change_24h_Percent')])).iloc[0]
+                    st.metric("24h change", f"{fmt_num(change)}%" if pd.notna(change) else "N/A")
+                    st.caption(f"Signal: {coin_row.get('Signal')}\n\nRisk: {coin_row.get('Risk_Level')}")
+        else:
+            st.info("No confirmed pre-pump setup yet. The scanner will not promote a coin without historical volume expansion.")
+        if not early.empty:
+            with st.expander(f"Early activity — needs confirmation ({len(early)})", expanded=True):
+                early_cols = [c for c in ["Coin", "Symbol", "PrePump_Score", "Change_24h_Percent", "Change_7d_Percent", "Volume_to_Market_Cap", "Volume_24h_vs_7d_Avg", "Risk_Level"] if c in early.columns]
+                st.dataframe(early[early_cols].head(20), use_container_width=True, hide_index=True)
+        with st.expander("📊 Detailed candidate table", expanded=True):
+            preferred_cols = [
+                "Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent",
+                "Volume_24h", "Volume_to_Market_Cap", "Volume_Activity_Score", "Price_Still_Quiet_Score",
+                "Accumulation_Score", "Accumulation_Data_Coverage", "Accumulation_Status",
+                "Range_Compression_Ratio", "Higher_Low_24h_Percent",
+                "Volume_24h_vs_7d_Avg", "Volume_Acceleration_Score", "Market_Cap_Rank", "RSI_14", "Technical_PrePump_Score",
+                "Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent", "Buy_Flow_Status",
+                "Momentum_Factor_Score", "Liquidity_Quality_Score", "BTC_Market_Context", "BTC_Regime_Score", "News_Factor_Score", "Evidence_Coverage_Percent",
+                "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange",
+                "Derivatives_Context_Score", "PrePump_Score", "Pump_Potential_Score", "Signal", "Risk_Level", "Technical_Signal",
+            ]
+            cols = [c for c in preferred_cols if c in ranked.columns]
+            display_names = {
+                "Coin": "Coin", "Symbol": "Ticker", "Price": f"Price ({currency.upper()})",
+                "Change_24h_Percent": "24h change (%)", "Change_7d_Percent": "7d change (%)",
+                "Volume_24h": f"24h volume ({currency.upper()})", "Market_Cap_Rank": "Market rank",
+                "Volume_to_Market_Cap": "Volume / market cap", "Volume_Activity_Score": "Turnover activity",
+                "Price_Still_Quiet_Score": "Price still quiet", "Accumulation_Score": "امتیاز انباشت",
+                "Accumulation_Data_Coverage": "پوشش داده انباشت (%)", "Accumulation_Status": "وضعیت انباشت",
+                "Range_Compression_Ratio": "نسبت فشردگی دامنه", "Higher_Low_24h_Percent": "تغییر کف ۲۴ساعته (%)",
+                "Volume_24h_vs_7d_Avg": "24h volume vs 7d baseline",
+                "Volume_Acceleration_Score": "Volume acceleration score", "Momentum_Factor_Score": "Momentum score",
+                "Liquidity_Quality_Score": "Liquidity score", "BTC_Regime_Score": "BTC regime score",
+                "News_Factor_Score": "News score", "Evidence_Coverage_Percent": "Evidence coverage (%)",
+                "RSI_14": "RSI (14)", "Technical_PrePump_Score": "Technical pre-pump",
+                 "Buy_Volume_USD": "حجم خرید واقعی (USDT)", "Sell_Volume_USD": "حجم فروش واقعی (USDT)",
+                "Net_Buy_USD": "خالص خرید (USDT)", "Buy_Share_Percent": "سهم خرید (%)",
+                "Buy_Flow_Status": "وضعیت جریان خرید", "BTC_Market_Context": "وضعیت بازار BTC",
+                "Funding_Rate_Percent": "Funding (%)", "Open_Interest_USD": "Open interest (USD)",
+                "Derivatives_Turnover_24h_USD": "Perp turnover (USD)", "Derivatives_Exchange": "Derivatives source", "Derivatives_Context_Score": "Derivatives context",
+                "PrePump_Score": "Pre-Pump score", "Pump_Potential_Score": "Legacy score (same value)",
+                "Signal": "Signal / interpretation", "Risk_Level": "Risk flag", "Technical_Signal": "Technical reading",
+            }
+            display_df = ranked[cols].rename(columns=display_names)
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            st.caption("RSI از صفر تا ۱۰۰ است: بالای ۷۰ می‌تواند نشانه داغ‌شدن حرکت و زیر ۳۰ نشانه فشار فروش شدید باشد؛ به‌تنهایی سیگنال خرید نیست. MACD بالای خط سیگنال یعنی مومنتوم صعودی‌تر، اما باید با حجم و ساختار قیمت تأیید شود.")
+            st.caption("روش ورود: ۲۵٪ اولیه فقط در ناحیه ساختاری مناسب؛ ۷۵٪ پس از شکست و تثبیت مقاومت. حدضرر پشت کف/حمایت ساختاری؛ اگر داده تاریخی برای تعیین آن نداریم، سطح ورود و خروج ساخته نمی‌شود. سقف ریسک هر معامله ۰٫۵٪ سرمایه و حداقل R/R برابر ۲ است.")
+    else:
+        st.info("No verified early-activity candidates match these filters yet. Calculate historical indicators or lower the minimum score to inspect unconfirmed setups.")
 
-# Full data export
-st.divider()
-with st.expander("📋 Advanced view — full market dataset", expanded=False):
-    st.caption("This table contains the raw columns used by the scanner. Most users can work from the candidate table above.")
-    if show_all:
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    st.download_button(
-        "⬇️ Download full market CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="crypto_intelligence_scanner_export.csv",
-        mime="text/csv",
+if section == "📊 نمودارها و ریزش‌ها":
+    # Separate watchlist for deeply declined assets (not mixed with pre-pump candidates).
+    st.subheader("📉 ارزهای با بیشترین ریزش")
+    st.caption("این فهرست فقط برای بررسی احتمال برگشت است؛ ریزش زیاد به‌تنهایی دلیل خرید نیست.")
+    drop_view = df[~df["Is_Excluded_Asset"]].copy()
+    drop_view["_drop_rank"] = numeric(drop_view["Change_7d_Percent"])
+    drop_view = drop_view.dropna(subset=["_drop_rank"]).sort_values("_drop_rank").head(15)
+    if not drop_view.empty:
+        drop_cols = [c for c in ["Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "RSI_14", "PrePump_Score", "Buy_Flow_Status", "Risk_Level"] if c in drop_view.columns]
+        st.dataframe(drop_view[drop_cols], width="stretch", hide_index=True)
+    else:
+        st.info("داده کافی برای رتبه‌بندی ریزش هفتگی موجود نیست.")
+
+    # Alerts for sharp moves
+    st.subheader("🔔 هشدار حرکت‌های غیرعادی بازار")
+    alerts = df[(numeric(df["Change_24h_Percent"]).abs() >= 5) | (numeric(df["Change_7d_Percent"]).abs() >= 15)].copy()
+    if not alerts.empty:
+        alerts = alerts.sort_values("Change_24h_Percent", ascending=False)
+        st.dataframe(alerts[["Coin", "Symbol", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Pump_Potential_Score", "Risk_Level"]].head(30), use_container_width=True, hide_index=True)
+    else:
+        st.info("No moves crossed the default alert thresholds.")
+
+    # Market chart
+    chart_source = filtered if not filtered.empty else df.head(50)
+    if not chart_source.empty:
+        st.subheader("🌌 نقشه مومنتوم بازار")
+        chart_source = chart_source.copy()
+        chart_source["_volume_size"] = np.log10(numeric(chart_source["Volume_24h"]).fillna(0).clip(lower=0) + 1)
+        fig = px.scatter(
+            chart_source,
+            x="Change_24h_Percent", y="Change_7d_Percent",
+            size="_volume_size", color="Pump_Potential_Score",
+            hover_name="Symbol", hover_data=["Coin", "Volume_24h", "Risk_Level"],
+            color_continuous_scale="Turbo", template="plotly_white",
+            labels={"Change_24h_Percent": "24h change (%)", "Change_7d_Percent": "7d change (%)", "Pump_Potential_Score": "Pre-Pump Score"},
+        )
+        fig.update_layout(paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font_color="#172b4d", height=520, xaxis=dict(gridcolor="#e5edf6"), yaxis=dict(gridcolor="#e5edf6"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Historical chart + Persian technical indicators
+    st.divider()
+    st.subheader("📈 نمودار قیمت و تحلیل تکنیکال به زبان فارسی")
+    st.caption("نمودارها از داده‌های تاریخی بازار ساخته می‌شوند. تفسیرها آموزشی‌اند و به‌تنهایی سیگنال قطعی خرید یا فروش نیستند.")
+    if data_source == "CoinGecko market" and "CoinGecko_ID" in df.columns:
+        hist_candidates = df.dropna(subset=["CoinGecko_ID"]).copy()
+        if not hist_candidates.empty:
+            hist_candidates["_opt"] = hist_candidates["Symbol"].astype(str) + " — " + hist_candidates["Coin"].astype(str)
+            choice = st.selectbox("ارز موردنظر برای تحلیل نمودار", hist_candidates["_opt"].tolist(), key="fa_chart_coin")
+            selected = hist_candidates[hist_candidates["_opt"] == choice].iloc[0]
+            hist_days = st.selectbox("بازه زمانی نمودار", [1, 7, 30, 90], index=1,
+                                     format_func=lambda x: {1: "۱ روز اخیر", 7: "۷ روز اخیر", 30: "۳۰ روز اخیر", 90: "۹۰ روز اخیر"}[x],
+                                     key="fa_chart_days")
+            if st.button("نمایش نمودار و تحلیل", type="primary", key="load_fa_technical_chart"):
+                try:
+                    hist = fetch_history(str(selected["CoinGecko_ID"]), currency, hist_days, cg_key)
+                    if hist.empty or len(hist) < 20:
+                        st.warning("داده تاریخی کافی برای رسم همه شاخص‌ها دریافت نشد. بازه زمانی دیگری را امتحان کن.")
+                    else:
+                        hist = hist.copy().sort_values("Time")
+                        close = pd.to_numeric(hist["price"], errors="coerce")
+                        delta = close.diff()
+                        gain = delta.clip(lower=0).rolling(14, min_periods=14).mean()
+                        loss = (-delta.clip(upper=0)).rolling(14, min_periods=14).mean()
+                        rs = gain / loss.replace(0, np.nan)
+                        hist["RSI"] = 100 - (100 / (1 + rs))
+                        hist.loc[(loss == 0) & (gain > 0), "RSI"] = 100
+                        hist.loc[(gain == 0) & (loss > 0), "RSI"] = 0
+                        ema12 = close.ewm(span=12, adjust=False).mean()
+                        ema26 = close.ewm(span=26, adjust=False).mean()
+                        hist["MACD"] = ema12 - ema26
+                        hist["MACD_Signal"] = hist["MACD"].ewm(span=9, adjust=False).mean()
+                        hist["MACD_Hist"] = hist["MACD"] - hist["MACD_Signal"]
+                        hist["Volume"] = pd.to_numeric(hist.get("volume_24h", pd.Series(index=hist.index, dtype=float)), errors="coerce")
+
+                        last_price = close.iloc[-1]
+                        last_rsi = hist["RSI"].iloc[-1]
+                        last_macd = hist["MACD"].iloc[-1]
+                        last_signal = hist["MACD_Signal"].iloc[-1]
+                        if pd.isna(last_rsi):
+                            rsi_text = "داده کافی برای تفسیر شاخص قدرت خرید و فروش وجود ندارد."
+                            rsi_status = "داده ناکافی"
+                        elif last_rsi < 30:
+                            rsi_text = "فشار فروش زیاد بوده و بازار در محدوده اشباع فروش است؛ این وضعیت فقط احتمال برگشت را مطرح می‌کند و تأیید خرید نیست."
+                            rsi_status = "اشباع فروش؛ منتظر تأیید برگشت"
+                        elif last_rsi > 70:
+                            rsi_text = "قدرت خرید بالا و بازار در محدوده اشباع خرید است؛ احتمال اصلاح یا کندشدن رشد را در نظر بگیر."
+                            rsi_status = "اشباع خرید؛ احتیاط"
+                        elif last_rsi >= 50:
+                            rsi_text = "قدرت خریداران کمی بیشتر است و شاخص در محدوده نسبتاً مثبت قرار دارد. پایداری روند را با حجم و MACD بررسی کن."
+                            rsi_status = "تمایل نسبی به خریداران"
+                        else:
+                            rsi_text = "قدرت فروشندگان هنوز بیشتر است؛ برای بررسی خرید بهتر است نشانه برگشت و عبور شاخص از محدوده میانی دیده شود."
+                            rsi_status = "فشار فروش بیشتر"
+
+                        if pd.isna(last_macd) or pd.isna(last_signal):
+                            macd_text = "داده کافی برای تفسیر مکدی وجود ندارد."
+                            macd_status = "داده ناکافی"
+                        elif last_macd > last_signal:
+                            macd_text = "خط مکدی بالاتر از خط سیگنال است؛ مومنتوم کوتاه‌مدت مثبت‌تر شده، اما بهتر است حجم و روند قیمت هم آن را تأیید کنند."
+                            macd_status = "تقاطع/وضعیت صعودی"
+                        else:
+                            macd_text = "خط مکدی پایین‌تر از خط سیگنال است؛ مومنتوم هنوز ضعیف یا نزولی است و ورود عجولانه ریسک دارد."
+                            macd_status = "وضعیت نزولی"
+
+                        st.markdown(f"**{choice} — قیمت آخرین داده:** `{fmt_money(last_price)}` {currency.upper()}")
+                        fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.055,
+                                            row_heights=[0.38, 0.16, 0.21, 0.25],
+                                            subplot_titles=("قیمت", "حجم معاملات", "شاخص قدرت خرید و فروش (RSI)", "مکدی؛ قدرت و جهت حرکت (MACD)"))
+                        fig.add_trace(go.Scatter(x=hist["Time"], y=close, mode="lines", name="قیمت", line=dict(color="#2878ee", width=2)), row=1, col=1)
+                        if hist["Volume"].notna().any():
+                            fig.add_trace(go.Bar(x=hist["Time"], y=hist["Volume"], name="حجم معاملات ۲۴ ساعته", marker_color="#9bb8df", opacity=0.72), row=2, col=1)
+                        fig.add_trace(go.Scatter(x=hist["Time"], y=hist["RSI"], mode="lines", name="RSI", line=dict(color="#805ad5", width=2)), row=3, col=1)
+                        fig.add_hrect(y0=70, y1=100, fillcolor="#f56565", opacity=0.09, line_width=0, row=3, col=1)
+                        fig.add_hrect(y0=0, y1=30, fillcolor="#13a98f", opacity=0.10, line_width=0, row=3, col=1)
+                        fig.add_hline(y=70, line_dash="dash", line_color="#d9534f", row=3, col=1)
+                        fig.add_hline(y=50, line_dash="dot", line_color="#9aa9bc", row=3, col=1)
+                        fig.add_hline(y=30, line_dash="dash", line_color="#13a98f", row=3, col=1)
+                        hist_colors = np.where(hist["MACD_Hist"].fillna(0) >= 0, "#13a98f", "#e06b75")
+                        fig.add_trace(go.Bar(x=hist["Time"], y=hist["MACD_Hist"], name="قدرت میله‌ها", marker_color=hist_colors), row=4, col=1)
+                        fig.add_trace(go.Scatter(x=hist["Time"], y=hist["MACD"], mode="lines", name="خط مکدی", line=dict(color="#2878ee", width=2)), row=4, col=1)
+                        fig.add_trace(go.Scatter(x=hist["Time"], y=hist["MACD_Signal"], mode="lines", name="خط سیگنال", line=dict(color="#f0a33a", width=2)), row=4, col=1)
+                        fig.update_yaxes(title_text=f"قیمت ({currency.upper()})", row=1, col=1, gridcolor="#e5edf6")
+                        fig.update_yaxes(title_text="حجم", row=2, col=1, gridcolor="#e5edf6")
+                        fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1, gridcolor="#e5edf6")
+                        fig.update_yaxes(title_text="مکدی", row=4, col=1, gridcolor="#e5edf6")
+                        fig.update_xaxes(title_text="زمان", gridcolor="#e5edf6", row=4, col=1)
+                        fig.update_layout(height=980, template="plotly_white", paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+                                          font=dict(family="Arial", color="#172b4d", size=12), legend=dict(orientation="h", y=1.02, x=0),
+                                          margin=dict(l=20, r=20, t=90, b=30), hovermode="x unified",
+                                          title=dict(text="نقشه تکنیکال قیمت، حجم، RSI و MACD", x=0.5))
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.markdown("#### 🧭 تفسیر ساده نمودار")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.markdown(f"**RSI — {rsi_status}**")
+                            st.write(rsi_text)
+                            if pd.notna(last_rsi):
+                                st.metric("مقدار RSI", f"{last_rsi:.1f} از ۱۰۰")
+                        with c2:
+                            st.markdown(f"**MACD — {macd_status}**")
+                            st.write(macd_text)
+                            if pd.notna(last_macd) and pd.notna(last_signal):
+                                st.metric("فاصله مکدی از خط سیگنال", f"{(last_macd-last_signal):.6g}")
+                        st.info("حجم نشان می‌دهد چه مقدار معامله انجام شده، نه اینکه دقیقاً چه مقدار پول خالص وارد ارز شده است. برای تشخیص ورود پول واقعی یا فعالیت نهنگ‌ها به داده جریان سفارش یا داده آن‌چین نیاز داریم.")
+                        st.caption("نکته: در بازه‌های ۱، ۷، ۳۰ و ۹۰ روزه، فاصله زمانی نقاط داده ممکن است متفاوت باشد. این نمودار بر اساس داده تاریخی دریافتی از CoinGecko رسم می‌شود و معادل کندل زنده صرافی بیت‌پین نیست.")
+                except Exception as exc:
+                    st.error(f"خطا در دریافت یا رسم نمودار: {exc}")
+    else:
+        st.info("برای نمایش نمودارهای تکنیکال، منبع داده CoinGecko را انتخاب کن.")
+
+if section == "📰 اخبار و DEX":
+    # News panel
+    st.divider()
+    st.subheader("📰 اخبار و عوامل بنیادی")
+    news_symbol = st.text_input("News currency code (e.g. BTC, ETH, SOL)", value="BTC").strip().upper()
+    if st.button("Fetch latest news"):
+        with st.spinner("Fetching news..."):
+            news_df, news_status = fetch_news(news_key_input, news_symbol or None)
+        if news_df.empty:
+            st.info(f"No news returned. {news_status}")
+        else:
+            # Lightweight headline sentiment proxy; never represented as a trained sentiment model.
+            pos_words = ("approval", "adoption", "partnership", "launch", "upgrade", "inflow", "bullish", "listing")
+            neg_words = ("hack", "exploit", "lawsuit", "ban", "delist", "outflow", "bearish", "scam", "breach")
+            def headline_score(title):
+                t = str(title).lower()
+                return sum(w in t for w in pos_words) - sum(w in t for w in neg_words)
+            news_df["Headline_Sentiment_Proxy"] = news_df["Title"].apply(headline_score).map(
+                lambda x: "Positive keyword" if x > 0 else ("Negative keyword" if x < 0 else "Neutral / unclassified")
+            )
+            st.dataframe(news_df, use_container_width=True, hide_index=True)
+            st.caption("Headline sentiment is a simple keyword proxy, not a trained NLP model or a fact-check.")
+
+    # DEX panel
+    st.divider()
+    st.subheader("🧪 جریان معاملات، فشار خرید و فروش و نشانه‌های نهنگ‌ها")
+    st.caption("Searches DEX Screener pairs matching your query. This is a market-activity screen, not complete on-chain whale tracking.")
+    st.info(
+        "What these numbers mean: DEX volume is traded value, not net money entering a token. "
+        "Buy/sell counts are transaction counts. Estimated buy/sell volume below is only a rough proxy "
+        "that splits total volume by transaction-count share; it is NOT actual USD flow. "
+        "Real whale detection needs wallet-level/on-chain trade data from a suitable provider."
     )
+    if dex_button:
+        if not dex_query.strip():
+            st.warning("Enter a search term.")
+        else:
+            try:
+                with st.spinner(f"Searching DEX pairs for {dex_query}..."):
+                    dex_df = fetch_dex_search(dex_query.strip())
+                if dex_df.empty:
+                    st.info("No DEX pairs found for that search term.")
+                else:
+                    dex_df = dex_df[numeric(dex_df["Liquidity_USD"]).fillna(0) >= min_liquidity]
+                    if dex_df.empty:
+                        st.warning("No pairs passed the minimum liquidity filter. Lower the liquidity filter and search again.")
+                    else:
+                        top = dex_df.iloc[0]
+                        k1, k2, k3, k4 = st.columns(4)
+                        k1.metric("DEX pairs found", f"{len(dex_df):,}")
+                        k2.metric("Top pair 24h volume", f"${fmt_num(top.get('Volume_24h_USD'), 0)}")
+                        k3.metric("Top pair liquidity", f"${fmt_num(top.get('Liquidity_USD'), 0)}")
+                        k4.metric("Top pair buy-count share", f"{fmt_num(top.get('Buy_Count_Share_Percent'), 1)}%")
+                        st.caption("Buy-count share = buys ÷ (buys + sells). It counts transactions, not their dollar size.")
+                        display_cols = [
+                            "Token", "Symbol", "Chain", "DEX", "Price_USD", "Change_1h_Percent",
+                            "Change_24h_Percent", "Volume_24h_USD", "Liquidity_USD", "Transactions_24h",
+                            "Buys_24h", "Sells_24h", "Buy_Count_Share_Percent",
+                            "Estimated_Buy_Volume_Proxy_USD", "Estimated_Sell_Volume_Proxy_USD",
+                            "Volume_to_Liquidity_Ratio", "Activity_Flag", "DEX_Screen_Score", "Risk_Flag", "Pair_URL"
+                        ]
+                        display_cols = [c for c in display_cols if c in dex_df.columns]
+                        st.dataframe(dex_df[display_cols].head(100), use_container_width=True, hide_index=True)
+                        st.caption(
+                            "Whale-watch clue only: unusually high volume relative to liquidity plus many transactions can merit review, "
+                            "but does not prove that whales traded or that net inflows occurred. Check wallet-level data separately."
+                        )
+                    st.download_button(
+                        "⬇️ Download DEX search CSV",
+                        data=dex_df.to_csv(index=False).encode("utf-8"),
+                        file_name="dex_screener_search.csv",
+                        mime="text/csv",
+                    )
+            except Exception as exc:
+                st.error(f"DEX Screener error: {exc}")
 
-st.caption(
-    "Data coverage depends on the connected APIs and their limits. "
-    "CoinGecko market pages cover listed market assets; DEX search is query-based. "
-    "CryptoMeter paid feeds require endpoint access in your plan. This tool is informational only, not financial advice."
-)
+    # =========================================================
+if section == "🐋 جریان پول و مشتقات":
+    # LIVE FUNDING + OPEN INTEREST PANEL
+    # =========================================================
+    if data_source == "CoinGecko market" and use_bybit_derivatives:
+        st.divider()
+        st.subheader("📈 وضعیت بازار مشتقه: فاندینگ و سود باز")
+        st.caption(
+            "Public USDT perpetual snapshot (Bybit, with Gate.io fallback). Funding is the current periodic rate, not an annual yield. "
+            "Open interest is the notional value of outstanding contracts; it is not net money entering spot markets."
+        )
+        deriv = df[df.get("Funding_Rate_Percent", pd.Series(np.nan, index=df.index)).notna()].copy()
+        if deriv.empty:
+            st.info("No matching Bybit perpetual symbols were returned for the loaded market list.")
+        else:
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Matched perpetuals", f"{len(deriv):,}")
+            d2.metric("Positive funding", int((numeric(deriv["Funding_Rate_Percent"]) > 0).sum()))
+            d3.metric("Negative funding", int((numeric(deriv["Funding_Rate_Percent"]) < 0).sum()))
+            deriv_view = deriv.sort_values("Derivatives_Context_Score", ascending=False)
+            deriv_cols = [c for c in ["Coin", "Symbol", "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange", "Derivatives_Change_24h_Percent", "Derivatives_Context_Score", "PrePump_Score", "Signal"] if c in deriv_view.columns]
+            st.dataframe(deriv_view[deriv_cols].head(60), use_container_width=True, hide_index=True)
+            st.caption("Interpretation: very positive funding can indicate crowded longs; negative funding can indicate crowded shorts. Combine with price, volume and OI changes—one snapshot alone cannot confirm a squeeze or a pump.")
+
+
+    # =========================================================
+    # CRYPTOMETER INTELLIGENCE PANEL
+    # =========================================================
+    st.divider()
+    st.subheader("🧭 داده‌های تکمیلی: فعالیت نهنگ‌ها، جریان پول و حرکت‌های سریع")
+    st.caption(
+        "CryptoMeter feeds add market evidence to the CoinGecko scanner. A signal is a research watchlist, "
+        "not a guaranteed pump prediction or an instruction to buy."
+    )
+    cm_key = secret_or_env("CRYPTOMETER_API_KEY")
+    if not cm_key:
+        st.warning("CryptoMeter API key not found. Add CRYPTOMETER_API_KEY in Render → Environment, then save and redeploy.")
+    else:
+        cm_a, cm_b, cm_c = st.columns(3)
+        with cm_a:
+            cm_symbol_filter = st.text_input(
+                "Whale / funding symbol filter (optional)", value="", key="cm_symbol_filter",
+                help="Leave blank to request the latest market-wide records where the endpoint supports it."
+            ).strip().lower()
+        with cm_b:
+            cm_timeframe = st.selectbox("Flow timeframe", ["15m", "1h", "4h", "d"], index=2, key="cm_flow_timeframe")
+        with cm_c:
+            cm_mover_timeframe = st.selectbox("Gainers/losers timeframe", ["5m", "15m", "1h", "1d", "1w"], index=2, key="cm_mover_timeframe")
+
+        st.markdown("**Free feeds** — account status, market trend pressure and the Rapid Movements feed.")
+        st.caption("The Rapid Movements endpoint is the original 4-hour movement feed. The richer Rapid Movements V2 feed is a paid endpoint.")
+
+        paid_options = {
+            "Whale trades (xtrades) — paid": "whales",
+            "Volume flow — paid": "volume_flow",
+            "Liquidity Lens / netflow — paid": "liquidity",
+            "Funding rates — paid": "funding",
+            "Gainers & losers — paid": "movers",
+        }
+        paid_selected_labels = st.multiselect(
+            "Optional paid feeds (select only endpoints included in your CryptoMeter plan)",
+            options=list(paid_options.keys()),
+            default=[],
+            help="Do not select these unless you have enabled/purchased the corresponding endpoint in CryptoMeter Manage API."
+        )
+        st.info(
+            "Whale trades, Volume Flow, Liquidity Lens, Funding Rates and Gainers/Losers are marked Paid in CryptoMeter's API documentation. "
+            "If your plan does not include an endpoint, leave it unselected."
+        )
+
+        if st.button("🔄 Fetch CryptoMeter intelligence", type="primary", key="cm_fetch_button"):
+            endpoint_jobs = {
+                "account": ("info", {}),
+                "trend": ("trend-indicator-v3", {}),
+                "rapid": ("rapid-movements", {}),
+            }
+            for label in paid_selected_labels:
+                result_key = paid_options[label]
+                if result_key == "whales":
+                    params = {"symbol": cm_symbol_filter} if cm_symbol_filter else {}
+                    endpoint_jobs[result_key] = ("xtrades", params)
+                elif result_key == "volume_flow":
+                    endpoint_jobs[result_key] = ("volume-flow", {"timeframe": cm_timeframe})
+                elif result_key == "liquidity":
+                    endpoint_jobs[result_key] = ("liquidity-lens", {"timeframe": cm_timeframe})
+                elif result_key == "funding":
+                    params = {"symbol": cm_symbol_filter} if cm_symbol_filter else {}
+                    endpoint_jobs[result_key] = ("funding-rates", params)
+                elif result_key == "movers":
+                    endpoint_jobs[result_key] = ("gainers-losers", {"timeframe": cm_mover_timeframe})
+
+            collected = {}
+            with st.spinner("Requesting selected CryptoMeter feeds..."):
+                for result_key, (endpoint, params) in endpoint_jobs.items():
+                    try:
+                        collected[result_key] = {
+                            "payload": fetch_cryptometer(endpoint, params, cm_key),
+                            "error": None,
+                            "endpoint": endpoint,
+                        }
+                    except Exception as exc:
+                        collected[result_key] = {
+                            "payload": None,
+                            "error": str(exc),
+                            "endpoint": endpoint,
+                        }
+            st.session_state["cryptometer_results"] = collected
+            st.session_state["cryptometer_last_fetch"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        cm_results = st.session_state.get("cryptometer_results", {})
+        if cm_results:
+            st.caption(f"Last requested: {st.session_state.get('cryptometer_last_fetch', 'unknown')} • Responses are cached for 5 minutes.")
+            errors = [(key, value) for key, value in cm_results.items() if value.get("error")]
+            if errors:
+                with st.expander("⚠️ Feed access / API errors", expanded=True):
+                    for key, value in errors:
+                        st.warning(f"{value.get('endpoint', key)}: {value['error']}")
+
+            account_result = cm_results.get("account", {})
+            if account_result.get("payload"):
+                account_df = cryptometer_frame(account_result["payload"])
+                if not account_df.empty:
+                    account = account_df.iloc[0]
+                    q1, q2, q3, q4 = st.columns(4)
+                    q1.metric("CryptoMeter plan", str(account.get("plan", "N/A")))
+                    q2.metric("API status", str(account.get("status", "N/A")))
+                    q3.metric("Monthly quota", fmt_num(account.get("quota"), 0))
+                    q4.metric("Requests used", fmt_num(account.get("total_requests"), 0))
+                    extras = account.get("extra_endpoints")
+                    if isinstance(extras, list) and extras:
+                        st.caption("Additional enabled endpoints reported by account: " + ", ".join(map(str, extras)))
+
+            trend_result = cm_results.get("trend", {})
+            if trend_result.get("payload"):
+                trend_df = cryptometer_frame(trend_result["payload"])
+                if not trend_df.empty:
+                    trend = trend_df.iloc[-1]
+                    st.markdown("**Market-wide trend pressure**")
+                    t1, t2, t3 = st.columns(3)
+                    t1.metric("Trend score", fmt_num(trend.get("trend_score")))
+                    t2.metric("Buy pressure", f"{fmt_num(trend.get('buy_pressure'))}%")
+                    t3.metric("Sell pressure", f"{fmt_num(trend.get('sell_pressure'))}%")
+                    if trend.get("timestamp"):
+                        st.caption(f"Provider timestamp: {trend.get('timestamp')}. Treat this as broad market context, not a coin-specific signal.")
+
+            rapid_result = cm_results.get("rapid", {})
+            if rapid_result.get("payload"):
+                rapid_df = cryptometer_frame(rapid_result["payload"])
+                st.markdown("**Rapid Movements — last four hours**")
+                if rapid_df.empty:
+                    st.info("No rapid-movement records were returned.")
+                else:
+                    show_cols = [c for c in ["pair", "exchange", "change_detected", "side", "timestamp"] if c in rapid_df.columns]
+                    st.dataframe(rapid_df[show_cols] if show_cols else rapid_df, use_container_width=True, hide_index=True)
+
+            whale_result = cm_results.get("whales", {})
+            if whale_result.get("payload"):
+                whale_df = cryptometer_frame(whale_result["payload"])
+                st.markdown("**Whale trades**")
+                if whale_df.empty:
+                    st.info("No whale-trade rows were returned.")
+                else:
+                    if "usd_total" not in whale_df.columns and "total" in whale_df.columns:
+                        whale_df["usd_total"] = whale_df["total"]
+                    whale_cols = [c for c in ["timestamp", "symbol", "pair", "exchange", "side", "price", "size", "usd_total"] if c in whale_df.columns]
+                    st.dataframe(whale_df[whale_cols] if whale_cols else whale_df, use_container_width=True, hide_index=True)
+
+            volume_result = cm_results.get("volume_flow", {})
+            if volume_result.get("payload"):
+                flow_data = cryptometer_data(volume_result["payload"])
+                st.markdown("**Volume Flow**")
+                if isinstance(flow_data, dict):
+                    flow_tabs = st.tabs(["Inflow", "Outflow", "Netflow"])
+                    for tab, flow_name in zip(flow_tabs, ["inflow", "outflow", "netflow"]):
+                        with tab:
+                            flow_rows = flow_data.get(flow_name, [])
+                            flow_frame = pd.DataFrame(flow_rows if isinstance(flow_rows, list) else [])
+                            if flow_frame.empty:
+                                st.info(f"No {flow_name} rows returned.")
+                            else:
+                                st.dataframe(flow_frame, use_container_width=True, hide_index=True)
+                else:
+                    st.json(flow_data)
+
+            # ---------------------------------------------------------
+            # ACTUAL PROVIDER BUY/SELL TRADED VOLUME (NOT TXN-COUNT PROXY)
+            # ---------------------------------------------------------
+            st.markdown("**خرید و فروش واقعی ثبت‌شده در صرافی (۲۴ ساعت)**")
+            st.caption(
+                "این بخش از endpoint اختصاصی 24h-trade-volume-v2 استفاده می‌کند؛ "
+                "حجم خرید و فروش را از داده صرافی می‌گیرد، نه از نسبت تعداد معاملات. "
+                "این داده فقط برای جفت و صرافی انتخاب‌شده است و به‌تنهایی ورود نهنگ یا خرید کیف‌پول خاص را ثابت نمی‌کند."
+            )
+            cm_symbols = []
+            if "Symbol" in df.columns:
+                cm_symbols = [str(x).upper() for x in df["Symbol"].dropna().unique() if str(x).strip()]
+            if not cm_symbols:
+                cm_symbols = ["BTC", "ETH", "SOL"]
+            ranked_symbols = []
+            if "PrePump_Score" in df.columns and "Symbol" in df.columns:
+                ranked_symbols = (
+                    df.assign(_cm_rank=numeric(df["PrePump_Score"]))
+                      .sort_values("_cm_rank", ascending=False)["Symbol"]
+                      .dropna().astype(str).str.upper().drop_duplicates().head(5).tolist()
+                )
+            default_symbols = [x for x in ranked_symbols if x in cm_symbols][:5] or cm_symbols[:5]
+            buy_col1, buy_col2 = st.columns([2, 1])
+            with buy_col1:
+                selected_buy_symbols = st.multiselect(
+                    "ارزها برای بررسی حجم خرید/فروش", options=cm_symbols, default=default_symbols,
+                    max_selections=10, key="cm_actual_buy_symbols"
+                )
+            with buy_col2:
+                buy_exchange = st.selectbox(
+                    "صرافی مرجع", ["binance", "bybit_spot", "okx", "kucoin", "coinbase_pro", "kraken"],
+                    index=0, key="cm_actual_buy_exchange"
+                )
+            if st.button("محاسبه حجم واقعی خرید و فروش", key="cm_actual_buy_fetch", type="primary"):
+                if not selected_buy_symbols:
+                    st.warning("حداقل یک ارز انتخاب کن.")
+                else:
+                    actual_rows = []
+                    with st.spinner("در حال دریافت حجم خرید و فروش از صرافی..."):
+                        for symbol in selected_buy_symbols:
+                            try:
+                                actual_rows.append(fetch_cryptometer_buy_sell_volume(symbol, buy_exchange, cm_key))
+                            except Exception as exc:
+                                actual_rows.append({
+                                    "Symbol": symbol, "Pair": f"{symbol}-USDT", "Exchange": buy_exchange,
+                                    "Buy volume (USDT)": np.nan, "Sell volume (USDT)": np.nan,
+                                    "Net buy (USDT)": np.nan, "Buy share (%)": np.nan,
+                                    "Data status": str(exc)[:140]
+                                })
+                            time.sleep(0.16)
+                    st.session_state["cm_actual_buy_sell_rows"] = actual_rows
+                    st.session_state["cm_actual_buy_sell_time"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
+            actual_rows = st.session_state.get("cm_actual_buy_sell_rows", [])
+            if actual_rows:
+                actual_df = pd.DataFrame(actual_rows)
+                st.caption("آخرین دریافت: " + str(st.session_state.get("cm_actual_buy_sell_time", "نامشخص")))
+                valid_actual = actual_df.dropna(subset=["Buy volume (USDT)", "Sell volume (USDT)"])
+                if valid_actual.empty:
+                    st.warning("برای ارزهای انتخاب‌شده داده خرید/فروش برنگشت. ممکن است جفت USDT در صرافی یا دسترسی این endpoint در پلن شما موجود نباشد؛ عدد صفر فرض نمی‌شود.")
+                else:
+                    show_actual = actual_df.copy()
+                    for col in ["Buy volume (USDT)", "Sell volume (USDT)", "Net buy (USDT)"]:
+                        show_actual[col] = show_actual[col].map(lambda v: fmt_num(v, 0) if pd.notna(v) else "—")
+                    show_actual["Buy share (%)"] = show_actual["Buy share (%)"].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
+                    show_actual = show_actual.rename(columns={
+                        "Symbol": "ارز", "Pair": "جفت", "Exchange": "صرافی",
+                        "Buy volume (USDT)": "حجم خرید (USDT)",
+                        "Sell volume (USDT)": "حجم فروش (USDT)",
+                        "Net buy (USDT)": "خالص خرید (USDT)",
+                        "Buy share (%)": "سهم خرید", "Data status": "وضعیت داده"
+                    })
+                    st.dataframe(show_actual, width="stretch", hide_index=True)
+                    st.caption("خالص خرید مثبت یعنی حجم خرید ثبت‌شده از فروش بیشتر بوده است. برای تأیید سیگنال، روند قیمت، نقدشوندگی و چند بازه زمانی را هم بررسی کن.")
+
+            liquidity_result = cm_results.get("liquidity", {})
+            if liquidity_result.get("payload"):
+                liquidity_data = cryptometer_data(liquidity_result["payload"])
+                st.markdown("**Liquidity Lens — coin-level netflow**")
+                if isinstance(liquidity_data, dict):
+                    liquidity_df = pd.DataFrame([
+                        {"Symbol": symbol, **values}
+                        for symbol, values in liquidity_data.items() if isinstance(values, dict)
+                    ])
+                elif isinstance(liquidity_data, list):
+                    liquidity_df = pd.DataFrame(liquidity_data)
+                else:
+                    liquidity_df = pd.DataFrame()
+                if liquidity_df.empty:
+                    st.info("No liquidity-lens rows were returned.")
+                else:
+                    if "netflow" in liquidity_df.columns:
+                        liquidity_df = liquidity_df.sort_values("netflow", ascending=False)
+                    st.dataframe(liquidity_df, use_container_width=True, hide_index=True)
+
+            funding_result = cm_results.get("funding", {})
+            if funding_result.get("payload"):
+                funding_df = cryptometer_frame(funding_result["payload"])
+                st.markdown("**Funding rates**")
+                if funding_df.empty:
+                    st.info("No funding-rate rows were returned.")
+                else:
+                    funding_cols = [c for c in ["symbol", "pair", "exchange", "rate_percent", "annualized_percent", "interval_hours", "next_funding_at"] if c in funding_df.columns]
+                    st.dataframe(funding_df[funding_cols] if funding_cols else funding_df, use_container_width=True, hide_index=True)
+
+            movers_result = cm_results.get("movers", {})
+            if movers_result.get("payload"):
+                movers_data = cryptometer_data(movers_result["payload"])
+                st.markdown("**Gainers & losers**")
+                if isinstance(movers_data, dict):
+                    mover_tabs = st.tabs(["Gainers", "Losers"])
+                    for tab, side_name in zip(mover_tabs, ["gainers", "losers"]):
+                        with tab:
+                            side_df = pd.DataFrame(movers_data.get(side_name, []))
+                            if side_df.empty:
+                                st.info(f"No {side_name} rows returned.")
+                            else:
+                                st.dataframe(side_df, use_container_width=True, hide_index=True)
+                else:
+                    st.json(movers_data)
+
+            watchlist_df = cryptometer_watchlist(cm_results)
+            if not watchlist_df.empty:
+                st.markdown("**Cross-signal activity watchlist**")
+                st.caption(
+                    "Transparent evidence score: Rapid Moves (+/−10), whale buy/sell USD dominance (+/−18), "
+                    "and coin-level netflow (+/−15). A bullish/bearish label requires at least two independent evidence sources. "
+                    "This score is not a calibrated probability and is not a buy recommendation."
+                )
+                st.dataframe(watchlist_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Download CryptoMeter watchlist CSV",
+                    data=watchlist_df.to_csv(index=False).encode("utf-8"),
+                    file_name="cryptometer_activity_watchlist.csv",
+                    mime="text/csv",
+                    key="cm_watchlist_download",
+                )
+        else:
+            st.info("Click 'Fetch CryptoMeter intelligence' to request the free feeds. Paid feeds remain off until you select them above.")
+
+
+if section == "📁 داده‌ها":
+    # Full data export
+    st.divider()
+    with st.expander("📋 مشاهده پیشرفته و دریافت کل داده‌های بازار", expanded=False):
+        st.caption("This table contains the raw columns used by the scanner. Most users can work from the candidate table above.")
+        if show_all:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Download full market CSV",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="crypto_intelligence_scanner_export.csv",
+            mime="text/csv",
+        )
+
+    st.caption(
+        "Data coverage depends on the connected APIs and their limits. "
+        "CoinGecko market pages cover listed market assets; DEX search is query-based. "
+        "CryptoMeter paid feeds require endpoint access in your plan. This tool is informational only, not financial advice."
+    )

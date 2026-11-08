@@ -752,26 +752,14 @@ def style_percentage_columns(frame):
     return frame.style.apply(color_column, subset=percent_cols)
 
 
-def render_selectable_coin_table(source_frame, display_frame=None, *, key, **kwargs):
-    """Render a selectable table and remember the selected coin for the shared chart panel."""
-    source = source_frame.reset_index(drop=True).copy()
+def render_selectable_coin_table(source_frame, display_frame=None, *, key=None, **kwargs):
+    """Render the existing coin table with positive/negative percentage coloring only."""
     shown = (display_frame if display_frame is not None else source_frame).reset_index(drop=True).copy()
-    event = st.dataframe(
+    # No row-selection callback or chart panel: keep the table simple and fast.
+    return st.dataframe(
         style_percentage_columns(shown), use_container_width=True, hide_index=True,
-        on_select="rerun", selection_mode="single-row", key=key, **kwargs
+        **kwargs
     )
-    rows = event.selection.rows if event and event.selection else []
-    if rows:
-        idx = int(rows[0])
-        if 0 <= idx < len(source):
-            row = source.iloc[idx]
-            st.session_state["selected_chart_coin"] = {
-                "Coin": str(row.get("Coin", row.get("ارز", "Unknown"))),
-                "Symbol": str(row.get("Symbol", row.get("نماد", ""))).upper(),
-                "CoinGecko_ID": str(row.get("CoinGecko_ID", "")) if pd.notna(row.get("CoinGecko_ID")) else "",
-                "Price": row.get("Price", np.nan),
-            }
-    return event
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -884,20 +872,38 @@ def fetch_bybit_spot_klines(base_symbol, interval, days):
     except Exception as exc:
         errors.append(f"OKX: {str(exc)[:160]}")
 
-    # 3) Gate.io Spot public candles. One request supports up to 1000 candles.
+    # 3) Gate.io Spot public candles.
+    # Gate rejects requests that combine `limit` with `from`/`to`; time ranges
+    # must also be split into <=1000-candle windows.
     try:
         pair = f"{base_symbol}_USDT"
         gate_interval = {"60": "1h", "240": "4h", "D": "1d", "W": "7d", "M": "30d"}[interval]
-        gate_rows = safe_get(
-            "https://api.gateio.ws/api/v4/spot/candlesticks",
-            params={"currency_pair": pair, "interval": gate_interval,
-                    "from": int(start_ms / 1000), "to": int(end_ms / 1000), "limit": 1000}, timeout=18
-        )
-        # Gate format: [timestamp, volume, close, high, low, open, ...]
-        rows = [[int(r[0]) * 1000, r[5], r[3], r[4], r[2], r[1]] for r in gate_rows]
+        interval_seconds = {"1h": 3600, "4h": 14400, "1d": 86400,
+                            "7d": 604800, "30d": 2592000}[gate_interval]
+        start_s, end_s = int(start_ms / 1000), int(end_ms / 1000)
+        # Keep each requested window safely below Gate's 1000-point ceiling.
+        window_seconds = interval_seconds * 950
+        cursor = start_s
+        gate_rows = []
+        while cursor < end_s:
+            window_end = min(end_s, cursor + window_seconds)
+            batch = safe_get(
+                "https://api.gateio.ws/api/v4/spot/candlesticks",
+                params={"currency_pair": pair, "interval": gate_interval,
+                        "from": cursor, "to": window_end}, timeout=18
+            )
+            if not isinstance(batch, list):
+                raise RuntimeError(f"Gate.io پاسخ غیرمنتظره داد: {str(batch)[:120]}")
+            gate_rows.extend(batch)
+            if window_end >= end_s:
+                break
+            cursor = window_end + 1
+        # Gate format: [timestamp, quote_volume, close, high, low, open, ...]
+        rows = [[int(r[0]) * 1000, r[5], r[3], r[4], r[2], r[1]]
+                for r in gate_rows if isinstance(r, (list, tuple)) and len(r) >= 6]
         return finish_candles(rows, ["timestamp_ms", "Open", "High", "Low", "Close", "Volume"], pair, "Gate.io")
     except Exception as exc:
-        errors.append(f"Gate.io: {str(exc)[:160]}")
+        errors.append(f"Gate.io: {str(exc)[:200]}")
 
     raise RuntimeError("هیچ منبعی کندل نداد. " + " | ".join(errors))
 
@@ -1739,7 +1745,6 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                 "Signal": "Signal / interpretation", "Risk_Level": "Risk flag", "Technical_Signal": "Technical reading",
             }
             display_df = ranked[cols].rename(columns=display_names)
-            st.caption("برای بازکردن پنل تحلیل حرفه‌ای، روی ردیف هر ارز کلیک کن.")
             render_selectable_coin_table(ranked.head(100), display_df.head(100), key="candidate_coin_table_select")
             st.caption("RSI از صفر تا ۱۰۰ است: بالای ۷۰ می‌تواند نشانه داغ‌شدن حرکت و زیر ۳۰ نشانه فشار فروش شدید باشد؛ به‌تنهایی سیگنال خرید نیست. MACD بالای خط سیگنال یعنی مومنتوم صعودی‌تر، اما باید با حجم و ساختار قیمت تأیید شود.")
             st.caption("روش ورود: ۲۵٪ اولیه فقط در ناحیه ساختاری مناسب؛ ۷۵٪ پس از شکست و تثبیت مقاومت. حدضرر پشت کف/حمایت ساختاری؛ اگر داده تاریخی برای تعیین آن نداریم، سطح ورود و خروج ساخته نمی‌شود. سقف ریسک هر معامله ۰٫۵٪ سرمایه و حداقل R/R برابر ۲ است.")
@@ -2393,62 +2398,3 @@ if section == "📁 داده‌ها":
         "CoinGecko market pages cover listed market assets; DEX search is query-based. "
         "CryptoMeter paid feeds require endpoint access in your plan. This tool is informational only, not financial advice."
     )
-
-# =========================================================
-# SHARED IN-APP TRADINGVIEW-LIKE COIN ANALYSIS PANEL
-# =========================================================
-selected_chart_coin = st.session_state.get("selected_chart_coin")
-if selected_chart_coin and section in ["🧲 رادار انباشت و پیش‌پامپ", "📊 نمودارها و ریزش‌ها", "🏠 نمای کلی"]:
-    st.divider()
-    coin_name = selected_chart_coin.get("Coin", "Unknown")
-    coin_symbol = selected_chart_coin.get("Symbol", "").upper()
-    st.subheader(f"📈 تحلیل حرفه‌ای {coin_name} ({coin_symbol})")
-    st.caption("نمودار کندلی بازار اسپات؛ ابتدا Bybit و در صورت محدودیت به‌ترتیب OKX و Gate.io بررسی می‌شوند. فقط پس از انتخاب ارز دریافت می‌شود و ۵ دقیقه Cache دارد.")
-    chart_controls = st.columns([1, 1, 2])
-    with chart_controls[0]:
-        chart_interval_label = st.selectbox("تایم‌فریم", ["۱ ساعته", "۴ ساعته", "روزانه", "هفتگی", "ماهانه"], index=0, key="tv_chart_interval")
-    with chart_controls[1]:
-        chart_days = st.selectbox("تاریخچه", [1, 7, 30, 90], index=3, format_func=lambda d: {1:"۲۴ ساعت", 7:"۷ روز", 30:"۳۰ روز", 90:"۳ ماه"}[d], key="tv_chart_days")
-    with chart_controls[2]:
-        show_emas = st.multiselect("میانگین‌های متحرک", ["EMA20", "EMA50", "EMA200"], default=["EMA20", "EMA50"], key="tv_chart_emas")
-    interval_map = {"۱ ساعته":"60", "۴ ساعته":"240", "روزانه":"D", "هفتگی":"W", "ماهانه":"M"}
-    try:
-        with st.spinner("در حال دریافت کندل‌های بازار..."):
-            candle_df, exchange_pair = fetch_bybit_spot_klines(coin_symbol, interval_map[chart_interval_label], chart_days)
-        st.caption(f"بازار: Bybit Spot · جفت: {exchange_pair} · تعداد کندل: {len(candle_df):,}")
-        candle_fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.035,
-                                   row_heights=[0.62, 0.18, 0.20],
-                                   subplot_titles=("نمودار کندلی و EMA", "حجم معاملات", "RSI / MACD"))
-        candle_fig.add_trace(go.Candlestick(x=candle_df["Time"], open=candle_df["Open"], high=candle_df["High"],
-                                            low=candle_df["Low"], close=candle_df["Close"], name=coin_symbol), row=1, col=1)
-        ema_colors = {"EMA20":"#1769d2", "EMA50":"#13a98f", "EMA200":"#d97706"}
-        for ema in show_emas:
-            candle_fig.add_trace(go.Scatter(x=candle_df["Time"], y=candle_df[ema], mode="lines", name=ema,
-                                            line=dict(width=1.5, color=ema_colors[ema])), row=1, col=1)
-        candle_fig.add_trace(go.Bar(x=candle_df["Time"], y=candle_df["Volume"], name="Volume",
-                                    marker_color="#9bb8df", opacity=.72), row=2, col=1)
-        candle_fig.add_trace(go.Scatter(x=candle_df["Time"], y=candle_df["RSI"], name="RSI 14",
-                                        line=dict(color="#805ad5", width=1.6)), row=3, col=1)
-        candle_fig.add_hline(y=70, line_dash="dash", line_color="#d9534f", row=3, col=1)
-        candle_fig.add_hline(y=30, line_dash="dash", line_color="#13a98f", row=3, col=1)
-        candle_fig.update_layout(template="plotly_white", height=760, paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-                                 font=dict(color="#172b4d", size=12), margin=dict(l=15,r=15,t=55,b=20),
-                                 hovermode="x unified", xaxis_rangeslider_visible=False,
-                                 legend=dict(orientation="h", y=1.02, x=0))
-        candle_fig.update_yaxes(gridcolor="#e5edf6")
-        candle_fig.update_xaxes(gridcolor="#edf2f8")
-        st.plotly_chart(candle_fig, use_container_width=True, config={"displaylogo":False, "scrollZoom":True, "responsive":True})
-        latest = candle_df.iloc[-1]
-        prev_close = candle_df["Close"].iloc[-2] if len(candle_df) > 1 else np.nan
-        change_pct = ((latest["Close"] / prev_close) - 1) * 100 if pd.notna(prev_close) and prev_close else np.nan
-        m1,m2,m3,m4 = st.columns(4)
-        m1.metric("آخرین قیمت", fmt_money(latest["Close"], "USDT"), f"{change_pct:+.2f}%" if pd.notna(change_pct) else None)
-        m2.metric("RSI (14)", f"{latest['RSI']:.1f}" if pd.notna(latest["RSI"]) else "—")
-        m3.metric("EMA20", fmt_money(latest["EMA20"], "USDT"))
-        m4.metric("MACD", f"{latest['MACD']:.6g}" if pd.notna(latest["MACD"]) else "—")
-        macd_bias = "مثبت‌تر" if latest["MACD"] > latest["MACD_Signal"] else "ضعیف‌تر/منفی" if pd.notna(latest["MACD"]) and pd.notna(latest["MACD_Signal"]) else "داده ناکافی"
-        st.info(f"برداشت تکنیکال: RSI برابر {latest['RSI']:.1f} است؛ وضعیت MACD: {macd_bias}. این موارد ابزار کمکی‌اند و به‌تنهایی سیگنال ورود نیستند.")
-    except Exception as chart_exc:
-        st.warning(f"نمودار کندلی برای این ارز دریافت نشد: {chart_exc}")
-        st.caption("ممکن است نماد در بازار اسپات USDT این صرافی‌ها موجود نباشد یا دسترسی شبکه محدود شده باشد. اسکنر و سایر جدول‌ها مستقل از این پنل به کار خود ادامه می‌دهند.")
-

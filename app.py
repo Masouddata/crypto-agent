@@ -1472,6 +1472,68 @@ if section == "🏠 نمای کلی":
     f.metric("🛰️ Pre-pump watch", int(df["Signal"].astype(str).str.startswith("Pre-pump watch").sum()))
     g.metric("⚠️ High-risk / overheated", int(df["Risk_Level"].astype(str).str.startswith("High").sum()))
 
+    # Persian market intelligence report (uses only fields actually present)
+    st.divider()
+    with st.container(border=True):
+        st.subheader("🧠 گزارش هوشمند بازار و ردپای نهنگ‌ها")
+        st.caption("گزارش پویا بر اساس داده‌های همین اجرای اسکنر؛ نبود داده به‌عنوان سیگنال مثبت تفسیر نمی‌شود.")
+
+        report_parts = []
+        market_up = int((numeric(df.get("Change_24h_Percent", pd.Series(np.nan, index=df.index))) > 0).sum())
+        market_down = int((numeric(df.get("Change_24h_Percent", pd.Series(np.nan, index=df.index))) < 0).sum())
+        market_valid = market_up + market_down
+        if market_valid:
+            up_share = market_up / market_valid * 100
+            if up_share >= 60:
+                report_parts.append(f"**تصویر کلی بازار:** جو کوتاه‌مدت متمایل به صعود است؛ {up_share:.0f}٪ از ارزهای دارای تغییر ۲۴ساعته مثبت هستند. برای تأیید، رشد حجم و عملکرد بیت‌کوین نیز باید بررسی شود.")
+            elif up_share <= 40:
+                report_parts.append(f"**تصویر کلی بازار:** فشار نزولی غالب است؛ فقط {up_share:.0f}٪ از ارزهای دارای داده تغییر ۲۴ساعته مثبت‌اند. در چنین شرایطی ورود عجولانه به آلت‌کوین‌ها ریسک بیشتری دارد.")
+            else:
+                report_parts.append(f"**تصویر کلی بازار:** وضعیت دوطرفه و بدون برتری روشن است؛ {up_share:.0f}٪ از ارزهای دارای داده مثبت‌اند. بهتر است منتظر تأیید جهت بازار بمانیم.")
+        else:
+            report_parts.append("**تصویر کلی بازار:** داده کافی برای سنجش گستردگی رشد و ریزش بازار وجود ندارد.")
+
+        flow_col = "Net_Buy_USD" if "Net_Buy_USD" in df.columns else None
+        buy_share_col = "Buy_Share_Percent" if "Buy_Share_Percent" in df.columns else None
+        if flow_col:
+            net_flow = numeric(df[flow_col])
+            known_flow = net_flow.dropna()
+            if not known_flow.empty:
+                net_total = float(known_flow.sum())
+                if net_total > 0:
+                    report_parts.append(f"**جریان خرید ثبت‌شده:** خالص خرید واقعی در ردیف‌های دارای داده حدود {fmt_money(net_total, 'USD')} مثبت است؛ این نشانه به نفع تقاضاست، اما به‌تنهایی تضمین‌کننده رشد قیمت نیست.")
+                elif net_total < 0:
+                    report_parts.append(f"**جریان فروش ثبت‌شده:** خالص جریان خرید/فروش حدود {fmt_money(abs(net_total), 'USD')} به سمت فروش است؛ فشار عرضه را جدی بگیر.")
+                else:
+                    report_parts.append("**جریان پول:** خالص خرید و فروش ثبت‌شده تقریباً متعادل است.")
+            else:
+                report_parts.append("**جریان پول:** داده واقعی خالص خرید برای این بازار در دسترس نیست؛ حجم ۲۴ساعته به‌تنهایی ورود پول را ثابت نمی‌کند.")
+        else:
+            report_parts.append("**جریان پول:** ستون خالص خرید واقعی در داده فعلی موجود نیست؛ از حجم معاملات به‌عنوان ورود پول قطعی استفاده نمی‌کنیم.")
+
+        if buy_share_col:
+            shares = numeric(df[buy_share_col]).dropna()
+            if not shares.empty:
+                mean_share = float(shares.mean())
+                report_parts.append(f"**فشار خرید:** میانگین سهم خرید ثبت‌شده در ارزهای دارای داده {mean_share:.1f}٪ است؛ این عدد فقط برای همان نمونه‌های پوشش‌داده‌شده معتبر است.")
+
+        cm_report = st.session_state.get("cryptometer_results", {})
+        whale_payload = cm_report.get("whales", {}).get("payload") if isinstance(cm_report, dict) else None
+        if whale_payload:
+            report_parts.append("**ردپای نهنگ‌ها:** داده معاملات بزرگ CryptoMeter دریافت شده است. جمع‌بندی جهت خرید و فروش در بخش «جریان پول و مشتقات» و نمودار معاملات نهنگ‌ها نمایش داده می‌شود.")
+        else:
+            report_parts.append("**ردپای نهنگ‌ها:** در این اجرا داده معاملات نهنگ از CryptoMeter دریافت نشده است؛ بنابراین نمی‌توان با اطمینان از انباشت یا توزیع نهنگ‌ها صحبت کرد.")
+
+        if "Signal" in df.columns:
+            pre_count = int(df["Signal"].astype(str).str.startswith("Pre-pump watch").sum())
+            avoid_count = int(df["Risk_Level"].astype(str).str.startswith("High").sum()) if "Risk_Level" in df.columns else 0
+            report_parts.append(f"**فرصت‌های زیرنظر:** اسکنر {pre_count} مورد در وضعیت رصد پیش‌پامپ و {avoid_count} مورد با ریسک بالا شناسایی کرده است. رصد به معنی نقطه ورود نیست؛ شکست مقاومت و تثبیت همراه حجم لازم است.")
+
+        for report_line in report_parts:
+            st.markdown(report_line)
+
+        st.caption("این گزارش تحلیلی و غربالگری است، نه پیش‌بینی قطعی. کیفیت نتیجه به پوشش و تازگی داده‌های API وابسته است.")
+
     st.divider()
 if section == "🧲 رادار انباشت و پیش‌پامپ":
     st.subheader("🧲 رادار انباشت قبل از شکست مقاومت")

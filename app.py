@@ -58,7 +58,7 @@ h4 { font-size: 1.04rem !important; }
 [data-testid="stMetricValue"] { color: #102846 !important; font-size: 1.5rem !important; font-weight: 800 !important; }
 [data-testid="stMetricDelta"] { font-weight: 700 !important; }
 [data-testid="stDataFrame"], [data-testid="stTable"] { background: #fff !important; border: 1px solid #cbd8e8 !important; border-radius: 12px !important; overflow: hidden; }
-[data-testid="stDataFrame"] * { font-size: 13px !important; opacity: 1 !important; }
+[data-testid="stDataFrame"] * { font-size: 13px !important; }
 [data-testid="stExpander"] { background: #fff !important; border: 1px solid #cbd8e8 !important; border-radius: 12px !important; overflow: hidden; }
 [data-testid="stExpander"] summary, [data-testid="stExpander"] summary p,
 [data-testid="stExpander"] summary span { color: #102846 !important; background: #eaf1fa !important;
@@ -207,94 +207,6 @@ def safe_get(url, *, params=None, headers=None, timeout=20):
 
 def numeric(series):
     return pd.to_numeric(series, errors="coerce")
-
-
-def show_styled_dataframe(frame, **kwargs):
-    """Render tables like a market terminal: positive directional values green,
-    negative values red, and neutral/unknown values in the default text color.
-    """
-    if not isinstance(frame, pd.DataFrame) or frame.empty:
-        return st.dataframe(frame, **kwargs)
-
-    def directional_style(data):
-        styles = pd.DataFrame("", index=data.index, columns=data.columns)
-        for column in data.columns:
-            label = str(column).strip().lower()
-            # Apply only to change/percentage/flow metrics, never prices, market caps,
-            # volume totals, rankings, or ordinary scores.
-            is_directional = any(token in label for token in (
-                "%", "percent", "change", "تغییر", "درصد", "٪", "funding",
-                "rate_percent", "share", "سهم خرید", "net buy", "net_buy",
-                "netflow", "net_flow", "خالص خرید", "خالص جریان", "خالص"
-            ))
-            if not is_directional:
-                continue
-
-            for idx, value in data[column].items():
-                if pd.isna(value):
-                    continue
-                try:
-                    if isinstance(value, str):
-                        # Also tolerate values already decorated with market arrows.
-                        cleaned = (value.strip().replace(",", "")
-                                   .replace("٪", "").replace("%", "")
-                                   .replace("▲", "").replace("▼", "")
-                                   .replace("↑", "").replace("↓", "")
-                                   .replace("▴", "").replace("▾", ""))
-                        number = float(cleaned)
-                    else:
-                        number = float(value)
-                except (TypeError, ValueError):
-                    continue
-
-                if number > 0:
-                    # Dark, high-contrast green; keep the cell background white.
-                    styles.at[idx, column] = (
-                        "color: #00845f !important; "
-                        "-webkit-text-fill-color: #00845f !important; "
-                        "background-color: #ffffff !important; "
-                        "font-weight: 800 !important; opacity: 1 !important;"
-                    )
-                elif number < 0:
-                    # Dark, high-contrast red; keep the cell background white.
-                    styles.at[idx, column] = (
-                        "color: #d11f2e !important; "
-                        "-webkit-text-fill-color: #d11f2e !important; "
-                        "background-color: #ffffff !important; "
-                        "font-weight: 800 !important; opacity: 1 !important;"
-                    )
-        return styles
-
-    try:
-        styled = frame.style.apply(directional_style, axis=None)
-
-        # Match the reference table: show a small up/down marker in percentage cells.
-        percent_columns = [
-            column for column in frame.columns
-            if any(token in str(column).strip().lower() for token in (
-                "%", "percent", "درصد", "٪"
-            ))
-        ]
-
-        def market_percent(value):
-            try:
-                number = float(value)
-            except (TypeError, ValueError):
-                return value
-            if pd.isna(number):
-                return value
-            if number > 0:
-                return f"▲ {number:.2f}%"
-            if number < 0:
-                return f"▼ {abs(number):.2f}%"
-            return f"• {number:.2f}%"
-
-        if percent_columns:
-            styled = styled.format({column: market_percent for column in percent_columns})
-        return st.dataframe(styled, **kwargs)
-    except Exception:
-        # Keep the table usable if Styler is unsupported by the installed Streamlit/Pandas.
-        return st.dataframe(frame, **kwargs)
 
 
 def fmt_num(value, digits=2):
@@ -749,7 +661,6 @@ def fetch_market_pages(currency, pages, api_key):
         "CoinGecko_ID": col("id"),
         "Symbol": col("symbol").astype("string").str.upper(),
         "Price": col("current_price"),
-        "Price_Change_24h_Absolute": col("price_change_24h"),
         "Change_24h_Percent": col("price_change_percentage_24h"),
         "Change_7d_Percent": col("price_change_percentage_7d_in_currency"),
         "Volume_24h": col("total_volume"),
@@ -760,19 +671,10 @@ def fetch_market_pages(currency, pages, api_key):
         "ATH_Change_Percent": col("ath_change_percentage"),
         "Last_Updated": col("last_updated"),
     })
-    for c in ["Price", "Price_Change_24h_Absolute", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h",
+    for c in ["Price", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h",
               "Market_Cap", "Market_Cap_Rank", "Circulating_Supply", "Total_Supply",
               "ATH_Change_Percent"]:
         df[c] = numeric(df[c])
-    # CoinGecko sometimes omits the percentage field while still returning
-    # the absolute 24h price change. Convert only when both values are valid.
-    missing_24h = df["Change_24h_Percent"].isna()
-    previous_price = df["Price"] - df["Price_Change_24h_Absolute"]
-    valid_24h = missing_24h & df["Price"].gt(0) & previous_price.gt(0)
-    df.loc[valid_24h, "Change_24h_Percent"] = (
-        df.loc[valid_24h, "Price_Change_24h_Absolute"] /
-        previous_price.loc[valid_24h] * 100
-    )
     # Market-only preliminary score. It is explicitly not a calibrated probability.
     ch24 = df["Change_24h_Percent"].fillna(0)
     ch7 = df["Change_7d_Percent"].fillna(0)
@@ -1366,7 +1268,6 @@ rename_candidates = {
     "symbol": "Symbol",
     "current_price": "Price", "Price_USD": "Price",
     "price_change_percentage_24h": "Change_24h_Percent",
-    "price_change_24h": "Price_Change_24h_Absolute",
     "change_24h_percent": "Change_24h_Percent",
     "price_change_percentage_7d_in_currency": "Change_7d_Percent",
     "change_7d_percent": "Change_7d_Percent",
@@ -1448,20 +1349,6 @@ if data_source == "CoinGecko market" and technical_limit > 0 and run_technicals:
         try:
             hist = fetch_history(str(coin_id), currency, 7, cg_key)
             item.update(technical_summary(hist["price"], hist.get("volume_24h")) if not hist.empty else technical_summary([]))
-            item["History_Change_24h_Percent"] = np.nan
-            item["History_Change_7d_Percent"] = np.nan
-            if not hist.empty and len(hist) >= 2:
-                hist = hist.sort_values("timestamp_ms")
-                latest_price = float(hist["price"].iloc[-1])
-                latest_ms = float(hist["timestamp_ms"].iloc[-1])
-                if latest_price > 0:
-                    for hours, target_col in [(24, "History_Change_24h_Percent"), (168, "History_Change_7d_Percent")]:
-                        target_ms = latest_ms - hours * 60 * 60 * 1000
-                        prior_rows = hist[hist["timestamp_ms"] <= target_ms]
-                        if not prior_rows.empty:
-                            prior_price = float(prior_rows["price"].iloc[-1])
-                            if prior_price > 0:
-                                item[target_col] = (latest_price / prior_price - 1) * 100
         except Exception as exc:
             item.update({"RSI_14": np.nan, "MACD": np.nan, "MACD_Signal": np.nan,
                          "Trend_7d_Percent": np.nan, "Technical_Score": np.nan,
@@ -1479,15 +1366,6 @@ if data_source == "CoinGecko market" and technical_limit > 0 and run_technicals:
     st.session_state["scanner_technical_results"] = {"currency": currency, "data": tech.copy()}
     df = df.drop(columns=[c for c in ["RSI_14", "MACD", "MACD_Signal", "Trend_7d_Percent", "Technical_Score", "Technical_Signal", "Volume_24h_vs_7d_Avg", "Price_Range_7d_Percent", "Price_Range_Last24h_Percent", "Range_Compression_Ratio", "Higher_Low_24h_Percent", "Accumulation_Price_Score"] if c in df.columns])
     df = df.merge(tech, on="CoinGecko_ID", how="left")
-    # Fill missing market percentage fields from the same coin's 7-day history.
-    if "History_Change_24h_Percent" in df.columns:
-        df["Change_24h_Percent"] = numeric(df["Change_24h_Percent"]).fillna(
-            numeric(df["History_Change_24h_Percent"])
-        )
-    if "History_Change_7d_Percent" in df.columns:
-        df["Change_7d_Percent"] = numeric(df["Change_7d_Percent"]).fillna(
-            numeric(df["History_Change_7d_Percent"])
-        )
     # Legacy momentum blend retained for export compatibility; final ranking is recalculated below.
     market = numeric(df["Market_Momentum_Score"])
     tech_score = numeric(df["Technical_Score"])
@@ -1505,14 +1383,6 @@ elif (data_source == "CoinGecko market" and technical_limit > 0
         if not tech.empty:
             df = df.drop(columns=[c for c in ["RSI_14", "MACD", "MACD_Signal", "Trend_7d_Percent", "Technical_Score", "Technical_Signal", "Volume_24h_vs_7d_Avg", "Price_Range_7d_Percent", "Price_Range_Last24h_Percent", "Range_Compression_Ratio", "Higher_Low_24h_Percent", "Accumulation_Price_Score"] if c in df.columns])
             df = df.merge(tech, on="CoinGecko_ID", how="left")
-            if "History_Change_24h_Percent" in df.columns:
-                df["Change_24h_Percent"] = numeric(df["Change_24h_Percent"]).fillna(
-                    numeric(df["History_Change_24h_Percent"])
-                )
-            if "History_Change_7d_Percent" in df.columns:
-                df["Change_7d_Percent"] = numeric(df["Change_7d_Percent"]).fillna(
-                    numeric(df["History_Change_7d_Percent"])
-                )
             market = numeric(df["Market_Momentum_Score"])
             tech_score = numeric(df["Technical_Score"])
             df["Pump_Potential_Score"] = np.where(
@@ -1688,7 +1558,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                 "Net_Buy_USD": "خالص خرید دلاری", "Volume_24h_vs_7d_Avg": "حجم ۲۴ساعت / مبنا",
                 "RSI_14": "RSI", "Accumulation_Status": "تفسیر وضعیت"
             })
-            show_styled_dataframe(accumulation_display, use_container_width=True, hide_index=True)
+            st.dataframe(accumulation_display, use_container_width=True, hide_index=True)
         else:
             st.info("برای محاسبه رادار انباشت، ابتدا از تنظیمات کناری دکمه «Calculate technical indicators» را اجرا کن.")
     else:
@@ -1746,7 +1616,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
         if not early.empty:
             with st.expander(f"Early activity — needs confirmation ({len(early)})", expanded=True):
                 early_cols = [c for c in ["Coin", "Symbol", "PrePump_Score", "Change_24h_Percent", "Change_7d_Percent", "Volume_to_Market_Cap", "Volume_24h_vs_7d_Avg", "Risk_Level"] if c in early.columns]
-                show_styled_dataframe(early[early_cols].head(20), use_container_width=True, hide_index=True)
+                st.dataframe(early[early_cols].head(20), use_container_width=True, hide_index=True)
         with st.expander("📊 Detailed candidate table", expanded=True):
             preferred_cols = [
                 "Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent",
@@ -1783,7 +1653,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
             }
             display_df = ranked[cols].rename(columns=display_names)
             st.caption("برای دیدن نمودار یک ارز، روی ردیف آن کلیک کن.")
-            table_event = show_styled_dataframe(
+            table_event = st.dataframe(
                 display_df,
                 use_container_width=True,
                 hide_index=True,
@@ -1855,7 +1725,7 @@ if section == "📊 نمودارها و ریزش‌ها":
     drop_view = drop_view.dropna(subset=["_drop_rank"]).sort_values("_drop_rank").head(15)
     if not drop_view.empty:
         drop_cols = [c for c in ["Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "RSI_14", "PrePump_Score", "Buy_Flow_Status", "Risk_Level"] if c in drop_view.columns]
-        show_styled_dataframe(drop_view[drop_cols], width="stretch", hide_index=True)
+        st.dataframe(drop_view[drop_cols], width="stretch", hide_index=True)
     else:
         st.info("داده کافی برای رتبه‌بندی ریزش هفتگی موجود نیست.")
 
@@ -1864,7 +1734,7 @@ if section == "📊 نمودارها و ریزش‌ها":
     alerts = df[(numeric(df["Change_24h_Percent"]).abs() >= 5) | (numeric(df["Change_7d_Percent"]).abs() >= 15)].copy()
     if not alerts.empty:
         alerts = alerts.sort_values("Change_24h_Percent", ascending=False)
-        show_styled_dataframe(alerts[["Coin", "Symbol", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Pump_Potential_Score", "Risk_Level"]].head(30), use_container_width=True, hide_index=True)
+        st.dataframe(alerts[["Coin", "Symbol", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Pump_Potential_Score", "Risk_Level"]].head(30), use_container_width=True, hide_index=True)
     else:
         st.info("No moves crossed the default alert thresholds.")
 
@@ -2016,7 +1886,7 @@ if section == "📰 اخبار و DEX":
             news_df["Headline_Sentiment_Proxy"] = news_df["Title"].apply(headline_score).map(
                 lambda x: "Positive keyword" if x > 0 else ("Negative keyword" if x < 0 else "Neutral / unclassified")
             )
-            show_styled_dataframe(news_df, use_container_width=True, hide_index=True)
+            st.dataframe(news_df, use_container_width=True, hide_index=True)
             st.caption("Headline sentiment is a simple keyword proxy, not a trained NLP model or a fact-check.")
 
     # DEX panel
@@ -2058,7 +1928,7 @@ if section == "📰 اخبار و DEX":
                             "Volume_to_Liquidity_Ratio", "Activity_Flag", "DEX_Screen_Score", "Risk_Flag", "Pair_URL"
                         ]
                         display_cols = [c for c in display_cols if c in dex_df.columns]
-                        show_styled_dataframe(dex_df[display_cols].head(100), use_container_width=True, hide_index=True)
+                        st.dataframe(dex_df[display_cols].head(100), use_container_width=True, hide_index=True)
                         st.caption(
                             "Whale-watch clue only: unusually high volume relative to liquidity plus many transactions can merit review, "
                             "but does not prove that whales traded or that net inflows occurred. Check wallet-level data separately."
@@ -2093,7 +1963,7 @@ if section == "🐋 جریان پول و مشتقات":
             d3.metric("Negative funding", int((numeric(deriv["Funding_Rate_Percent"]) < 0).sum()))
             deriv_view = deriv.sort_values("Derivatives_Context_Score", ascending=False)
             deriv_cols = [c for c in ["Coin", "Symbol", "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange", "Derivatives_Change_24h_Percent", "Derivatives_Context_Score", "PrePump_Score", "Signal"] if c in deriv_view.columns]
-            show_styled_dataframe(deriv_view[deriv_cols].head(60), use_container_width=True, hide_index=True)
+            st.dataframe(deriv_view[deriv_cols].head(60), use_container_width=True, hide_index=True)
             st.caption("Interpretation: very positive funding can indicate crowded longs; negative funding can indicate crowded shorts. Combine with price, volume and OI changes—one snapshot alone cannot confirm a squeeze or a pump.")
 
 
@@ -2237,7 +2107,7 @@ if section == "🐋 جریان پول و مشتقات":
                     st.info("No rapid-movement records were returned.")
                 else:
                     show_cols = [c for c in ["pair", "exchange", "change_detected", "side", "timestamp"] if c in rapid_df.columns]
-                    show_styled_dataframe(rapid_df[show_cols] if show_cols else rapid_df, use_container_width=True, hide_index=True)
+                    st.dataframe(rapid_df[show_cols] if show_cols else rapid_df, use_container_width=True, hide_index=True)
 
             whale_result = cm_results.get("whales", {})
             if whale_result.get("payload"):
@@ -2249,7 +2119,7 @@ if section == "🐋 جریان پول و مشتقات":
                     if "usd_total" not in whale_df.columns and "total" in whale_df.columns:
                         whale_df["usd_total"] = whale_df["total"]
                     whale_cols = [c for c in ["timestamp", "symbol", "pair", "exchange", "side", "price", "size", "usd_total"] if c in whale_df.columns]
-                    show_styled_dataframe(whale_df[whale_cols] if whale_cols else whale_df, use_container_width=True, hide_index=True)
+                    st.dataframe(whale_df[whale_cols] if whale_cols else whale_df, use_container_width=True, hide_index=True)
                     # Whale-flow visualization uses only provider-reported USD trade values.
                     whale_value_col = "usd_total" if "usd_total" in whale_df.columns else ("total" if "total" in whale_df.columns else None)
                     if whale_value_col and "side" in whale_df.columns:
@@ -2290,7 +2160,7 @@ if section == "🐋 جریان پول و مشتقات":
                             if flow_frame.empty:
                                 st.info(f"No {flow_name} rows returned.")
                             else:
-                                show_styled_dataframe(flow_frame, use_container_width=True, hide_index=True)
+                                st.dataframe(flow_frame, use_container_width=True, hide_index=True)
                 else:
                     st.json(flow_data)
 
@@ -2374,7 +2244,7 @@ if section == "🐋 جریان پول و مشتقات":
                         "Net buy (USDT)": "خالص خرید (USDT)",
                         "Buy share (%)": "سهم خرید", "Data status": "وضعیت داده"
                     })
-                    show_styled_dataframe(show_actual, width="stretch", hide_index=True)
+                    st.dataframe(show_actual, width="stretch", hide_index=True)
                     st.markdown("**نمودار جریان خرید و فروش واقعی**")
                     chart_actual = valid_actual[["Symbol", "Buy volume (USDT)", "Sell volume (USDT)"]].melt(
                         id_vars="Symbol", var_name="جهت جریان", value_name="حجم (USDT)"
@@ -2426,7 +2296,7 @@ if section == "🐋 جریان پول و مشتقات":
                 else:
                     if "netflow" in liquidity_df.columns:
                         liquidity_df = liquidity_df.sort_values("netflow", ascending=False)
-                    show_styled_dataframe(liquidity_df, use_container_width=True, hide_index=True)
+                    st.dataframe(liquidity_df, use_container_width=True, hide_index=True)
 
             funding_result = cm_results.get("funding", {})
             if funding_result.get("payload"):
@@ -2436,7 +2306,7 @@ if section == "🐋 جریان پول و مشتقات":
                     st.info("No funding-rate rows were returned.")
                 else:
                     funding_cols = [c for c in ["symbol", "pair", "exchange", "rate_percent", "annualized_percent", "interval_hours", "next_funding_at"] if c in funding_df.columns]
-                    show_styled_dataframe(funding_df[funding_cols] if funding_cols else funding_df, use_container_width=True, hide_index=True)
+                    st.dataframe(funding_df[funding_cols] if funding_cols else funding_df, use_container_width=True, hide_index=True)
 
             movers_result = cm_results.get("movers", {})
             if movers_result.get("payload"):
@@ -2450,7 +2320,7 @@ if section == "🐋 جریان پول و مشتقات":
                             if side_df.empty:
                                 st.info(f"No {side_name} rows returned.")
                             else:
-                                show_styled_dataframe(side_df, use_container_width=True, hide_index=True)
+                                st.dataframe(side_df, use_container_width=True, hide_index=True)
                 else:
                     st.json(movers_data)
 
@@ -2462,7 +2332,7 @@ if section == "🐋 جریان پول و مشتقات":
                     "and coin-level netflow (+/−15). A bullish/bearish label requires at least two independent evidence sources. "
                     "This score is not a calibrated probability and is not a buy recommendation."
                 )
-                show_styled_dataframe(watchlist_df, use_container_width=True, hide_index=True)
+                st.dataframe(watchlist_df, use_container_width=True, hide_index=True)
                 st.download_button(
                     "⬇️ Download CryptoMeter watchlist CSV",
                     data=watchlist_df.to_csv(index=False).encode("utf-8"),
@@ -2480,7 +2350,7 @@ if section == "📁 داده‌ها":
     with st.expander("📋 مشاهده پیشرفته و دریافت کل داده‌های بازار", expanded=False):
         st.caption("This table contains the raw columns used by the scanner. Most users can work from the candidate table above.")
         if show_all:
-            show_styled_dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, use_container_width=True, hide_index=True)
         st.download_button(
             "⬇️ Download full market CSV",
             data=df.to_csv(index=False).encode("utf-8"),

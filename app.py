@@ -58,7 +58,7 @@ h4 { font-size: 1.04rem !important; }
 [data-testid="stMetricValue"] { color: #102846 !important; font-size: 1.5rem !important; font-weight: 800 !important; }
 [data-testid="stMetricDelta"] { font-weight: 700 !important; }
 [data-testid="stDataFrame"], [data-testid="stTable"] { background: #fff !important; border: 1px solid #cbd8e8 !important; border-radius: 12px !important; overflow: hidden; }
-[data-testid="stDataFrame"] * { font-size: 13px !important; }
+[data-testid="stDataFrame"] * { font-size: 13px !important; opacity: 1 !important; }
 [data-testid="stExpander"] { background: #fff !important; border: 1px solid #cbd8e8 !important; border-radius: 12px !important; overflow: hidden; }
 [data-testid="stExpander"] summary, [data-testid="stExpander"] summary p,
 [data-testid="stExpander"] summary span { color: #102846 !important; background: #eaf1fa !important;
@@ -248,9 +248,21 @@ def show_styled_dataframe(frame, **kwargs):
                     continue
 
                 if number > 0:
-                    styles.at[idx, column] = "color: #00a878 !important; font-weight: 700;"
+                    # Dark, high-contrast green; keep the cell background white.
+                    styles.at[idx, column] = (
+                        "color: #00845f !important; "
+                        "-webkit-text-fill-color: #00845f !important; "
+                        "background-color: #ffffff !important; "
+                        "font-weight: 800 !important; opacity: 1 !important;"
+                    )
                 elif number < 0:
-                    styles.at[idx, column] = "color: #f04452 !important; font-weight: 700;"
+                    # Dark, high-contrast red; keep the cell background white.
+                    styles.at[idx, column] = (
+                        "color: #d11f2e !important; "
+                        "-webkit-text-fill-color: #d11f2e !important; "
+                        "background-color: #ffffff !important; "
+                        "font-weight: 800 !important; opacity: 1 !important;"
+                    )
         return styles
 
     try:

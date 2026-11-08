@@ -1652,7 +1652,65 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                 "Signal": "Signal / interpretation", "Risk_Level": "Risk flag", "Technical_Signal": "Technical reading",
             }
             display_df = ranked[cols].rename(columns=display_names)
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            st.caption("برای دیدن نمودار یک ارز، روی ردیف آن کلیک کن.")
+            table_event = st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="candidate_coin_table_select",
+            )
+            selected_rows = table_event.selection.rows if table_event and table_event.selection else []
+            if selected_rows:
+                selected_coin_row = ranked.iloc[int(selected_rows[0])]
+                selected_coin_name = str(selected_coin_row.get("Coin", "ارز انتخاب‌شده"))
+                selected_coin_symbol = str(selected_coin_row.get("Symbol", "")).upper()
+                st.divider()
+                st.subheader(f"📈 نمودار {selected_coin_name} ({selected_coin_symbol})")
+                if data_source == "CoinGecko market" and pd.notna(selected_coin_row.get("CoinGecko_ID")):
+                    chart_days = st.selectbox(
+                        "بازه نمودار",
+                        [1, 7, 30, 90],
+                        index=1,
+                        format_func=lambda x: {1: "۱ روز", 7: "۷ روز", 30: "۳۰ روز", 90: "۹۰ روز"}[x],
+                        key="clicked_coin_chart_days",
+                    )
+                    try:
+                        clicked_hist = fetch_history(str(selected_coin_row["CoinGecko_ID"]), currency, chart_days, cg_key)
+                        if clicked_hist is not None and not clicked_hist.empty and "price" in clicked_hist.columns:
+                            clicked_hist = clicked_hist.sort_values("Time").copy()
+                            clicked_hist["price"] = pd.to_numeric(clicked_hist["price"], errors="coerce")
+                            clicked_hist = clicked_hist.dropna(subset=["price"])
+                            if not clicked_hist.empty:
+                                clicked_fig = go.Figure()
+                                clicked_fig.add_trace(go.Scatter(
+                                    x=clicked_hist["Time"], y=clicked_hist["price"],
+                                    mode="lines", name=selected_coin_symbol,
+                                    line=dict(color="#1769d2", width=2.5),
+                                    fill="tozeroy", fillcolor="rgba(23,105,210,0.08)",
+                                ))
+                                clicked_fig.update_layout(
+                                    template="plotly_white", height=420,
+                                    title=f"{selected_coin_symbol} — نمودار قیمت ({chart_days} روز)",
+                                    paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+                                    font=dict(color="#172b4d"),
+                                    margin=dict(l=15, r=15, t=55, b=25),
+                                    hovermode="x unified",
+                                    xaxis=dict(title="زمان", gridcolor="#e5edf6"),
+                                    yaxis=dict(title=f"قیمت ({currency.upper()})", gridcolor="#e5edf6"),
+                                )
+                                st.plotly_chart(clicked_fig, use_container_width=True)
+                                latest_clicked_price = clicked_hist["price"].iloc[-1]
+                                st.metric("آخرین قیمت داده تاریخی", fmt_money(latest_clicked_price), currency.upper())
+                            else:
+                                st.warning("داده قیمت تاریخی معتبر برای این ارز دریافت نشد.")
+                        else:
+                            st.warning("تاریخچه قیمت برای این ارز در دسترس نیست.")
+                    except Exception as chart_error:
+                        st.warning(f"دریافت نمودار ناموفق بود: {chart_error}")
+                else:
+                    st.info("برای نمایش نمودار تاریخی، منبع داده باید CoinGecko باشد و شناسه تاریخی ارز موجود باشد.")
             st.caption("RSI از صفر تا ۱۰۰ است: بالای ۷۰ می‌تواند نشانه داغ‌شدن حرکت و زیر ۳۰ نشانه فشار فروش شدید باشد؛ به‌تنهایی سیگنال خرید نیست. MACD بالای خط سیگنال یعنی مومنتوم صعودی‌تر، اما باید با حجم و ساختار قیمت تأیید شود.")
             st.caption("روش ورود: ۲۵٪ اولیه فقط در ناحیه ساختاری مناسب؛ ۷۵٪ پس از شکست و تثبیت مقاومت. حدضرر پشت کف/حمایت ساختاری؛ اگر داده تاریخی برای تعیین آن نداریم، سطح ورود و خروج ساخته نمی‌شود. سقف ریسک هر معامله ۰٫۵٪ سرمایه و حداقل R/R برابر ۲ است.")
     else:

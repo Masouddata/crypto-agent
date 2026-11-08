@@ -1,6 +1,9 @@
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import requests
+from requests.adapters import HTTPAdapter
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -123,10 +126,59 @@ def cg_headers(api_key: str):
     return {"x-cg-demo-api-key": api_key} if api_key else {}
 
 
+# Reuse HTTP connections per worker thread. Thread-local sessions avoid sharing
+# mutable requests.Session state between concurrent Streamlit fetch workers.
+_HTTP_LOCAL = threading.local()
+_HTTP_RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _http_session():
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=12, pool_maxsize=12, max_retries=0)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.headers.update({"User-Agent": "CryptoIntelligenceScanner/2026.11"})
+        _HTTP_LOCAL.session = session
+    return session
+
+
+def _retry_delay(response, attempt):
+    retry_after = response.headers.get("Retry-After") if response is not None else None
+    if retry_after:
+        try:
+            return min(8.0, max(0.25, float(retry_after)))
+        except (TypeError, ValueError):
+            pass
+    return min(4.0, 0.35 * (2 ** attempt))
+
+
 def safe_get(url, *, params=None, headers=None, timeout=20):
-    response = requests.get(url, params=params, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
+    """GET with connection reuse and bounded retry for transient/rate-limit errors."""
+    last_error = None
+    for attempt in range(3):
+        response = None
+        try:
+            response = _http_session().get(
+                url, params=params, headers=headers, timeout=timeout
+            )
+            if response.status_code in _HTTP_RETRY_STATUSES and attempt < 2:
+                time.sleep(_retry_delay(response, attempt))
+                continue
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt >= 2:
+                raise
+            time.sleep(_retry_delay(response, attempt))
+        except ValueError:
+            # Invalid JSON is a data/provider error, not a transient transport error.
+            raise
+    if last_error:
+        raise last_error
+    raise RuntimeError("HTTP request failed without a response")
 
 
 def numeric(series):
@@ -534,32 +586,46 @@ def calculate_pre_pump_score(frame):
 # =========================================================
 # DATA SOURCES
 # =========================================================
-@st.cache_data(ttl=120, show_spinner=False)
+def _fetch_market_page(currency, page, api_key):
+    return safe_get(
+        f"{CG_API}/coins/markets",
+        params={
+            "vs_currency": currency,
+            "order": "market_cap_desc",
+            "per_page": 250,
+            "page": int(page),
+            "sparkline": "false",
+            "price_change_percentage": "24h,7d",
+        },
+        headers=cg_headers(api_key),
+        timeout=25,
+    )
+
+
+@st.cache_data(ttl=150, show_spinner=False)
 def fetch_market_pages(currency, pages, api_key):
-    """Fetches up to pages*250 CoinGecko market rows, subject to API access/rate limits."""
+    """Fetch market pages concurrently (max 3 workers); cache the assembled result."""
+    page_numbers = list(range(1, int(pages) + 1))
+    rows_by_page = {}
+    # Three concurrent requests improve multi-page scans without creating a large
+    # burst against CoinGecko. Results are reassembled in page/rank order.
+    with ThreadPoolExecutor(max_workers=min(3, len(page_numbers) or 1)) as pool:
+        futures = {
+            page: pool.submit(_fetch_market_page, currency, page, api_key)
+            for page in page_numbers
+        }
+        for page in page_numbers:
+            data = futures[page].result()
+            rows_by_page[page] = data if isinstance(data, list) else []
+
     rows = []
-    for page in range(1, int(pages) + 1):
-        data = safe_get(
-            f"{CG_API}/coins/markets",
-            params={
-                "vs_currency": currency,
-                "order": "market_cap_desc",
-                "per_page": 250,
-                "page": page,
-                "sparkline": "false",
-                "price_change_percentage": "24h,7d",
-            },
-            headers=cg_headers(api_key),
-            timeout=25,
-        )
-        if not isinstance(data, list) or not data:
+    for page in page_numbers:
+        data = rows_by_page[page]
+        if not data:
             break
         rows.extend(data)
         if len(data) < 250:
             break
-        # Gentle pause between pages to reduce request bursts.
-        if page < int(pages):
-            time.sleep(0.25)
 
     if not rows:
         raise ValueError("CoinGecko returned no market rows.")
@@ -860,6 +926,21 @@ def add_derivatives_score(frame):
     return out
 
 
+def _run_parallel_jobs(jobs, worker, max_workers=3):
+    """Run independent API jobs concurrently and preserve input key order."""
+    if not jobs:
+        return {}
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(jobs))) as pool:
+        futures = {key: pool.submit(worker, *args) for key, args in jobs.items()}
+        for key in jobs:
+            try:
+                results[key] = futures[key].result()
+            except Exception as exc:
+                results[key] = exc
+    return results
+
+
 # =========================================================
 # CRYPTOMETER API
 # =========================================================
@@ -872,11 +953,17 @@ def fetch_cryptometer(endpoint: str, params: dict, api_key: str):
     query = dict(params or {})
     query["api_key"] = api_key
     try:
-        response = requests.get(
-            f"{CRYPTOMETER_API}/{endpoint.strip('/')}/",
-            params=query,
-            timeout=25,
-        )
+        response = None
+        for attempt in range(3):
+            response = _http_session().get(
+                f"{CRYPTOMETER_API}/{endpoint.strip('/')}/",
+                params=query,
+                timeout=25,
+            )
+            if response.status_code in _HTTP_RETRY_STATUSES and attempt < 2:
+                time.sleep(_retry_delay(response, attempt))
+                continue
+            break
     except requests.RequestException as exc:
         raise RuntimeError(f"Network error while calling CryptoMeter: {exc.__class__.__name__}") from None
 
@@ -1061,7 +1148,8 @@ def cryptometer_watchlist(results):
 # =========================================================
 st.title("📡 اسکنر هوشمند بازار ارزهای دیجیتال")
 st.caption("پایش گسترده بازار • شناسایی فرصت‌های پیش از رشد • رادار انباشت • افزایش حجم • کنترل ریسک")
-st.caption("Build 2026-11-08.1 • Icon navigation + high-contrast light UI • Analysis engine preserved")
+st.caption("Build 2026-11-08.2 • Parallel fetch + pooled HTTP + smart cache • Analysis engine preserved")
+st.caption("سرعت دریافت بهینه شده: صفحات بازار و درخواست‌های مستقل هم‌زمان اجرا می‌شوند؛ پاسخ‌ها کش می‌شوند و خطاهای موقت/محدودیت API با تلاش مجدد کنترل‌شده مدیریت می‌شوند.")
 st.warning(
     "امتیازها ابزار غربالگری‌اند، نه احتمال قطعی پامپ یا توصیه مالی. داده‌های ناقص به‌عنوان سیگنال مثبت فرض نمی‌شوند؛ درصد پوشش شواهد را کنار امتیاز ببین."
 )
@@ -1799,19 +1887,21 @@ if section == "🐋 جریان پول و مشتقات":
                     endpoint_jobs[result_key] = ("gainers-losers", {"timeframe": cm_mover_timeframe})
 
             collected = {}
-            with st.spinner("Requesting selected CryptoMeter feeds..."):
-                for result_key, (endpoint, params) in endpoint_jobs.items():
-                    try:
+            with st.spinner("Requesting selected CryptoMeter feeds in parallel..."):
+                job_results = _run_parallel_jobs(
+                    endpoint_jobs,
+                    lambda endpoint, params: fetch_cryptometer(endpoint, params, cm_key),
+                    max_workers=3,
+                )
+                for result_key, (endpoint, _params) in endpoint_jobs.items():
+                    result = job_results.get(result_key)
+                    if isinstance(result, Exception):
                         collected[result_key] = {
-                            "payload": fetch_cryptometer(endpoint, params, cm_key),
-                            "error": None,
-                            "endpoint": endpoint,
+                            "payload": None, "error": str(result), "endpoint": endpoint,
                         }
-                    except Exception as exc:
+                    else:
                         collected[result_key] = {
-                            "payload": None,
-                            "error": str(exc),
-                            "endpoint": endpoint,
+                            "payload": result, "error": None, "endpoint": endpoint,
                         }
             st.session_state["cryptometer_results"] = collected
             st.session_state["cryptometer_last_fetch"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1929,18 +2019,27 @@ if section == "🐋 جریان پول و مشتقات":
                     st.warning("حداقل یک ارز انتخاب کن.")
                 else:
                     actual_rows = []
-                    with st.spinner("در حال دریافت حجم خرید و فروش از صرافی..."):
-                        for symbol in selected_buy_symbols:
-                            try:
-                                actual_rows.append(fetch_cryptometer_buy_sell_volume(symbol, buy_exchange, cm_key))
-                            except Exception as exc:
+                    with st.spinner("در حال دریافت هم‌زمان حجم خرید و فروش..."):
+                        buy_jobs = {
+                            symbol: (symbol, buy_exchange, cm_key)
+                            for symbol in dict.fromkeys(selected_buy_symbols)
+                        }
+                        buy_results = _run_parallel_jobs(
+                            buy_jobs,
+                            lambda symbol, exchange, key: fetch_cryptometer_buy_sell_volume(symbol, exchange, key),
+                            max_workers=3,
+                        )
+                        for symbol in buy_jobs:
+                            result = buy_results.get(symbol)
+                            if isinstance(result, Exception):
                                 actual_rows.append({
                                     "Symbol": symbol, "Pair": f"{symbol}-USDT", "Exchange": buy_exchange,
                                     "Buy volume (USDT)": np.nan, "Sell volume (USDT)": np.nan,
                                     "Net buy (USDT)": np.nan, "Buy share (%)": np.nan,
-                                    "Data status": str(exc)[:140]
+                                    "Data status": str(result)[:140]
                                 })
-                            time.sleep(0.16)
+                            else:
+                                actual_rows.append(result)
                     st.session_state["cm_actual_buy_sell_rows"] = actual_rows
                     st.session_state["cm_actual_buy_sell_time"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
             actual_rows = st.session_state.get("cm_actual_buy_sell_rows", [])

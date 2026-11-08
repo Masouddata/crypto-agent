@@ -715,6 +715,91 @@ def fetch_history(coin_id, currency, days, api_key):
     return prices.dropna(subset=["price"])
 
 
+def render_selectable_coin_table(source_frame, display_frame=None, *, key, **kwargs):
+    """Render a selectable table and remember the selected coin for the shared chart panel."""
+    source = source_frame.reset_index(drop=True).copy()
+    shown = (display_frame if display_frame is not None else source_frame).reset_index(drop=True).copy()
+    event = st.dataframe(
+        shown, use_container_width=True, hide_index=True,
+        on_select="rerun", selection_mode="single-row", key=key, **kwargs
+    )
+    rows = event.selection.rows if event and event.selection else []
+    if rows:
+        idx = int(rows[0])
+        if 0 <= idx < len(source):
+            row = source.iloc[idx]
+            st.session_state["selected_chart_coin"] = {
+                "Coin": str(row.get("Coin", row.get("ارز", "Unknown"))),
+                "Symbol": str(row.get("Symbol", row.get("نماد", ""))).upper(),
+                "CoinGecko_ID": str(row.get("CoinGecko_ID", "")) if pd.notna(row.get("CoinGecko_ID")) else "",
+                "Price": row.get("Price", np.nan),
+            }
+    return event
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_bybit_spot_klines(base_symbol, interval, days):
+    """Resolve a spot USDT pair and fetch real OHLCV candles from Bybit public API."""
+    base_symbol = str(base_symbol).upper().strip()
+    if not base_symbol:
+        raise RuntimeError("نماد ارز مشخص نیست.")
+    instruments_payload = safe_get(
+        "https://api.bybit.com/v5/market/instruments-info",
+        params={"category": "spot", "baseCoin": base_symbol, "limit": 1000}, timeout=18
+    )
+    instruments = (instruments_payload.get("result") or {}).get("list") or []
+    matches = [item for item in instruments
+               if str(item.get("baseCoin", "")).upper() == base_symbol
+               and str(item.get("quoteCoin", "")).upper() == "USDT"]
+    if not matches:
+        raise RuntimeError(f"جفت اسپات {base_symbol}/USDT در Bybit پیدا نشد؛ برای این نماد نمودار کندلی در دسترس نیست.")
+    symbol = matches[0].get("symbol") or f"{base_symbol}USDT"
+    interval = str(interval)
+    interval_ms = {"60": 3600000, "240": 14400000, "D": 86400000, "W": 604800000, "M": 2592000000}[interval]
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - int(days) * 86400000
+    cursor_end = end_ms
+    rows = []
+    # 1h/90d needs ~2160 candles; paginate in chunks of at most 1000.
+    for _ in range(4):
+        payload = safe_get(
+            "https://api.bybit.com/v5/market/kline",
+            params={"category": "spot", "symbol": symbol, "interval": interval,
+                    "start": start_ms, "end": cursor_end, "limit": 1000}, timeout=22
+        )
+        result = payload.get("result") or {}
+        batch = result.get("list") or []
+        if not batch:
+            break
+        rows.extend(batch)
+        oldest = min(int(item[0]) for item in batch)
+        if oldest <= start_ms or len(batch) < 1000:
+            break
+        cursor_end = oldest - 1
+    if not rows:
+        raise RuntimeError("Bybit برای این جفت، کندلی برنگرداند.")
+    out = pd.DataFrame(rows, columns=["timestamp_ms", "Open", "High", "Low", "Close", "Volume", "Turnover"])
+    out["timestamp_ms"] = pd.to_numeric(out["timestamp_ms"], errors="coerce")
+    for col in ["Open", "High", "Low", "Close", "Volume", "Turnover"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=["timestamp_ms", "Open", "High", "Low", "Close"]).drop_duplicates("timestamp_ms")
+    out = out[(out["timestamp_ms"] >= start_ms) & (out["timestamp_ms"] <= end_ms)].sort_values("timestamp_ms")
+    out["Time"] = pd.to_datetime(out["timestamp_ms"], unit="ms", utc=True)
+    out["EMA20"] = out["Close"].ewm(span=20, adjust=False).mean()
+    out["EMA50"] = out["Close"].ewm(span=50, adjust=False).mean()
+    out["EMA200"] = out["Close"].ewm(span=200, adjust=False).mean()
+    delta = out["Close"].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    out["RSI"] = 100 - (100 / (1 + rs))
+    ema12 = out["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = out["Close"].ewm(span=26, adjust=False).mean()
+    out["MACD"] = ema12 - ema26
+    out["MACD_Signal"] = out["MACD"].ewm(span=9, adjust=False).mean()
+    return out, symbol
+
+
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_news(currency_api_key, coin_symbol=None):
     if not currency_api_key:
@@ -1558,7 +1643,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                 "Net_Buy_USD": "خالص خرید دلاری", "Volume_24h_vs_7d_Avg": "حجم ۲۴ساعت / مبنا",
                 "RSI_14": "RSI", "Accumulation_Status": "تفسیر وضعیت"
             })
-            st.dataframe(accumulation_display, use_container_width=True, hide_index=True)
+            render_selectable_coin_table(accumulation_view.head(20), accumulation_display, key="accumulation_coin_select")
         else:
             st.info("برای محاسبه رادار انباشت، ابتدا از تنظیمات کناری دکمه «Calculate technical indicators» را اجرا کن.")
     else:
@@ -1616,7 +1701,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
         if not early.empty:
             with st.expander(f"Early activity — needs confirmation ({len(early)})", expanded=True):
                 early_cols = [c for c in ["Coin", "Symbol", "PrePump_Score", "Change_24h_Percent", "Change_7d_Percent", "Volume_to_Market_Cap", "Volume_24h_vs_7d_Avg", "Risk_Level"] if c in early.columns]
-                st.dataframe(early[early_cols].head(20), use_container_width=True, hide_index=True)
+                render_selectable_coin_table(early.head(20), early[early_cols].head(20), key="early_coin_select")
         with st.expander("📊 Detailed candidate table", expanded=True):
             preferred_cols = [
                 "Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent",
@@ -1652,65 +1737,8 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                 "Signal": "Signal / interpretation", "Risk_Level": "Risk flag", "Technical_Signal": "Technical reading",
             }
             display_df = ranked[cols].rename(columns=display_names)
-            st.caption("برای دیدن نمودار یک ارز، روی ردیف آن کلیک کن.")
-            table_event = st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="candidate_coin_table_select",
-            )
-            selected_rows = table_event.selection.rows if table_event and table_event.selection else []
-            if selected_rows:
-                selected_coin_row = ranked.iloc[int(selected_rows[0])]
-                selected_coin_name = str(selected_coin_row.get("Coin", "ارز انتخاب‌شده"))
-                selected_coin_symbol = str(selected_coin_row.get("Symbol", "")).upper()
-                st.divider()
-                st.subheader(f"📈 نمودار {selected_coin_name} ({selected_coin_symbol})")
-                if data_source == "CoinGecko market" and pd.notna(selected_coin_row.get("CoinGecko_ID")):
-                    chart_days = st.selectbox(
-                        "بازه نمودار",
-                        [1, 7, 30, 90],
-                        index=1,
-                        format_func=lambda x: {1: "۱ روز", 7: "۷ روز", 30: "۳۰ روز", 90: "۹۰ روز"}[x],
-                        key="clicked_coin_chart_days",
-                    )
-                    try:
-                        clicked_hist = fetch_history(str(selected_coin_row["CoinGecko_ID"]), currency, chart_days, cg_key)
-                        if clicked_hist is not None and not clicked_hist.empty and "price" in clicked_hist.columns:
-                            clicked_hist = clicked_hist.sort_values("Time").copy()
-                            clicked_hist["price"] = pd.to_numeric(clicked_hist["price"], errors="coerce")
-                            clicked_hist = clicked_hist.dropna(subset=["price"])
-                            if not clicked_hist.empty:
-                                clicked_fig = go.Figure()
-                                clicked_fig.add_trace(go.Scatter(
-                                    x=clicked_hist["Time"], y=clicked_hist["price"],
-                                    mode="lines", name=selected_coin_symbol,
-                                    line=dict(color="#1769d2", width=2.5),
-                                    fill="tozeroy", fillcolor="rgba(23,105,210,0.08)",
-                                ))
-                                clicked_fig.update_layout(
-                                    template="plotly_white", height=420,
-                                    title=f"{selected_coin_symbol} — نمودار قیمت ({chart_days} روز)",
-                                    paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-                                    font=dict(color="#172b4d"),
-                                    margin=dict(l=15, r=15, t=55, b=25),
-                                    hovermode="x unified",
-                                    xaxis=dict(title="زمان", gridcolor="#e5edf6"),
-                                    yaxis=dict(title=f"قیمت ({currency.upper()})", gridcolor="#e5edf6"),
-                                )
-                                st.plotly_chart(clicked_fig, use_container_width=True)
-                                latest_clicked_price = clicked_hist["price"].iloc[-1]
-                                st.metric("آخرین قیمت داده تاریخی", fmt_money(latest_clicked_price), currency.upper())
-                            else:
-                                st.warning("داده قیمت تاریخی معتبر برای این ارز دریافت نشد.")
-                        else:
-                            st.warning("تاریخچه قیمت برای این ارز در دسترس نیست.")
-                    except Exception as chart_error:
-                        st.warning(f"دریافت نمودار ناموفق بود: {chart_error}")
-                else:
-                    st.info("برای نمایش نمودار تاریخی، منبع داده باید CoinGecko باشد و شناسه تاریخی ارز موجود باشد.")
+            st.caption("برای بازکردن پنل تحلیل حرفه‌ای، روی ردیف هر ارز کلیک کن.")
+            render_selectable_coin_table(ranked.head(100), display_df.head(100), key="candidate_coin_table_select")
             st.caption("RSI از صفر تا ۱۰۰ است: بالای ۷۰ می‌تواند نشانه داغ‌شدن حرکت و زیر ۳۰ نشانه فشار فروش شدید باشد؛ به‌تنهایی سیگنال خرید نیست. MACD بالای خط سیگنال یعنی مومنتوم صعودی‌تر، اما باید با حجم و ساختار قیمت تأیید شود.")
             st.caption("روش ورود: ۲۵٪ اولیه فقط در ناحیه ساختاری مناسب؛ ۷۵٪ پس از شکست و تثبیت مقاومت. حدضرر پشت کف/حمایت ساختاری؛ اگر داده تاریخی برای تعیین آن نداریم، سطح ورود و خروج ساخته نمی‌شود. سقف ریسک هر معامله ۰٫۵٪ سرمایه و حداقل R/R برابر ۲ است.")
     else:
@@ -1725,7 +1753,7 @@ if section == "📊 نمودارها و ریزش‌ها":
     drop_view = drop_view.dropna(subset=["_drop_rank"]).sort_values("_drop_rank").head(15)
     if not drop_view.empty:
         drop_cols = [c for c in ["Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "RSI_14", "PrePump_Score", "Buy_Flow_Status", "Risk_Level"] if c in drop_view.columns]
-        st.dataframe(drop_view[drop_cols], width="stretch", hide_index=True)
+        render_selectable_coin_table(drop_view, drop_view[drop_cols], key="drop_coin_select")
     else:
         st.info("داده کافی برای رتبه‌بندی ریزش هفتگی موجود نیست.")
 
@@ -1734,7 +1762,7 @@ if section == "📊 نمودارها و ریزش‌ها":
     alerts = df[(numeric(df["Change_24h_Percent"]).abs() >= 5) | (numeric(df["Change_7d_Percent"]).abs() >= 15)].copy()
     if not alerts.empty:
         alerts = alerts.sort_values("Change_24h_Percent", ascending=False)
-        st.dataframe(alerts[["Coin", "Symbol", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Pump_Potential_Score", "Risk_Level"]].head(30), use_container_width=True, hide_index=True)
+        render_selectable_coin_table(alerts.head(30), alerts[["Coin", "Symbol", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Pump_Potential_Score", "Risk_Level"]].head(30), key="alerts_coin_select")
     else:
         st.info("No moves crossed the default alert thresholds.")
 
@@ -1820,7 +1848,7 @@ if section == "📊 نمودارها و ریزش‌ها":
                             macd_text = "خط مکدی پایین‌تر از خط سیگنال است؛ مومنتوم هنوز ضعیف یا نزولی است و ورود عجولانه ریسک دارد."
                             macd_status = "وضعیت نزولی"
 
-                        st.markdown(f"**{choice} — قیمت آخرین داده:** `{fmt_money(last_price)}` {currency.upper()}")
+                        st.markdown(f"**{choice} — قیمت آخرین داده:** `{fmt_money(last_price, currency)}` {currency.upper()}")
                         fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.055,
                                             row_heights=[0.38, 0.16, 0.21, 0.25],
                                             subplot_titles=("قیمت", "حجم معاملات", "شاخص قدرت خرید و فروش (RSI)", "مکدی؛ قدرت و جهت حرکت (MACD)"))
@@ -2363,3 +2391,62 @@ if section == "📁 داده‌ها":
         "CoinGecko market pages cover listed market assets; DEX search is query-based. "
         "CryptoMeter paid feeds require endpoint access in your plan. This tool is informational only, not financial advice."
     )
+
+# =========================================================
+# SHARED IN-APP TRADINGVIEW-LIKE COIN ANALYSIS PANEL
+# =========================================================
+selected_chart_coin = st.session_state.get("selected_chart_coin")
+if selected_chart_coin and section in ["🧲 رادار انباشت و پیش‌پامپ", "📊 نمودارها و ریزش‌ها", "🏠 نمای کلی"]:
+    st.divider()
+    coin_name = selected_chart_coin.get("Coin", "Unknown")
+    coin_symbol = selected_chart_coin.get("Symbol", "").upper()
+    st.subheader(f"📈 تحلیل حرفه‌ای {coin_name} ({coin_symbol})")
+    st.caption("نمودار کندلی واقعی از بازار اسپات Bybit؛ فقط پس از انتخاب ارز دریافت می‌شود و برای کاهش درخواست‌ها ۵ دقیقه Cache دارد.")
+    chart_controls = st.columns([1, 1, 2])
+    with chart_controls[0]:
+        chart_interval_label = st.selectbox("تایم‌فریم", ["۱ ساعته", "۴ ساعته", "روزانه", "هفتگی", "ماهانه"], index=0, key="tv_chart_interval")
+    with chart_controls[1]:
+        chart_days = st.selectbox("تاریخچه", [1, 7, 30, 90], index=3, format_func=lambda d: {1:"۲۴ ساعت", 7:"۷ روز", 30:"۳۰ روز", 90:"۳ ماه"}[d], key="tv_chart_days")
+    with chart_controls[2]:
+        show_emas = st.multiselect("میانگین‌های متحرک", ["EMA20", "EMA50", "EMA200"], default=["EMA20", "EMA50"], key="tv_chart_emas")
+    interval_map = {"۱ ساعته":"60", "۴ ساعته":"240", "روزانه":"D", "هفتگی":"W", "ماهانه":"M"}
+    try:
+        with st.spinner("در حال دریافت کندل‌های بازار..."):
+            candle_df, exchange_pair = fetch_bybit_spot_klines(coin_symbol, interval_map[chart_interval_label], chart_days)
+        st.caption(f"بازار: Bybit Spot · جفت: {exchange_pair} · تعداد کندل: {len(candle_df):,}")
+        candle_fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.035,
+                                   row_heights=[0.62, 0.18, 0.20],
+                                   subplot_titles=("نمودار کندلی و EMA", "حجم معاملات", "RSI / MACD"))
+        candle_fig.add_trace(go.Candlestick(x=candle_df["Time"], open=candle_df["Open"], high=candle_df["High"],
+                                            low=candle_df["Low"], close=candle_df["Close"], name=coin_symbol), row=1, col=1)
+        ema_colors = {"EMA20":"#1769d2", "EMA50":"#13a98f", "EMA200":"#d97706"}
+        for ema in show_emas:
+            candle_fig.add_trace(go.Scatter(x=candle_df["Time"], y=candle_df[ema], mode="lines", name=ema,
+                                            line=dict(width=1.5, color=ema_colors[ema])), row=1, col=1)
+        candle_fig.add_trace(go.Bar(x=candle_df["Time"], y=candle_df["Volume"], name="Volume",
+                                    marker_color="#9bb8df", opacity=.72), row=2, col=1)
+        candle_fig.add_trace(go.Scatter(x=candle_df["Time"], y=candle_df["RSI"], name="RSI 14",
+                                        line=dict(color="#805ad5", width=1.6)), row=3, col=1)
+        candle_fig.add_hline(y=70, line_dash="dash", line_color="#d9534f", row=3, col=1)
+        candle_fig.add_hline(y=30, line_dash="dash", line_color="#13a98f", row=3, col=1)
+        candle_fig.update_layout(template="plotly_white", height=760, paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+                                 font=dict(color="#172b4d", size=12), margin=dict(l=15,r=15,t=55,b=20),
+                                 hovermode="x unified", xaxis_rangeslider_visible=False,
+                                 legend=dict(orientation="h", y=1.02, x=0))
+        candle_fig.update_yaxes(gridcolor="#e5edf6")
+        candle_fig.update_xaxes(gridcolor="#edf2f8")
+        st.plotly_chart(candle_fig, use_container_width=True, config={"displaylogo":False, "scrollZoom":True, "responsive":True})
+        latest = candle_df.iloc[-1]
+        prev_close = candle_df["Close"].iloc[-2] if len(candle_df) > 1 else np.nan
+        change_pct = ((latest["Close"] / prev_close) - 1) * 100 if pd.notna(prev_close) and prev_close else np.nan
+        m1,m2,m3,m4 = st.columns(4)
+        m1.metric("آخرین قیمت", fmt_money(latest["Close"], "USDT"), f"{change_pct:+.2f}%" if pd.notna(change_pct) else None)
+        m2.metric("RSI (14)", f"{latest['RSI']:.1f}" if pd.notna(latest["RSI"]) else "—")
+        m3.metric("EMA20", fmt_money(latest["EMA20"], "USDT"))
+        m4.metric("MACD", f"{latest['MACD']:.6g}" if pd.notna(latest["MACD"]) else "—")
+        macd_bias = "مثبت‌تر" if latest["MACD"] > latest["MACD_Signal"] else "ضعیف‌تر/منفی" if pd.notna(latest["MACD"]) and pd.notna(latest["MACD_Signal"]) else "داده ناکافی"
+        st.info(f"برداشت تکنیکال: RSI برابر {latest['RSI']:.1f} است؛ وضعیت MACD: {macd_bias}. این موارد ابزار کمکی‌اند و به‌تنهایی سیگنال ورود نیستند.")
+    except Exception as chart_exc:
+        st.warning(f"نمودار کندلی برای این ارز دریافت نشد: {chart_exc}")
+        st.caption("ممکن است این نماد در بازار اسپات USDT صرافی Bybit فهرست نشده باشد. اسکنر و سایر جدول‌ها مستقل از این پنل به کار خود ادامه می‌دهند.")
+

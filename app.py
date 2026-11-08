@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -715,12 +716,48 @@ def fetch_history(coin_id, currency, days, api_key):
     return prices.dropna(subset=["price"])
 
 
+def style_percentage_columns(frame):
+    """Render positive percentages green and negative percentages red in every table."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return frame
+
+    percent_tokens = (
+        "%", "٪", "percent", "percentage", "change", "funding", "share", "pressure",
+        "تغییر", "درصد", "سهم", "فشار", "رشد", "بازده", "فاندینگ",
+    )
+    percent_cols = [
+        col for col in frame.columns
+        if any(token in str(col).casefold() for token in percent_tokens)
+    ]
+    if not percent_cols:
+        return frame
+
+    def parse_percent(value):
+        if pd.isna(value):
+            return np.nan
+        # Also support display strings such as +2.4%, −1.8٪ or values with thousands separators.
+        cleaned = str(value).replace("−", "-").replace("٪", "").replace("%", "").replace(",", "")
+        match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", cleaned)
+        return float(match.group(0)) if match else np.nan
+
+    def color_column(series):
+        values = series.map(parse_percent)
+        return [
+            "color: #16803c !important; font-weight: 700" if pd.notna(value) and value > 0
+            else "color: #dc2626 !important; font-weight: 700" if pd.notna(value) and value < 0
+            else ""
+            for value in values
+        ]
+
+    return frame.style.apply(color_column, subset=percent_cols)
+
+
 def render_selectable_coin_table(source_frame, display_frame=None, *, key, **kwargs):
     """Render a selectable table and remember the selected coin for the shared chart panel."""
     source = source_frame.reset_index(drop=True).copy()
     shown = (display_frame if display_frame is not None else source_frame).reset_index(drop=True).copy()
     event = st.dataframe(
-        shown, use_container_width=True, hide_index=True,
+        style_percentage_columns(shown), use_container_width=True, hide_index=True,
         on_select="rerun", selection_mode="single-row", key=key, **kwargs
     )
     rows = event.selection.rows if event and event.selection else []
@@ -739,165 +776,130 @@ def render_selectable_coin_table(source_frame, display_frame=None, *, key, **kwa
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_bybit_spot_klines(base_symbol, interval, days):
-    """Resolve a spot USDT pair and fetch real OHLCV candles from Bybit public API."""
+    """Fetch spot OHLCV candles: Bybit first, then OKX, then Gate.io."""
     base_symbol = str(base_symbol).upper().strip()
     if not base_symbol:
         raise RuntimeError("نماد ارز مشخص نیست.")
-    instruments_payload = safe_get(
-        "https://api.bybit.com/v5/market/instruments-info",
-        params={"category": "spot", "baseCoin": base_symbol, "limit": 1000}, timeout=18
-    )
-    instruments = (instruments_payload.get("result") or {}).get("list") or []
-    matches = [item for item in instruments
-               if str(item.get("baseCoin", "")).upper() == base_symbol
-               and str(item.get("quoteCoin", "")).upper() == "USDT"]
-    if not matches:
-        raise RuntimeError(f"جفت اسپات {base_symbol}/USDT در Bybit پیدا نشد؛ برای این نماد نمودار کندلی در دسترس نیست.")
-    symbol = matches[0].get("symbol") or f"{base_symbol}USDT"
+
     interval = str(interval)
-    interval_ms = {"60": 3600000, "240": 14400000, "D": 86400000, "W": 604800000, "M": 2592000000}[interval]
+    interval_ms = {"60": 3600000, "240": 14400000, "D": 86400000,
+                   "W": 604800000, "M": 2592000000}[interval]
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - int(days) * 86400000
-    cursor_end = end_ms
-    rows = []
-    # 1h/90d needs ~2160 candles; paginate in chunks of at most 1000.
-    for _ in range(4):
-        payload = safe_get(
-            "https://api.bybit.com/v5/market/kline",
-            params={"category": "spot", "symbol": symbol, "interval": interval,
-                    "start": start_ms, "end": cursor_end, "limit": 1000}, timeout=22
-        )
-        result = payload.get("result") or {}
-        batch = result.get("list") or []
-        if not batch:
-            break
-        rows.extend(batch)
-        oldest = min(int(item[0]) for item in batch)
-        if oldest <= start_ms or len(batch) < 1000:
-            break
-        cursor_end = oldest - 1
-    if not rows:
-        raise RuntimeError("Bybit برای این جفت، کندلی برنگرداند.")
-    out = pd.DataFrame(rows, columns=["timestamp_ms", "Open", "High", "Low", "Close", "Volume", "Turnover"])
-    out["timestamp_ms"] = pd.to_numeric(out["timestamp_ms"], errors="coerce")
-    for col in ["Open", "High", "Low", "Close", "Volume", "Turnover"]:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-    out = out.dropna(subset=["timestamp_ms", "Open", "High", "Low", "Close"]).drop_duplicates("timestamp_ms")
-    out = out[(out["timestamp_ms"] >= start_ms) & (out["timestamp_ms"] <= end_ms)].sort_values("timestamp_ms")
-    out["Time"] = pd.to_datetime(out["timestamp_ms"], unit="ms", utc=True)
-    out["EMA20"] = out["Close"].ewm(span=20, adjust=False).mean()
-    out["EMA50"] = out["Close"].ewm(span=50, adjust=False).mean()
-    out["EMA200"] = out["Close"].ewm(span=200, adjust=False).mean()
-    delta = out["Close"].diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    out["RSI"] = 100 - (100 / (1 + rs))
-    ema12 = out["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = out["Close"].ewm(span=26, adjust=False).mean()
-    out["MACD"] = ema12 - ema26
-    out["MACD_Signal"] = out["MACD"].ewm(span=9, adjust=False).mean()
-    return out, symbol
+    errors = []
 
+    def finish_candles(rows, columns, exchange_pair, exchange_name):
+        if not rows:
+            raise RuntimeError(f"{exchange_name}: داده کندلی دریافت نشد.")
+        out = pd.DataFrame(rows, columns=columns)
+        out["timestamp_ms"] = pd.to_numeric(out["timestamp_ms"], errors="coerce")
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+        out = out.dropna(subset=["timestamp_ms", "Open", "High", "Low", "Close"])
+        out = out.drop_duplicates("timestamp_ms")
+        out = out[(out["timestamp_ms"] >= start_ms) & (out["timestamp_ms"] <= end_ms)].sort_values("timestamp_ms")
+        if out.empty:
+            raise RuntimeError(f"{exchange_name}: کندل معتبری در بازه انتخاب‌شده وجود ندارد.")
+        out["Time"] = pd.to_datetime(out["timestamp_ms"], unit="ms", utc=True)
+        out["EMA20"] = out["Close"].ewm(span=20, adjust=False).mean()
+        out["EMA50"] = out["Close"].ewm(span=50, adjust=False).mean()
+        out["EMA200"] = out["Close"].ewm(span=200, adjust=False).mean()
+        delta = out["Close"].diff()
+        gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+        rs = gain / loss.replace(0, np.nan)
+        out["RSI"] = 100 - (100 / (1 + rs))
+        ema12 = out["Close"].ewm(span=12, adjust=False).mean()
+        ema26 = out["Close"].ewm(span=26, adjust=False).mean()
+        out["MACD"] = ema12 - ema26
+        out["MACD_Signal"] = out["MACD"].ewm(span=9, adjust=False).mean()
+        return out, f"{exchange_name} Spot · {exchange_pair}"
 
-@st.cache_data(ttl=180, show_spinner=False)
-def fetch_news(currency_api_key, coin_symbol=None):
-    if not currency_api_key:
-        return pd.DataFrame(), "No CryptoPanic API key configured"
-    params = {"auth_token": currency_api_key, "public": "true", "kind": "news"}
-    if coin_symbol:
-        params["currencies"] = str(coin_symbol).lower()
+    # 1) Bybit. A 403/region block should not prevent the chart from loading elsewhere.
     try:
-        payload = safe_get(NEWS_API, params=params, timeout=20)
-        results = payload.get("results", [])
-        rows = []
-        for item in results:
-            votes = item.get("votes") or {}
-            title = item.get("title", "")
-            rows.append({
-                "Published": item.get("published_at"),
-                "Title": title,
-                "Source": (item.get("source") or {}).get("title", ""),
-                "Currencies": ", ".join(
-                    (c.get("code", "") for c in (item.get("currencies") or []))
-                ),
-                "Positive_Votes": votes.get("positive", 0),
-                "Negative_Votes": votes.get("negative", 0),
-                "URL": item.get("url", ""),
-            })
-        return pd.DataFrame(rows), "ok"
-    except Exception as exc:
-        return pd.DataFrame(), str(exc)
-
-
-@st.cache_data(ttl=90, show_spinner=False)
-def fetch_dex_search(query):
-    """Searches DEX Screener by query; it does not enumerate every token on every chain."""
-    payload = safe_get(f"{DEX_API}/latest/dex/search", params={"q": query}, timeout=20)
-    pairs = payload.get("pairs") or []
-    rows = []
-    for p in pairs:
-        base = p.get("baseToken") or {}
-        quote = p.get("quoteToken") or {}
-        txns = p.get("txns") or {}
-        h24 = txns.get("h24") or {}
-        vol = p.get("volume") or {}
-        liq = p.get("liquidity") or {}
-        price_change = p.get("priceChange") or {}
-        rows.append({
-            "Chain": p.get("chainId", ""),
-            "DEX": p.get("dexId", ""),
-            "Pair": p.get("pairAddress", ""),
-            "Token": base.get("name", ""),
-            "Symbol": str(base.get("symbol", "")).upper(),
-            "Price_USD": p.get("priceUsd"),
-            "Change_5m_Percent": price_change.get("m5"),
-            "Change_1h_Percent": price_change.get("h1"),
-            "Change_6h_Percent": price_change.get("h6"),
-            "Change_24h_Percent": price_change.get("h24"),
-            "Volume_24h_USD": vol.get("h24"),
-            "Liquidity_USD": liq.get("usd"),
-            "Buys_24h": h24.get("buys"),
-            "Sells_24h": h24.get("sells"),
-            "Pair_URL": p.get("url", ""),
-            "Created_At": p.get("pairCreatedAt"),
-        })
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        for c in ["Price_USD", "Change_5m_Percent", "Change_1h_Percent", "Change_6h_Percent",
-                  "Change_24h_Percent", "Volume_24h_USD", "Liquidity_USD", "Buys_24h", "Sells_24h"]:
-            df[c] = numeric(df[c])
-        # Simple DEX screening score, deliberately penalizes low liquidity.
-        ch = df["Change_24h_Percent"].fillna(0).clip(-50, 100)
-        vol = np.log10(df["Volume_24h_USD"].fillna(0).clip(lower=0) + 1)
-        liq = df["Liquidity_USD"].fillna(0)
-        buy = df["Buys_24h"].fillna(0)
-        sell = df["Sells_24h"].fillna(0)
-        buy_ratio = buy / (buy + sell).replace(0, np.nan)
-        total_txns = buy + sell
-        buy_ratio = buy_ratio.fillna(0.5).clip(0, 1)
-        df["Transactions_24h"] = total_txns
-        df["Buy_Count_Share_Percent"] = (buy_ratio * 100).round(1)
-        df["Buy_Sell_Count_Ratio"] = (buy / sell.replace(0, np.nan)).round(2)
-        # Approximate split of reported volume using transaction-count share only.
-        # This is NOT actual buy/sell USD flow because average trade sizes may differ.
-        df["Estimated_Buy_Volume_Proxy_USD"] = (df["Volume_24h_USD"].fillna(0) * buy_ratio).round(2)
-        df["Estimated_Sell_Volume_Proxy_USD"] = (df["Volume_24h_USD"].fillna(0) * (1 - buy_ratio)).round(2)
-        df["Volume_to_Liquidity_Ratio"] = (
-            df["Volume_24h_USD"] / liq.replace(0, np.nan)
-        ).round(2)
-        df["Activity_Flag"] = np.where(
-            (df["Volume_to_Liquidity_Ratio"] >= 3) & (total_txns >= 1000),
-            "Unusually high trading activity — investigate",
-            np.where(total_txns >= 500, "Active trading", "Limited activity / verify data")
+        instruments_payload = safe_get(
+            "https://api.bybit.com/v5/market/instruments-info",
+            params={"category": "spot", "baseCoin": base_symbol, "limit": 1000}, timeout=12
         )
-        df["DEX_Screen_Score"] = (
-            45 + ch * 0.7 + vol * 3 + (buy_ratio - 0.5) * 20
-        ).clip(0, 100).round(2)
-        df["Risk_Flag"] = np.where(liq < 50000, "High: low liquidity",
-                           np.where(liq < 200000, "Medium: check liquidity", "Review contract / market"))
-        df = df.sort_values(["DEX_Screen_Score", "Liquidity_USD"], ascending=False, na_position="last")
-    return df
+        if str(instruments_payload.get("retCode")) != "0":
+            raise RuntimeError(instruments_payload.get("retMsg", "Bybit instruments error"))
+        instruments = (instruments_payload.get("result") or {}).get("list") or []
+        matches = [x for x in instruments if str(x.get("baseCoin", "")).upper() == base_symbol
+                   and str(x.get("quoteCoin", "")).upper() == "USDT"]
+        if not matches:
+            raise RuntimeError(f"{base_symbol}/USDT در Bybit Spot فهرست نشده است")
+        symbol = matches[0].get("symbol") or f"{base_symbol}USDT"
+        cursor_end, rows = end_ms, []
+        for _ in range(4):
+            payload = safe_get(
+                "https://api.bybit.com/v5/market/kline",
+                params={"category": "spot", "symbol": symbol, "interval": interval,
+                        "start": start_ms, "end": cursor_end, "limit": 1000}, timeout=18
+            )
+            if str(payload.get("retCode")) != "0":
+                raise RuntimeError(payload.get("retMsg", "Bybit kline error"))
+            batch = (payload.get("result") or {}).get("list") or []
+            if not batch:
+                break
+            rows.extend([[r[0], r[1], r[2], r[3], r[4], r[5]] for r in batch])
+            oldest = min(int(r[0]) for r in batch)
+            if oldest <= start_ms or len(batch) < 1000:
+                break
+            cursor_end = oldest - 1
+        return finish_candles(rows, ["timestamp_ms", "Open", "High", "Low", "Close", "Volume"], symbol, "Bybit")
+    except Exception as exc:
+        errors.append(f"Bybit: {str(exc)[:160]}")
+
+    # 2) OKX Spot public candles (no API key). history-candles returns up to 300 rows per page.
+    try:
+        base = "https://www.okx.com"
+        inst_payload = safe_get(f"{base}/api/v5/public/instruments", params={"instType": "SPOT"}, timeout=18)
+        if str(inst_payload.get("code")) != "0":
+            raise RuntimeError(inst_payload.get("msg", "OKX instruments error"))
+        instruments = inst_payload.get("data", [])
+        candidates = [x for x in instruments if x.get("baseCcy", "").upper() == base_symbol
+                      and x.get("quoteCcy", "").upper() == "USDT" and x.get("state") == "live"]
+        if not candidates:
+            raise RuntimeError(f"{base_symbol}/USDT در OKX Spot فهرست نشده است")
+        inst_id = candidates[0]["instId"]
+        okx_bar = {"60": "1H", "240": "4H", "D": "1D", "W": "1W", "M": "1M"}[interval]
+        rows, after = [], None
+        for _ in range(10):
+            params = {"instId": inst_id, "bar": okx_bar, "limit": "300"}
+            if after is not None:
+                params["after"] = str(after)
+            payload = safe_get(f"{base}/api/v5/market/history-candles", params=params, timeout=18)
+            if str(payload.get("code")) != "0":
+                raise RuntimeError(payload.get("msg", "OKX candle error"))
+            batch = payload.get("data", [])
+            if not batch:
+                break
+            for r in batch:
+                rows.append([r[0], r[1], r[2], r[3], r[4], r[5]])
+            oldest = min(int(r[0]) for r in batch)
+            if oldest <= start_ms or len(batch) < 300:
+                break
+            after = oldest - 1
+        return finish_candles(rows, ["timestamp_ms", "Open", "High", "Low", "Close", "Volume"], inst_id, "OKX")
+    except Exception as exc:
+        errors.append(f"OKX: {str(exc)[:160]}")
+
+    # 3) Gate.io Spot public candles. One request supports up to 1000 candles.
+    try:
+        pair = f"{base_symbol}_USDT"
+        gate_interval = {"60": "1h", "240": "4h", "D": "1d", "W": "7d", "M": "30d"}[interval]
+        gate_rows = safe_get(
+            "https://api.gateio.ws/api/v4/spot/candlesticks",
+            params={"currency_pair": pair, "interval": gate_interval,
+                    "from": int(start_ms / 1000), "to": int(end_ms / 1000), "limit": 1000}, timeout=18
+        )
+        # Gate format: [timestamp, volume, close, high, low, open, ...]
+        rows = [[int(r[0]) * 1000, r[5], r[3], r[4], r[2], r[1]] for r in gate_rows]
+        return finish_candles(rows, ["timestamp_ms", "Open", "High", "Low", "Close", "Volume"], pair, "Gate.io")
+    except Exception as exc:
+        errors.append(f"Gate.io: {str(exc)[:160]}")
+
+    raise RuntimeError("هیچ منبعی کندل نداد. " + " | ".join(errors))
 
 
 # =========================================================
@@ -1914,7 +1916,7 @@ if section == "📰 اخبار و DEX":
             news_df["Headline_Sentiment_Proxy"] = news_df["Title"].apply(headline_score).map(
                 lambda x: "Positive keyword" if x > 0 else ("Negative keyword" if x < 0 else "Neutral / unclassified")
             )
-            st.dataframe(news_df, use_container_width=True, hide_index=True)
+            st.dataframe(style_percentage_columns(news_df), use_container_width=True, hide_index=True)
             st.caption("Headline sentiment is a simple keyword proxy, not a trained NLP model or a fact-check.")
 
     # DEX panel
@@ -1956,7 +1958,7 @@ if section == "📰 اخبار و DEX":
                             "Volume_to_Liquidity_Ratio", "Activity_Flag", "DEX_Screen_Score", "Risk_Flag", "Pair_URL"
                         ]
                         display_cols = [c for c in display_cols if c in dex_df.columns]
-                        st.dataframe(dex_df[display_cols].head(100), use_container_width=True, hide_index=True)
+                        st.dataframe(style_percentage_columns(dex_df[display_cols].head(100)), use_container_width=True, hide_index=True)
                         st.caption(
                             "Whale-watch clue only: unusually high volume relative to liquidity plus many transactions can merit review, "
                             "but does not prove that whales traded or that net inflows occurred. Check wallet-level data separately."
@@ -1991,7 +1993,7 @@ if section == "🐋 جریان پول و مشتقات":
             d3.metric("Negative funding", int((numeric(deriv["Funding_Rate_Percent"]) < 0).sum()))
             deriv_view = deriv.sort_values("Derivatives_Context_Score", ascending=False)
             deriv_cols = [c for c in ["Coin", "Symbol", "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange", "Derivatives_Change_24h_Percent", "Derivatives_Context_Score", "PrePump_Score", "Signal"] if c in deriv_view.columns]
-            st.dataframe(deriv_view[deriv_cols].head(60), use_container_width=True, hide_index=True)
+            st.dataframe(style_percentage_columns(deriv_view[deriv_cols].head(60)), use_container_width=True, hide_index=True)
             st.caption("Interpretation: very positive funding can indicate crowded longs; negative funding can indicate crowded shorts. Combine with price, volume and OI changes—one snapshot alone cannot confirm a squeeze or a pump.")
 
 
@@ -2135,7 +2137,7 @@ if section == "🐋 جریان پول و مشتقات":
                     st.info("No rapid-movement records were returned.")
                 else:
                     show_cols = [c for c in ["pair", "exchange", "change_detected", "side", "timestamp"] if c in rapid_df.columns]
-                    st.dataframe(rapid_df[show_cols] if show_cols else rapid_df, use_container_width=True, hide_index=True)
+                    st.dataframe(style_percentage_columns(rapid_df[show_cols] if show_cols else rapid_df), use_container_width=True, hide_index=True)
 
             whale_result = cm_results.get("whales", {})
             if whale_result.get("payload"):
@@ -2147,7 +2149,7 @@ if section == "🐋 جریان پول و مشتقات":
                     if "usd_total" not in whale_df.columns and "total" in whale_df.columns:
                         whale_df["usd_total"] = whale_df["total"]
                     whale_cols = [c for c in ["timestamp", "symbol", "pair", "exchange", "side", "price", "size", "usd_total"] if c in whale_df.columns]
-                    st.dataframe(whale_df[whale_cols] if whale_cols else whale_df, use_container_width=True, hide_index=True)
+                    st.dataframe(style_percentage_columns(whale_df[whale_cols] if whale_cols else whale_df), use_container_width=True, hide_index=True)
                     # Whale-flow visualization uses only provider-reported USD trade values.
                     whale_value_col = "usd_total" if "usd_total" in whale_df.columns else ("total" if "total" in whale_df.columns else None)
                     if whale_value_col and "side" in whale_df.columns:
@@ -2188,7 +2190,7 @@ if section == "🐋 جریان پول و مشتقات":
                             if flow_frame.empty:
                                 st.info(f"No {flow_name} rows returned.")
                             else:
-                                st.dataframe(flow_frame, use_container_width=True, hide_index=True)
+                                st.dataframe(style_percentage_columns(flow_frame), use_container_width=True, hide_index=True)
                 else:
                     st.json(flow_data)
 
@@ -2272,7 +2274,7 @@ if section == "🐋 جریان پول و مشتقات":
                         "Net buy (USDT)": "خالص خرید (USDT)",
                         "Buy share (%)": "سهم خرید", "Data status": "وضعیت داده"
                     })
-                    st.dataframe(show_actual, width="stretch", hide_index=True)
+                    st.dataframe(style_percentage_columns(show_actual), width="stretch", hide_index=True)
                     st.markdown("**نمودار جریان خرید و فروش واقعی**")
                     chart_actual = valid_actual[["Symbol", "Buy volume (USDT)", "Sell volume (USDT)"]].melt(
                         id_vars="Symbol", var_name="جهت جریان", value_name="حجم (USDT)"
@@ -2324,7 +2326,7 @@ if section == "🐋 جریان پول و مشتقات":
                 else:
                     if "netflow" in liquidity_df.columns:
                         liquidity_df = liquidity_df.sort_values("netflow", ascending=False)
-                    st.dataframe(liquidity_df, use_container_width=True, hide_index=True)
+                    st.dataframe(style_percentage_columns(liquidity_df), use_container_width=True, hide_index=True)
 
             funding_result = cm_results.get("funding", {})
             if funding_result.get("payload"):
@@ -2334,7 +2336,7 @@ if section == "🐋 جریان پول و مشتقات":
                     st.info("No funding-rate rows were returned.")
                 else:
                     funding_cols = [c for c in ["symbol", "pair", "exchange", "rate_percent", "annualized_percent", "interval_hours", "next_funding_at"] if c in funding_df.columns]
-                    st.dataframe(funding_df[funding_cols] if funding_cols else funding_df, use_container_width=True, hide_index=True)
+                    st.dataframe(style_percentage_columns(funding_df[funding_cols] if funding_cols else funding_df), use_container_width=True, hide_index=True)
 
             movers_result = cm_results.get("movers", {})
             if movers_result.get("payload"):
@@ -2348,7 +2350,7 @@ if section == "🐋 جریان پول و مشتقات":
                             if side_df.empty:
                                 st.info(f"No {side_name} rows returned.")
                             else:
-                                st.dataframe(side_df, use_container_width=True, hide_index=True)
+                                st.dataframe(style_percentage_columns(side_df), use_container_width=True, hide_index=True)
                 else:
                     st.json(movers_data)
 
@@ -2360,7 +2362,7 @@ if section == "🐋 جریان پول و مشتقات":
                     "and coin-level netflow (+/−15). A bullish/bearish label requires at least two independent evidence sources. "
                     "This score is not a calibrated probability and is not a buy recommendation."
                 )
-                st.dataframe(watchlist_df, use_container_width=True, hide_index=True)
+                st.dataframe(style_percentage_columns(watchlist_df), use_container_width=True, hide_index=True)
                 st.download_button(
                     "⬇️ Download CryptoMeter watchlist CSV",
                     data=watchlist_df.to_csv(index=False).encode("utf-8"),
@@ -2378,7 +2380,7 @@ if section == "📁 داده‌ها":
     with st.expander("📋 مشاهده پیشرفته و دریافت کل داده‌های بازار", expanded=False):
         st.caption("This table contains the raw columns used by the scanner. Most users can work from the candidate table above.")
         if show_all:
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(style_percentage_columns(df), use_container_width=True, hide_index=True)
         st.download_button(
             "⬇️ Download full market CSV",
             data=df.to_csv(index=False).encode("utf-8"),
@@ -2401,7 +2403,7 @@ if selected_chart_coin and section in ["🧲 رادار انباشت و پیش�
     coin_name = selected_chart_coin.get("Coin", "Unknown")
     coin_symbol = selected_chart_coin.get("Symbol", "").upper()
     st.subheader(f"📈 تحلیل حرفه‌ای {coin_name} ({coin_symbol})")
-    st.caption("نمودار کندلی واقعی از بازار اسپات Bybit؛ فقط پس از انتخاب ارز دریافت می‌شود و برای کاهش درخواست‌ها ۵ دقیقه Cache دارد.")
+    st.caption("نمودار کندلی بازار اسپات؛ ابتدا Bybit و در صورت محدودیت به‌ترتیب OKX و Gate.io بررسی می‌شوند. فقط پس از انتخاب ارز دریافت می‌شود و ۵ دقیقه Cache دارد.")
     chart_controls = st.columns([1, 1, 2])
     with chart_controls[0]:
         chart_interval_label = st.selectbox("تایم‌فریم", ["۱ ساعته", "۴ ساعته", "روزانه", "هفتگی", "ماهانه"], index=0, key="tv_chart_interval")
@@ -2448,5 +2450,5 @@ if selected_chart_coin and section in ["🧲 رادار انباشت و پیش�
         st.info(f"برداشت تکنیکال: RSI برابر {latest['RSI']:.1f} است؛ وضعیت MACD: {macd_bias}. این موارد ابزار کمکی‌اند و به‌تنهایی سیگنال ورود نیستند.")
     except Exception as chart_exc:
         st.warning(f"نمودار کندلی برای این ارز دریافت نشد: {chart_exc}")
-        st.caption("ممکن است این نماد در بازار اسپات USDT صرافی Bybit فهرست نشده باشد. اسکنر و سایر جدول‌ها مستقل از این پنل به کار خود ادامه می‌دهند.")
+        st.caption("ممکن است نماد در بازار اسپات USDT این صرافی‌ها موجود نباشد یا دسترسی شبکه محدود شده باشد. اسکنر و سایر جدول‌ها مستقل از این پنل به کار خود ادامه می‌دهند.")
 

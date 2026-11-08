@@ -1402,6 +1402,101 @@ else:
     df["Volume_24h_vs_7d_Avg"] = numeric(df["Volume_24h_vs_7d_Avg"])
 
 # =========================================================
+# MARKET SENTIMENT INDICES — Fear & Greed + Altcoin Season
+# =========================================================
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_fear_greed_history():
+    """Alternative.me daily Fear & Greed observations (latest 31 records)."""
+    payload = safe_get(
+        "https://api.alternative.me/fng/",
+        params={"limit": 31, "format": "json"},
+        timeout=15,
+    )
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    records = []
+    for item in rows:
+        try:
+            value = float(item.get("value"))
+            stamp = int(item.get("timestamp"))
+            if 0 <= value <= 100 and stamp > 0:
+                records.append({
+                    "Timestamp": pd.to_datetime(stamp, unit="s", utc=True),
+                    "Value": value,
+                    "Classification": str(item.get("value_classification", "")),
+                })
+        except (TypeError, ValueError, OverflowError):
+            continue
+    if not records:
+        raise ValueError("Fear & Greed provider returned no valid observations")
+    return pd.DataFrame(records).sort_values("Timestamp").reset_index(drop=True)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_altcoin_season_index():
+    """CoinMarketCap public/keyless Altcoin Season Index endpoint."""
+    payload = safe_get(
+        "https://pro-api.coinmarketcap.com/public-api/v1/altcoin-season-index/latest",
+        timeout=15,
+    )
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    value = data.get("altcoin_index")
+    if value is None:
+        raise ValueError("Altcoin Season Index is not present in provider response")
+    value = float(value)
+    if not 0 <= value <= 100:
+        raise ValueError("Altcoin Season Index is outside the 0–100 range")
+    return {
+        "value": value,
+        "snapshot_time": data.get("snapshot_time"),
+        "yearly_high": data.get("yearly_high"),
+        "yearly_low": data.get("yearly_low"),
+    }
+
+
+def sentiment_label(value):
+    if value < 25:
+        return "ترس شدید"
+    if value < 45:
+        return "ترس"
+    if value <= 55:
+        return "خنثی"
+    if value <= 75:
+        return "طمع"
+    return "طمع شدید"
+
+
+def render_semi_gauge(value, title, subtitle, marker_color="#1769d2"):
+    """Compact semicircular Plotly gauge with explicit 0–100 scale."""
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=float(value),
+        number={"font": {"size": 38, "color": "#102846"}, "suffix": " / 100"},
+        title={"text": f"<b>{title}</b><br><span style='font-size:13px;color:#52677f'>{subtitle}</span>",
+               "font": {"size": 18, "color": "#102846"}},
+        gauge={
+            "shape": "angular",
+            "axis": {"range": [0, 100], "tickmode": "array", "tickvals": [0, 25, 50, 75, 100],
+                     "tickfont": {"size": 11, "color": "#465b75"}},
+            "bar": {"color": marker_color, "thickness": 0.25},
+            "bgcolor": "white",
+            "borderwidth": 0,
+            "steps": [
+                {"range": [0, 25], "color": "#f46b65"},
+                {"range": [25, 45], "color": "#ffad72"},
+                {"range": [45, 55], "color": "#f6d878"},
+                {"range": [55, 75], "color": "#9cdda0"},
+                {"range": [75, 100], "color": "#35c878"},
+            ],
+            "threshold": {"line": {"color": marker_color, "width": 4}, "thickness": 0.85,
+                          "value": float(value)},
+        },
+    ))
+    fig.update_layout(height=265, margin={"l": 22, "r": 22, "t": 65, "b": 12},
+                      paper_bgcolor="rgba(0,0,0,0)", font={"family": "Arial"})
+    return fig
+
+
+# =========================================================
 # منوی اصلی بخش‌های اسکنر
 # =========================================================
 filtered = df[(numeric(df["PrePump_Score"]).fillna(0) >= min_score) & (~df["Is_Excluded_Asset"])].copy()  # پیش‌فرض برای بخش‌های دیگر
@@ -1444,6 +1539,74 @@ if section == "🏠 نمای کلی":
             st.success(f"Public derivatives feed: {bybit_status} • cached 90 seconds")
         else:
             st.warning(f"Public derivatives feed {bybit_status}. Scanner continues without it.")
+
+    # Live sentiment meters — these are market context indicators, not entry signals.
+    st.divider()
+    st.subheader("🌡️ دماسنج احساسات بازار")
+    st.caption("دو شاخص مستقل برای سنجش جو بازار؛ مقدارها از ارائه‌دهنده دریافت می‌شوند و در صورت قطعی API عدد ساختگی نمایش داده نمی‌شود.")
+    fg_col, alt_col = st.columns(2, gap="large")
+    try:
+        fg_history = fetch_fear_greed_history()
+        fg_latest = fg_history.iloc[-1]
+        fg_value = float(fg_latest["Value"])
+        fg_label = sentiment_label(fg_value)
+        with fg_col:
+            st.plotly_chart(
+                render_semi_gauge(fg_value, "شاخص ترس و طمع", fg_label, "#1769d2"),
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+            if len(fg_history) >= 2:
+                previous_value = float(fg_history.iloc[-2]["Value"])
+                delta = fg_value - previous_value
+                st.metric("تغییر نسبت به مشاهده قبلی", f"{delta:+.0f} واحد", delta_color="normal")
+            st.caption("منبع: Alternative.me — داده روزانه؛ شاخص احساسات است، نه سیگنال قطعی خرید یا فروش.")
+            history_chart = go.Figure()
+            history_chart.add_trace(go.Scatter(
+                x=fg_history["Timestamp"], y=fg_history["Value"], mode="lines+markers",
+                name="Fear & Greed", line={"color": "#1769d2", "width": 3},
+                marker={"size": 5},
+            ))
+            history_chart.add_hrect(y0=0, y1=25, fillcolor="#f46b65", opacity=0.08, line_width=0)
+            history_chart.add_hrect(y0=75, y1=100, fillcolor="#35c878", opacity=0.08, line_width=0)
+            history_chart.update_layout(
+                title="روند ۳۰ روزه ترس و طمع", height=220,
+                margin={"l": 12, "r": 12, "t": 42, "b": 12},
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                yaxis={"range": [0, 100], "title": "امتیاز", "gridcolor": "#e4ebf4"},
+                xaxis={"title": "", "gridcolor": "#f0f3f8"},
+                showlegend=False,
+            )
+            st.plotly_chart(history_chart, use_container_width=True, config={"displayModeBar": False})
+    except Exception as exc:
+        with fg_col:
+            st.warning(f"شاخص ترس و طمع فعلاً دریافت نشد: {str(exc)[:180]}")
+
+    try:
+        alt_data = fetch_altcoin_season_index()
+        alt_value = alt_data["value"]
+        if alt_value < 25:
+            alt_label = "فصل بیت‌کوین"
+        elif alt_value > 75:
+            alt_label = "فصل آلت‌کوین‌ها"
+        else:
+            alt_label = "فصل خنثی / انتقالی"
+        with alt_col:
+            st.plotly_chart(
+                render_semi_gauge(alt_value, "شاخص فصل آلت‌کوین‌ها", alt_label, "#087f6b"),
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+            st.metric("وضعیت بازار آلت‌کوین‌ها", alt_label)
+            st.caption("منبع: CoinMarketCap Public API • کمتر از ۲۵: فصل بیت‌کوین؛ بیشتر از ۷۵: فصل آلت‌کوین‌ها.")
+            if alt_data.get("snapshot_time"):
+                st.caption(f"زمان ثبت داده: {alt_data['snapshot_time']}")
+    except Exception as exc:
+        with alt_col:
+            st.warning(f"شاخص فصل آلت‌کوین‌ها فعلاً دریافت نشد: {str(exc)[:180]}")
+
+    st.divider()
+
     search = st.text_input("🔎 Search coin name or symbol", value="")
     filtered = df.copy()
     if search.strip():

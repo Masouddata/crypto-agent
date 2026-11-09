@@ -384,6 +384,11 @@ def attach_actual_buy_sell_flow(frame):
     out["Sell_Volume_USD"] = np.nan
     out["Net_Buy_USD"] = np.nan
     out["Buy_Share_Percent"] = np.nan
+    # A ticker alone is not a unique asset identifier. Mark collisions so a
+    # provider's symbol-only flow cannot be assigned to the wrong token.
+    symbols = out.get("Symbol", pd.Series("", index=out.index)).astype(str).str.upper().str.strip()
+    collision_counts = symbols[symbols.ne("")].value_counts()
+    out["Symbol_Ambiguous"] = symbols.map(collision_counts).fillna(0).gt(1)
     rows = st.session_state.get("cm_actual_buy_sell_rows", [])
     if not rows:
         return out
@@ -408,8 +413,13 @@ def attach_actual_buy_sell_flow(frame):
         "Sell volume (USDT)": "Sell_Volume_USD",
     })
     out = out.drop(columns=["Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent"], errors="ignore")
-    return out.merge(flow[["Symbol", "Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent"]],
-                     on="Symbol", how="left")
+    out = out.merge(flow[["Symbol", "Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent"]],
+                    on="Symbol", how="left")
+    # Never present symbol-only flow as confirmed for colliding tickers.
+    ambiguous = out["Symbol_Ambiguous"].fillna(False)
+    flow_columns = ["Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent"]
+    out.loc[ambiguous, flow_columns] = np.nan
+    return out
 
 
 def _btc_market_context(frame):
@@ -441,6 +451,12 @@ def calculate_pre_pump_score(frame):
     turnover = (volume / market_cap.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
     out["Volume_to_Market_Cap"] = turnover
     eligible = ~out["Is_Excluded_Asset"]
+    symbol_ambiguous = out.get("Symbol_Ambiguous", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+    out["Data_Quality_Status"] = np.where(
+        symbol_ambiguous,
+        "نماد تکراری است؛ تطبیق قرارداد لازم است",
+        "تطبیق نماد بدون برخورد تکراری"
+    )
 
     # 1) REAL reported buy/sell traded volume (30%). Never infer it from trade counts.
     buy_share = numeric(out.get("Buy_Share_Percent", pd.Series(np.nan, index=out.index)))
@@ -584,59 +600,26 @@ def calculate_pre_pump_score(frame):
     positive_flow = flow_available & (net_buy > 0) & (buy_share >= 52)
     strong_coverage = available_weight >= 75
     btc_not_bearish = btc_context not in ("BTC weak — risk-off", "BTC mildly weak")
-    valid_setup = (eligible & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
+    valid_setup = (eligible & ~symbol_ambiguous & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
                    ch24.abs().le(5) & ch7.abs().le(12) & surge.ge(1.5) &
                    turnover.between(0.001, 0.15) & score.ge(70) & positive_flow &
                    rsi_value.between(40, 68) & strong_coverage & btc_not_bearish)
-    watch_setup = (eligible & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
+    watch_setup = (eligible & ~symbol_ambiguous & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
                    ch24.abs().le(7) & ch7.abs().le(18) & turnover.between(0.001, 0.15) & score.ge(55))
     out["Signal"] = np.select(
-        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], overheated, valid_setup,
+        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], symbol_ambiguous, overheated, valid_setup,
          watch_setup & ~flow_available, watch_setup & flow_available & ~positive_flow,
          watch_setup & ~surge.notna(), watch_setup],
-        ["Excluded — stablecoin", "Excluded — tokenized equity", "Already moving / abnormal volatility — caution",
-         "Pre-pump watch — real buying + volume confirmed",
+        ["Excluded — stablecoin", "Excluded — tokenized equity", "Hold — ambiguous ticker; verify contract",
+         "Already moving / abnormal volatility — caution", "Pre-pump watch — real buying + volume confirmed",
          "Early activity — real buy/sell data missing",
          "Early activity — buy pressure not confirmed",
          "Early activity — volume history missing",
          "Early activity — monitor"], default="Watch — not enough evidence")
     out["Risk_Level"] = np.select(
-        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], thin, overheated, extreme_turnover, missing_market],
-        ["Excluded — stablecoin", "Excluded — tokenized equity", "High / thin market", "High / volatile", "High / abnormal turnover", "Incomplete market data"],
+        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], symbol_ambiguous, thin, overheated, extreme_turnover, missing_market],
+        ["Excluded — stablecoin", "Excluded — tokenized equity", "Unverified ticker / contract", "High / thin market", "High / volatile", "High / abnormal turnover", "Incomplete market data"],
         default="Medium / review")
-
-    # Three explicit market phases. Stage 3 is deliberately labelled as later/riskier,
-    # not as a pre-pump entry signal.
-    stage1 = (eligible & ~overheated & ~thin & ~missing_market &
-              numeric(out.get("Accumulation_Score", pd.Series(np.nan, index=out.index))).ge(65) &
-              ch24.abs().le(5) & ch7.abs().le(15) &
-              (surge.ge(1.1) | positive_flow))
-    stage2 = (eligible & ~overheated & ~thin & ~missing_market &
-              ch24.between(1.0, 8.0) & ch7.between(0, 25) & surge.ge(1.5) &
-              score.ge(55) & turnover.between(0.001, 0.15))
-    stage3 = (eligible & ~thin & ~missing_market &
-              ((ch24 >= 8.0) | (ch7 >= 20.0)) & surge.ge(1.2))
-    out["Pump_Stage"] = np.select(
-        [out["Is_Excluded_Asset"], stage3, stage1, stage2],
-        ["حذف‌شده از رادار", "مرحله ۳ — ادامه حرکت؛ ریسک تعقیب قیمت", 
-         "مرحله ۱ — رصد پیش‌پامپ", "مرحله ۲ — شروع شکست/شتاب"],
-        default="مرحله صفر — فقط زیر نظر")
-
-    # Scenario bands are volatility-based illustrations, not forecasts or probabilities.
-    # They are intentionally blank when historical range data is unavailable.
-    hist_range = numeric(out.get("Price_Range_7d_Percent", pd.Series(np.nan, index=out.index)))
-    base_move = (hist_range * 0.5).clip(lower=4, upper=12)
-    low_move = np.select([stage1, stage2, stage3],
-                         [base_move, base_move * 0.6, base_move * 0.25], default=np.nan)
-    high_move = np.select([stage1, stage2, stage3],
-                          [np.maximum(hist_range, base_move).clip(upper=25), (hist_range * 0.9).clip(upper=22),
-                           (hist_range * 0.6).clip(upper=15)], default=np.nan)
-    out["Scenario_Upside_Low_Pct"] = pd.Series(low_move, index=out.index).where(hist_range.notna()).round(1)
-    out["Scenario_Upside_High_Pct"] = pd.Series(high_move, index=out.index).where(hist_range.notna()).round(1)
-    out["Scenario_Note"] = np.where(
-        out["Scenario_Upside_Low_Pct"].notna(),
-        "سناریوی مشروط بر تداوم شرایط؛ بر پایه دامنه نوسان ۷روزه، نه پیش‌بینی آماری",
-        "تاریخچه کافی برای برآورد سناریو موجود نیست")
     return out
 
 
@@ -724,75 +707,6 @@ def fetch_market_pages(currency, pages, api_key):
     df["Risk_Level"] = "Unassessed"
     df["Signal"] = "Watch"
     return df
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_cmc_listings(limit=200, convert="USD"):
-    """CoinMarketCap keyless latest listings; selected public endpoint, cached 5 min."""
-    payload = safe_get(
-        "https://pro-api.coinmarketcap.com/public-api/v3/cryptocurrency/listings/latest",
-        params={"start": 1, "limit": int(limit), "convert": str(convert).upper()},
-        timeout=20,
-    )
-    records = payload.get("data", []) if isinstance(payload, dict) else []
-    if not isinstance(records, list) or not records:
-        status = payload.get("status", {}) if isinstance(payload, dict) else {}
-        raise ValueError(str(status.get("error_message") or "CoinMarketCap returned no listing rows"))
-    rows = []
-    for item in records:
-        quote_raw = item.get("quote") or []
-        if isinstance(quote_raw, list):
-            quote = next((q for q in quote_raw if str(q.get("symbol", "")).upper() == str(convert).upper()), {})
-        elif isinstance(quote_raw, dict):
-            quote = quote_raw.get(str(convert).upper(), {})
-        else:
-            quote = {}
-        rows.append({
-            "رتبه CMC": item.get("cmc_rank"),
-            "ارز": item.get("name"),
-            "نماد": str(item.get("symbol", "")).upper(),
-            "قیمت": quote.get("price"),
-            "تغییر ۲۴ساعت٪": quote.get("percent_change_24h"),
-            "تغییر ۷روز٪": quote.get("percent_change_7d"),
-            "حجم ۲۴ساعت": quote.get("volume_24h"),
-            "ارزش بازار": quote.get("market_cap"),
-            "حجم/ارزش بازار": (quote.get("volume_24h", 0) / quote.get("market_cap", 1)
-                              if quote.get("market_cap") else np.nan),
-        })
-    out = pd.DataFrame(rows)
-    for col in ["قیمت", "تغییر ۲۴ساعت٪", "تغییر ۷روز٪", "حجم ۲۴ساعت", "ارزش بازار", "حجم/ارزش بازار"]:
-        out[col] = numeric(out[col])
-    return out
-
-
-def score_cmc_early_watch(frame):
-    """A separate CMC market snapshot screen; no fake historical volume confirmation."""
-    out = frame.copy()
-    ch24 = numeric(out["تغییر ۲۴ساعت٪"])
-    ch7 = numeric(out["تغییر ۷روز٪"])
-    volume = numeric(out["حجم ۲۴ساعت"])
-    cap = numeric(out["ارزش بازار"])
-    turnover = numeric(out["حجم/ارزش بازار"])
-    quiet = ch24.abs().le(5) & ch7.abs().le(15)
-    quality = (cap >= 10_000_000) & (volume >= 300_000) & turnover.between(0.001, 0.20)
-    # CMC snapshot has no coin-specific historical baseline here: this is a watchlist,
-    # not an unusual-volume or confirmed accumulation signal.
-    stable_symbols = {"USDT", "USDC", "USDE", "DAI", "FDUSD", "TUSD", "USDP", "USDD", "PYUSD", "USD1", "GUSD", "FRAX", "LUSD", "USTC", "UST"}
-    is_stable = out["نماد"].astype(str).str.upper().isin(stable_symbols)
-    out["وضعیت رادار CMC"] = np.select(
-        [is_stable, quality & quiet, quality & (ch24.between(1, 8)) & (ch7 <= 25),
-         (cap < 10_000_000) | (volume < 300_000)],
-        ["حذف — استیبل‌کوین", "رصد اولیه — قیمت هنوز آرام", "شتاب اولیه — نیازمند تأیید نمودار", "حذف — نقدشوندگی/ارزش بازار پایین"],
-        default="زیر نظر — شواهد ناکافی")
-    out["امتیاز غربال CMC"] = (
-        35 * (turnover.clip(0, 0.15) / 0.15).fillna(0) +
-        35 * (1 - (ch24.abs().clip(0, 15) / 15)).fillna(0) +
-        20 * (1 - (ch7.abs().clip(0, 30) / 30)).fillna(0) +
-        10 * (cap.ge(10_000_000).astype(float))
-    ).clip(0, 100).round(1)
-    return out[out["وضعیت رادار CMC"].str.startswith(("رصد اولیه", "شتاب اولیه", "زیر نظر"))].sort_values(
-        ["امتیاز غربال CMC", "حجم/ارزش بازار"], ascending=False
-    )
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1274,7 +1188,7 @@ def cryptometer_watchlist(results):
 # =========================================================
 st.title("📡 اسکنر هوشمند بازار ارزهای دیجیتال")
 st.caption("پایش گسترده بازار • شناسایی فرصت‌های پیش از رشد • رادار انباشت • افزایش حجم • کنترل ریسک")
-st.caption("Build 2026-11-09.1 • 3-stage pump radar + CMC watchlist + scenario bands • Existing engine preserved")
+st.caption("Build 2026-11-08.2 • Parallel fetch + pooled HTTP + smart cache • Analysis engine preserved")
 st.caption("سرعت دریافت بهینه شده: صفحات بازار و درخواست‌های مستقل هم‌زمان اجرا می‌شوند؛ پاسخ‌ها کش می‌شوند و خطاهای موقت/محدودیت API با تلاش مجدد کنترل‌شده مدیریت می‌شوند.")
 st.warning(
     "امتیازها ابزار غربالگری‌اند، نه احتمال قطعی پامپ یا توصیه مالی. داده‌های ناقص به‌عنوان سیگنال مثبت فرض نمی‌شوند؛ درصد پوشش شواهد را کنار امتیاز ببین."
@@ -1830,32 +1744,6 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
         st.info("ستون‌های لازم برای ارزیابی انباشت هنوز موجود نیستند.")
 
     st.divider()
-    st.subheader("🚦 سه مرحله حرکت بازار")
-    st.caption("مرحله ۱ برای شکار زودهنگام مهم‌تر است؛ مرحله ۲ یعنی حرکت آغاز شده و مرحله ۳ معمولاً ریسک تعقیب قیمت بیشتری دارد.")
-    stage_counts = df["Pump_Stage"].value_counts() if "Pump_Stage" in df.columns else pd.Series(dtype=int)
-    stage_cols = st.columns(3)
-    stage_specs = [
-        ("مرحله ۱ — رصد پیش‌پامپ", "نشانه‌های فشردگی/انباشت و قیمت نسبتاً آرام"),
-        ("مرحله ۲ — شروع شکست/شتاب", "حرکت اولیه و افزایش فعالیت؛ نیازمند تأیید مقاومت"),
-        ("مرحله ۳ — ادامه حرکت؛ ریسک تعقیب قیمت", "حرکت قبلاً شروع شده؛ مراقب اصلاح و ورود دیرهنگام باش"),
-    ]
-    for col, (stage_name, stage_help) in zip(stage_cols, stage_specs):
-        col.metric(stage_name, int(stage_counts.get(stage_name, 0)))
-        col.caption(stage_help)
-    stage_view = df[df["Pump_Stage"].isin([x[0] for x in stage_specs])].copy()
-    if not stage_view.empty:
-        stage_cols_show = [c for c in ["Coin", "Symbol", "Pump_Stage", "PrePump_Score", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h_vs_7d_Avg", "Accumulation_Score", "Evidence_Coverage_Percent", "Scenario_Upside_Low_Pct", "Scenario_Upside_High_Pct"] if c in stage_view.columns]
-        stage_view = stage_view.sort_values(["PrePump_Score", "Accumulation_Score"], ascending=False, na_position="last")
-        stage_view = stage_view[stage_cols_show].head(40).rename(columns={
-            "Coin": "ارز", "Symbol": "نماد", "Pump_Stage": "مرحله حرکت", "PrePump_Score": "امتیاز پیش‌پامپ",
-            "Change_24h_Percent": "تغییر ۲۴ساعت٪", "Change_7d_Percent": "تغییر ۷روز٪",
-            "Volume_24h_vs_7d_Avg": "شتاب حجم نسبت به مبنا", "Accumulation_Score": "امتیاز انباشت",
-            "Evidence_Coverage_Percent": "پوشش شواهد٪", "Scenario_Upside_Low_Pct": "سناریوی پایین رشد٪",
-            "Scenario_Upside_High_Pct": "سناریوی بالای رشد٪"})
-        st.dataframe(stage_view, use_container_width=True, hide_index=True)
-    st.info("بازه رشد فقط یک سناریوی مشروط و مبتنی بر دامنه نوسان تاریخی ۷روزه است؛ احتمال موفقیت یا پیش‌بینی قیمت نیست. اگر تاریخچه کافی نباشد، برآورد خالی می‌ماند.")
-
-    st.divider()
     st.subheader("🛰️ فرصت‌های احتمالی پیش از رشد")
     st.caption("استیبل‌کوین‌ها حذف شده‌اند. سیگنال معتبر نیازمند خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه، نقدشوندگی مناسب و بازار BTC غیرنزولی است. درصد پوشش نشان می‌دهد چه مقدار از هفت عامل واقعاً داده داشته‌اند.")
     if not filtered.empty:
@@ -1912,8 +1800,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
             preferred_cols = [
                 "Coin", "Symbol", "Price", "Change_24h_Percent", "Change_7d_Percent",
                 "Volume_24h", "Volume_to_Market_Cap", "Volume_Activity_Score", "Price_Still_Quiet_Score",
-                "Accumulation_Score", "Accumulation_Data_Coverage", "Accumulation_Status", "Pump_Stage",
-                "Scenario_Upside_Low_Pct", "Scenario_Upside_High_Pct", "Scenario_Note",
+                "Accumulation_Score", "Accumulation_Data_Coverage", "Accumulation_Status",
                 "Range_Compression_Ratio", "Higher_Low_24h_Percent",
                 "Volume_24h_vs_7d_Avg", "Volume_Acceleration_Score", "Market_Cap_Rank", "RSI_14", "Technical_PrePump_Score",
                 "Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent", "Buy_Flow_Status",
@@ -1929,8 +1816,6 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                 "Volume_to_Market_Cap": "Volume / market cap", "Volume_Activity_Score": "Turnover activity",
                 "Price_Still_Quiet_Score": "Price still quiet", "Accumulation_Score": "امتیاز انباشت",
                 "Accumulation_Data_Coverage": "پوشش داده انباشت (%)", "Accumulation_Status": "وضعیت انباشت",
-                "Pump_Stage": "مرحله حرکت بازار", "Scenario_Upside_Low_Pct": "سناریوی پایین رشد (%)",
-                "Scenario_Upside_High_Pct": "سناریوی بالای رشد (%)", "Scenario_Note": "توضیح سناریو",
                 "Range_Compression_Ratio": "نسبت فشردگی دامنه", "Higher_Low_24h_Percent": "تغییر کف ۲۴ساعته (%)",
                 "Volume_24h_vs_7d_Avg": "24h volume vs 7d baseline",
                 "Volume_Acceleration_Score": "Volume acceleration score", "Momentum_Factor_Score": "Momentum score",
@@ -2009,28 +1894,6 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
             st.caption("روش ورود: ۲۵٪ اولیه فقط در ناحیه ساختاری مناسب؛ ۷۵٪ پس از شکست و تثبیت مقاومت. حدضرر پشت کف/حمایت ساختاری؛ اگر داده تاریخی برای تعیین آن نداریم، سطح ورود و خروج ساخته نمی‌شود. سقف ریسک هر معامله ۰٫۵٪ سرمایه و حداقل R/R برابر ۲ است.")
     else:
         st.info("No verified early-activity candidates match these filters yet. Calculate historical indicators or lower the minimum score to inspect unconfirmed setups.")
-
-    st.divider()
-    st.subheader("🟡 جدول مستقل فرصت‌های بازار CoinMarketCap")
-    st.caption("این جدول جدا از امتیاز CoinGecko است و مستقیماً از فهرست عمومی CoinMarketCap می‌آید. در نسخه keyless، حداکثر ۱۰۰۰ دارایی اول دریافت می‌شود؛ حجم غیرعادی تاریخی یا خرید نهنگ از این snapshot به‌تنهایی قابل تأیید نیست.")
-    if st.button("دریافت/به‌روزرسانی فرصت‌های CMC", key="fetch_cmc_radar"):
-        try:
-            with st.spinner("در حال دریافت فهرست بازار CoinMarketCap..."):
-                cmc_rows = fetch_cmc_listings(1000, "USD")
-                st.session_state["cmc_radar_rows"] = score_cmc_early_watch(cmc_rows)
-                st.session_state["cmc_radar_fetched_at"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
-        except Exception as exc:
-            st.session_state["cmc_radar_error"] = str(exc)[:240]
-    if st.session_state.get("cmc_radar_error"):
-        st.warning("دریافت CMC ناموفق بود: " + st.session_state.pop("cmc_radar_error"))
-    cmc_radar = st.session_state.get("cmc_radar_rows", pd.DataFrame())
-    if isinstance(cmc_radar, pd.DataFrame) and not cmc_radar.empty:
-        st.caption("آخرین دریافت: " + str(st.session_state.get("cmc_radar_fetched_at", "نامشخص")))
-        st.dataframe(cmc_radar.head(40), use_container_width=True, hide_index=True)
-        st.download_button("⬇️ دریافت جدول فرصت‌های CMC (CSV)", data=cmc_radar.to_csv(index=False).encode("utf-8-sig"),
-                           file_name="coinmarketcap_early_watch.csv", mime="text/csv", key="download_cmc_radar")
-    else:
-        st.info("برای دریافت جدول مستقل CMC، دکمه بالا را بزن. این مسیر از endpoint عمومی بدون کلید استفاده می‌کند؛ در صورت محدودیت سرویس، بعداً دوباره امتحان کن.")
 
 if section == "📊 نمودارها و ریزش‌ها":
     # Separate watchlist for deeply declined assets (not mixed with pre-pump candidates).

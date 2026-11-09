@@ -1058,47 +1058,55 @@ def analyze_recent_recovery_trend(history, lookback_days=7):
     }
 
 
-def green_candle_streak_from_history(history, min_days=5):
-    """Aggregate intraday market-chart samples into UTC daily candles and find green runs."""
+def last_three_green_daily_candles(history):
+    """Return the latest three fully completed UTC daily candles only when all are green."""
     if history is None or history.empty or not {"Time", "price"}.issubset(history.columns):
         return None
     frame = history[["Time", "price"]].copy().dropna()
-    if len(frame) < min_days:
-        return None
     frame["Time"] = pd.to_datetime(frame["Time"], utc=True, errors="coerce")
     frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
     frame = frame.dropna().sort_values("Time").set_index("Time")
-    daily = frame["price"].resample("1D").agg(open="first", close="last").dropna()
-    # Ignore today's unfinished candle so it cannot create a false green-day signal.
-    today_utc = pd.Timestamp.now(tz="UTC").normalize()
-    daily = daily[daily.index < today_utc]
-    if len(daily) < min_days:
+    if frame.empty:
         return None
-    daily["green"] = daily["close"] > daily["open"]
-    runs = []
-    run_start = None
-    for i, is_green in enumerate(daily["green"].tolist()):
-        if is_green and run_start is None:
-            run_start = i
-        if run_start is not None and (not is_green or i == len(daily) - 1):
-            run_end = i - 1 if not is_green else i
-            run_len = run_end - run_start + 1
-            if run_len >= min_days:
-                first_open = float(daily.iloc[run_start]["open"])
-                last_close = float(daily.iloc[run_end]["close"])
-                run_closes = daily.iloc[run_start:run_end + 1]["close"].to_numpy(dtype=float)
-                trend_slope = float(np.polyfit(np.arange(len(run_closes)), run_closes, 1)[0]) if len(run_closes) >= 2 else 0.0
-                change_pct = (last_close / first_open - 1) * 100 if first_open else 0.0
-                if change_pct > 0 and trend_slope > 0:
-                    runs.append({
-                        "Green_Days": int(run_len),
-                        "Streak_Start": daily.index[run_start].strftime("%Y-%m-%d"),
-                        "Streak_End": daily.index[run_end].strftime("%Y-%m-%d"),
-                        "Streak_Change_Percent": float(change_pct),
-                        "Last_Daily_Close": last_close,
-                    })
-            run_start = None
-    return max(runs, key=lambda x: (x["Green_Days"], x["Streak_Change_Percent"])) if runs else None
+
+    # Exclude the current, still-forming UTC day.
+    today_utc = pd.Timestamp.now(tz="UTC").normalize()
+    completed = frame[frame.index < today_utc]
+    daily = completed["price"].resample("1D").agg(open="first", close="last").dropna()
+    if len(daily) < 3:
+        return None
+
+    last_three = daily.tail(3).copy()
+    expected_days = pd.date_range(end=today_utc - pd.Timedelta(days=1), periods=3, freq="1D", tz="UTC")
+    if not last_three.index.equals(expected_days):
+        return None
+
+    # Require reasonably complete intraday coverage so sparse/stale history is not
+    # mistaken for a real daily candle.
+    for day in expected_days:
+        day_samples = completed.loc[(completed.index >= day) & (completed.index < day + pd.Timedelta(days=1))]
+        if day_samples.empty:
+            return None
+        if day_samples.index.min() > day + pd.Timedelta(hours=3):
+            return None
+        if day_samples.index.max() < day + pd.Timedelta(hours=21):
+            return None
+
+    last_three["green"] = last_three["close"] > last_three["open"]
+    if not bool(last_three["green"].all()):
+        return None
+    first_open = float(last_three.iloc[0]["open"])
+    last_close = float(last_three.iloc[-1]["close"])
+    if first_open <= 0:
+        return None
+    change_pct = (last_close / first_open - 1.0) * 100.0
+    return {
+        "Green_Days": 3,
+        "Three_Day_Change_Percent": float(change_pct),
+        "Streak_Start": last_three.index[0].strftime("%Y-%m-%d"),
+        "Streak_End": last_three.index[-1].strftime("%Y-%m-%d"),
+        "Last_Daily_Close": last_close,
+    }
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -3218,35 +3226,37 @@ if section == "📊 نمودارها و ریزش‌ها":
     else:
         st.info("No moves crossed the default alert thresholds.")
 
-    # Multi-day consecutive green-candle scan (daily candles built from CoinGecko history).
+    # Latest three completed green daily candles (UTC).
     st.divider()
-    st.subheader("🟢 ارزهای دارای حداقل ۵ روز متوالی کندل سبز")
-    st.caption("اسکن حداکثر ۴۰ ارز نقدشونده بر اساس داده تاریخی ۳۰ روزه؛ فقط روزهای کامل UTC شمرده می‌شوند. هر ردیف باید حداقل ۵ کندل روزانه سبزِ پی‌درپی و بازده مثبت در همان بازه داشته باشد.")
+    st.subheader("🟢 ارزهای دارای ۳ کندل سبز ۲۴ ساعته آخر")
+    st.caption("فقط سه کندل روزانهٔ کامل و متوالی UTC بررسی می‌شوند؛ هر سه باید سبز باشند. درصد کنار هر ارز، تغییر قیمت از ابتدای روز اول تا بسته‌شدن روز سوم است. استیبل‌کوین‌ها و داده‌های ناقص/قدیمی حذف می‌شوند.")
     if data_source != "CoinGecko market" or "CoinGecko_ID" not in df.columns:
         st.info("برای اسکن کندل‌های روزانه، منبع داده CoinGecko market را انتخاب کن.")
     else:
-        if st.button("🔍 اسکن ارزهای با کندل سبز متوالی", type="primary", key="scan_green_streaks"):
+        if st.button("🔍 اسکن ارزهای دارای ۳ کندل سبز آخر", type="primary", key="scan_green_streaks"):
             scan_universe = df.copy()
             if "Is_Excluded_Asset" in scan_universe.columns:
                 scan_universe = scan_universe[~scan_universe["Is_Excluded_Asset"].fillna(False)]
             scan_universe["_scan_volume"] = numeric(scan_universe["Volume_24h"]).fillna(0)
-            scan_universe = scan_universe[scan_universe["CoinGecko_ID"].notna()].sort_values("_scan_volume", ascending=False).head(40)
+            # Scan the full currently loaded market universe, not only the top 40.
+            scan_universe = scan_universe[scan_universe["CoinGecko_ID"].notna()].sort_values("_scan_volume", ascending=False)
             found = []
             errors = 0
+
             def _scan_one_green(row):
                 hist = fetch_history(str(row["CoinGecko_ID"]), currency, 30, cg_key)
-                streak = green_candle_streak_from_history(hist, min_days=5)
-                if streak:
+                signal = last_three_green_daily_candles(hist)
+                if signal:
                     return {
                         "Coin": row.get("Coin", ""), "Symbol": row.get("Symbol", ""),
-                        "Green_Days": streak["Green_Days"],
-                        "Streak_Change_Percent": streak["Streak_Change_Percent"],
-                        "Streak_Start": streak["Streak_Start"], "Streak_End": streak["Streak_End"],
-                        "Last_Daily_Close": streak["Last_Daily_Close"],
+                        "Three_Day_Change_Percent": signal["Three_Day_Change_Percent"],
+                        "Streak_Start": signal["Streak_Start"], "Streak_End": signal["Streak_End"],
+                        "Last_Daily_Close": signal["Last_Daily_Close"],
                         "Volume_24h": row.get("Volume_24h", np.nan),
                     }
                 return None
-            with st.spinner(f"در حال بررسی کندل‌های روزانه {len(scan_universe)} ارز نقدشونده... ممکن است کمی زمان ببرد."):
+
+            with st.spinner(f"در حال بررسی سه کندل روزانهٔ آخر برای {len(scan_universe)} ارز... ممکن است کمی زمان ببرد."):
                 with ThreadPoolExecutor(max_workers=6) as pool:
                     futures = [pool.submit(_scan_one_green, row) for _, row in scan_universe.iterrows()]
                     for future in futures:
@@ -3258,26 +3268,28 @@ if section == "📊 نمودارها و ریزش‌ها":
                             errors += 1
             result_df = pd.DataFrame(found)
             if not result_df.empty:
-                result_df = result_df.sort_values(["Green_Days", "Streak_Change_Percent"], ascending=[False, False])
+                result_df = result_df.sort_values("Three_Day_Change_Percent", ascending=False, kind="mergesort")
             st.session_state["green_streak_scan_results"] = result_df
             st.session_state["green_streak_scan_errors"] = errors
+            st.session_state["green_streak_scan_universe"] = len(scan_universe)
+
         green_results = st.session_state.get("green_streak_scan_results", pd.DataFrame())
         if isinstance(green_results, pd.DataFrame) and not green_results.empty:
             green_display = green_results.rename(columns={
-                "Coin": "ارز", "Symbol": "نماد", "Green_Days": "روز سبز متوالی",
-                "Streak_Change_Percent": "تغییر قیمت در دوره (%)",
-                "Streak_Start": "شروع دوره", "Streak_End": "پایان دوره",
-                "Last_Daily_Close": "آخرین بسته‌شدن روزانه", "Volume_24h": "حجم ۲۴ساعته",
+                "Coin": "ارز", "Symbol": "نماد",
+                "Three_Day_Change_Percent": "درصد تغییر ۳ روز (%)",
+                "Streak_Start": "شروع روز اول", "Streak_End": "پایان روز سوم",
+                "Last_Daily_Close": "قیمت بسته‌شدن آخرین روز", "Volume_24h": "حجم ۲۴ساعته",
             })
             st.dataframe(green_display, use_container_width=True, hide_index=True,
-                         column_config={"تغییر قیمت در دوره (%)": st.column_config.NumberColumn(format="%.2f%%"),
-                                        "آخرین بسته‌شدن روزانه": st.column_config.NumberColumn(format="%.8g"),
+                         column_config={"درصد تغییر ۳ روز (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                                        "قیمت بسته‌شدن آخرین روز": st.column_config.NumberColumn(format="%.8g"),
                                         "حجم ۲۴ساعته": st.column_config.NumberColumn(format="$%.2f")})
-            st.success(f"{len(green_results)} ارز با حداقل ۵ کندل سبز متوالی و روند صعودی در همان دوره پیدا شد.")
+            st.success(f"{len(green_results)} ارز با سه کندل سبز ۲۴ ساعتهٔ آخر پیدا شد؛ مرتب‌سازی از بیشترین درصد رشد به کمترین است.")
         elif "green_streak_scan_results" in st.session_state:
-            st.info("در ۴۰ ارز نقدشونده بررسی‌شده، موردی با حداقل ۵ کندل سبز متوالی و بازده مثبت پیدا نشد.")
+            st.info("در سه روز کامل UTC اخیر، ارزی با هر سه کندل سبز و دادهٔ معتبر پیدا نشد.")
         if st.session_state.get("green_streak_scan_errors", 0):
-            st.caption(f"تعداد {st.session_state['green_streak_scan_errors']} درخواست تاریخی با خطا یا محدودیت منبع روبه‌رو شد؛ بنابراین این اسکن پوشش کامل بازار نیست.")
+            st.caption(f"{st.session_state['green_streak_scan_errors']} درخواست از منبع تاریخی با خطا یا محدودیت روبه‌رو شد. پوشش اسکن: {st.session_state.get('green_streak_scan_universe', 0)} ارز از بازار بارگذاری‌شده.")
 
     # Market chart
     chart_source = filtered if not filtered.empty else df.head(50)

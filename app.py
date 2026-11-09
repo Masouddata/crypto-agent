@@ -358,7 +358,7 @@ STABLECOIN_NAME_HINTS = (
     "tether", "usd coin", "usdc", "usdt", "first digital usd",
     "paypal usd", "trueusd", "pax dollar", "dai stablecoin",
     "frax", "liquity usd", "staked usde", "ethena usde", "euro coinvertible", "eur coinvertible",
-    "stablecoin", "usd1", "usdd", "gemini dollar",
+    "stablecoin", "united stables", "usd1", "usdd", "gemini dollar",
 )
 
 def mark_stablecoins(frame):
@@ -1343,11 +1343,135 @@ def fetch_gecko_hourly_candles(chain, pair_address):
     return closed[:2] if closed else None
 
 
-def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_000):
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_public_exchange_hourly_market(symbol):
+    """Free public CEX fallback: return closed 1h OHLCV and taker-buy share.
+
+    Binance Spot is tried first, then OKX Spot. No API key is required. This
+    fallback is used when DEX Screener has no qualifying liquid pool, so
+    exchange-listed assets are not silently omitted from the hourly radar.
     """
-    Screen the most liquid CoinGecko-listed assets using DEX Screener's native
-    1h price change, 1h traded volume, and 1h buy/sell transaction counts.
-    This is DEX-pair coverage, not a complete CEX/all-market scan.
+    symbol = str(symbol or "").upper().strip()
+    if not re.fullmatch(r"[A-Z0-9]{2,15}", symbol):
+        return None
+    now_ms = int(time.time() * 1000)
+
+    # Binance public spot klines. Quote volume and taker-buy quote volume are
+    # provider-reported values; no transaction-count split is fabricated.
+    try:
+        raw = safe_get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": f"{symbol}USDT", "interval": "1h", "limit": 12},
+            timeout=12,
+        )
+        if isinstance(raw, list) and raw:
+            closed = [k for k in raw if len(k) > 10 and int(k[6]) <= now_ms]
+            closed.sort(key=lambda k: int(k[0]), reverse=True)
+            if closed:
+                last = closed[0]
+                quote_vol = float(last[7] or 0)
+                taker_buy_quote = float(last[10] or 0)
+                previous_vols = [float(k[7] or 0) for k in closed[1:7]]
+                avg_prev = sum(previous_vols) / len(previous_vols) if previous_vols else 0
+                opn, close = float(last[1]), float(last[4])
+                if opn > 0 and close > 0:
+                    return {
+                        "source": "Binance Spot",
+                        "change_1h": (close / opn - 1) * 100,
+                        "volume_1h": quote_vol,
+                        "volume_ratio": quote_vol / avg_prev if avg_prev > 0 else np.nan,
+                        "buys": np.nan,
+                        "sells": np.nan,
+                        "transactions": float(last[8] or 0),
+                        "buy_share": (taker_buy_quote / quote_vol * 100) if quote_vol > 0 else np.nan,
+                        "liquidity": np.nan,
+                        "candle": "سبز" if close > opn else ("قرمز" if close < opn else "خنثی"),
+                        "open": opn, "close": close, "timestamp": int(last[0] // 1000),
+                        "pair_url": f"https://www.binance.com/en/trade/{symbol}_USDT?type=spot",
+                        "chain": "CEX", "dex": "Binance Spot",
+                        "pair_address": f"{symbol}USDT", "token_address": "",
+                        "buy_pressure_type": "سهم حجم خرید تیکر (Binance)",
+                    }
+    except Exception:
+        pass
+
+    # OKX public spot candles as a second no-key source. OKX does not expose
+    # taker-side split in this endpoint, so buy pressure remains unavailable.
+    try:
+        raw = safe_get(
+            "https://www.okx.com/api/v5/market/candles",
+            params={"instId": f"{symbol}-USDT", "bar": "1H", "limit": "12"},
+            timeout=12,
+        )
+        rows = (raw or {}).get("data") or []
+        closed = [k for k in rows if len(k) >= 9 and str(k[8]) == "1"]
+        closed.sort(key=lambda k: int(k[0]), reverse=True)
+        if closed:
+            last = closed[0]
+            opn, close = float(last[1]), float(last[4])
+            quote_vol = float(last[7] or 0)
+            prev_vols = [float(k[7] or 0) for k in closed[1:7]]
+            avg_prev = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+            if opn > 0 and close > 0:
+                return {
+                    "source": "OKX Spot",
+                    "change_1h": (close / opn - 1) * 100,
+                    "volume_1h": quote_vol,
+                    "volume_ratio": quote_vol / avg_prev if avg_prev > 0 else np.nan,
+                    "buys": np.nan, "sells": np.nan, "transactions": np.nan,
+                    "buy_share": np.nan, "liquidity": np.nan,
+                    "candle": "سبز" if close > opn else ("قرمز" if close < opn else "خنثی"),
+                    "open": opn, "close": close, "timestamp": int(int(last[0]) // 1000),
+                    "pair_url": f"https://www.okx.com/trade-spot/{symbol.lower()}-usdt",
+                    "chain": "CEX", "dex": "OKX Spot",
+                    "pair_address": f"{symbol}-USDT", "token_address": "",
+                    "buy_pressure_type": "داده سهم خرید در دسترس نیست",
+                }
+    except Exception:
+        pass
+
+    # Kraken public OHLC fallback (no key). Its OHLC feed has no taker-side
+    # split; volume is converted to an approximate quote value using close.
+    try:
+        raw = safe_get(
+            "https://api.kraken.com/0/public/OHLC",
+            params={"pair": f"{symbol}USD", "interval": 60}, timeout=12,
+        )
+        result = (raw or {}).get("result") or {}
+        pair_key = next((k for k in result.keys() if k != "last"), None)
+        candles = result.get(pair_key) if pair_key else None
+        now_sec = int(time.time())
+        closed = [k for k in (candles or []) if len(k) >= 8 and int(float(k[0])) + 3600 <= now_sec]
+        closed.sort(key=lambda k: int(float(k[0])), reverse=True)
+        if closed:
+            last = closed[0]
+            opn, close = float(last[1]), float(last[4])
+            quote_vol = float(last[6] or 0) * close
+            prev_vols = [float(k[6] or 0) * float(k[4] or 0) for k in closed[1:7]]
+            avg_prev = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+            if opn > 0 and close > 0:
+                return {
+                    "source": "Kraken Spot", "change_1h": (close / opn - 1) * 100,
+                    "volume_1h": quote_vol,
+                    "volume_ratio": quote_vol / avg_prev if avg_prev > 0 else np.nan,
+                    "buys": np.nan, "sells": np.nan, "transactions": float(last[7] or 0),
+                    "buy_share": np.nan, "liquidity": np.nan,
+                    "candle": "سبز" if close > opn else ("قرمز" if close < opn else "خنثی"),
+                    "open": opn, "close": close, "timestamp": int(float(last[0])),
+                    "pair_url": f"https://pro.kraken.com/app/trade/{symbol.lower()}-usd",
+                    "chain": "CEX", "dex": "Kraken Spot", "pair_address": f"{symbol}USD",
+                    "token_address": "", "buy_pressure_type": "داده سهم خرید در دسترس نیست",
+                }
+    except Exception:
+        pass
+    return None
+
+
+def scan_hourly_pump_radar(market_frame, max_coins=100, min_pair_liquidity=100_000):
+    """
+    Scan a broad CoinGecko market universe. Prefer qualifying DEX pairs, then
+    fall back to free public Binance/OKX spot OHLCV for CEX-listed assets.
+    Stablecoins and ambiguous duplicate tickers remain excluded.
     """
     if market_frame is None or market_frame.empty or "Symbol" not in market_frame.columns:
         return pd.DataFrame(), {"checked": 0, "errors": 0, "matched": 0, "skipped": 0}
@@ -1363,7 +1487,13 @@ def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_00
     # Avoid ambiguous ticker mappings: one symbol must identify only one market row.
     duplicate_symbols = set(base.loc[base["Symbol"].duplicated(keep=False), "Symbol"])
     base = base[~base["Symbol"].isin(duplicate_symbols)]
-    base = base.sort_values("Volume_24h", ascending=False, na_position="last").head(int(max_coins))
+    base = base.sort_values("Volume_24h", ascending=False, na_position="last").copy()
+    # Explicit priority symbols ensure major assets are not lost just below the
+    # volume cutoff. Only symbols present in the public market feed are appended.
+    priority_symbols = {"XMR", "ZEC"}
+    top_rows = base.head(int(max_coins))
+    priority_rows = base.loc[base["Symbol"].isin(priority_symbols)]
+    base = pd.concat([top_rows, priority_rows]).drop_duplicates(subset=["Symbol"], keep="first")
     symbols = base["Symbol"].drop_duplicates().tolist()
     if not symbols:
         return pd.DataFrame(), {"checked": 0, "errors": 0, "matched": 0, "skipped": len(duplicate_symbols)}
@@ -1376,16 +1506,63 @@ def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_00
     rows, errors, matched = [], 0, 0
     used_pair_keys = set()
     duplicate_pair_skipped = 0
+    cex_checked = 0
+
+    def append_cex_row(symbol):
+        nonlocal matched, cex_checked
+        # Keep public exchange fallback bounded; XMR/ZEC are always prioritized.
+        if cex_checked >= 40 and symbol not in priority_symbols:
+            return False
+        cex_checked += 1
+        cex = fetch_public_exchange_hourly_market(symbol)
+        if not cex:
+            return False
+        market_row = market_lookup.get(symbol, {})
+        ch1, vol1, volume_ratio = cex["change_1h"], cex["volume_1h"], cex["volume_ratio"]
+        if cex["candle"] == "قرمز":
+            cex_status = "در انتظار تأیید؛ آخرین کندل قرمز"
+        elif cex["candle"] == "خنثی":
+            cex_status = "در انتظار تأیید؛ کندل خنثی"
+        elif pd.notna(ch1) and ch1 > 6:
+            cex_status = "حرکت تند؛ احتمالاً دیرهنگام"
+        elif pd.notna(ch1) and ch1 >= 0 and pd.notna(volume_ratio) and volume_ratio >= 1.5:
+            cex_status = "زیر نظر؛ کندل سبز، شروط ناقص"
+        else:
+            cex_status = "شرایط اولیه کافی نیست"
+        volume_component = min(max(float(volume_ratio) * 25, 0), 100) if pd.notna(volume_ratio) else 50
+        momentum_component = min(max(50 + float(ch1) * 10, 0), 100) if pd.notna(ch1) else 50
+        rows.append({
+            "Coin": market_row.get("Coin", symbol), "Symbol": symbol,
+            "Change_1h_Percent": ch1, "Volume_1h_USD": vol1,
+            "Volume_1h_vs_6h_Avg": volume_ratio,
+            "Buys_1h": cex["buys"], "Sells_1h": cex["sells"],
+            "Transactions_1h": cex["transactions"], "Buy_Count_Share_1h": cex["buy_share"],
+            "Liquidity_USD": cex["liquidity"],
+            "Change_24h_Percent": market_row.get("Change_24h_Percent", np.nan),
+            "Pump_1h_Score": round((50 + volume_component + momentum_component) / 3, 1),
+            "Hourly_Status": cex_status, "Chain": cex["chain"], "DEX": cex["dex"],
+            "Pair_Address": cex["pair_address"], "Base_Token_Address": cex["token_address"],
+            "Pair_URL": cex["pair_url"], "Market_Data_Source": cex["source"],
+            "Buy_Pressure_Type": cex["buy_pressure_type"],
+            "Last_Closed_1h_Candle": cex["candle"],
+            "Last_Closed_1h_Open": cex["open"], "Last_Closed_1h_Close": cex["close"],
+            "Last_Closed_1h_Time_UTC": pd.to_datetime(cex["timestamp"], unit="s", utc=True).strftime("%Y-%m-%d %H:%M"),
+            "Previous_1h_Candle": "—",
+        })
+        matched += 1
+        return True
 
     for symbol in symbols:
         pairs = results.get(symbol)
         if isinstance(pairs, Exception):
             errors += 1
-            continue
+            pairs = pd.DataFrame()
         if not isinstance(pairs, pd.DataFrame) or pairs.empty:
-            continue
-        pairs = pairs[pairs["Symbol"].astype(str).str.upper().eq(symbol)].copy()
+            pairs = pd.DataFrame()
+        else:
+            pairs = pairs[pairs["Symbol"].astype(str).str.upper().eq(symbol)].copy()
         if pairs.empty:
+            append_cex_row(symbol)
             continue
         pairs["Liquidity_USD"] = numeric(pairs["Liquidity_USD"])
         pairs["Volume_1h_USD"] = numeric(pairs.get("Volume_1h_USD", np.nan))
@@ -1396,6 +1573,7 @@ def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_00
         # Choose the deepest exact-ticker pair. Contract/pair URL remains visible for manual verification.
         pairs = pairs[pairs["Liquidity_USD"].fillna(0) >= float(min_pair_liquidity)]
         if pairs.empty:
+            append_cex_row(symbol)
             continue
         pairs = pairs.sort_values("Liquidity_USD", ascending=False)
         pair = None
@@ -1411,6 +1589,7 @@ def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_00
         if pair is None:
             # A provider response must never reuse the same pool for another ticker.
             duplicate_pair_skipped += 1
+            append_cex_row(symbol)
             continue
         ch1 = pair.get("Change_1h_Percent")
         vol1 = pair.get("Volume_1h_USD")
@@ -1513,6 +1692,8 @@ def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_00
             "Pair_Address": pair.get("Pair", ""),
             "Base_Token_Address": pair.get("Base_Token_Address", ""),
             "Pair_URL": pair.get("Pair_URL", ""),
+            "Market_Data_Source": "DEX Screener / GeckoTerminal",
+            "Buy_Pressure_Type": "سهم تعداد معاملات خرید (DEX)",
             "Last_Closed_1h_Candle": "بررسی نشده",
             "Last_Closed_1h_Open": np.nan,
             "Last_Closed_1h_Close": np.nan,
@@ -1529,10 +1710,13 @@ def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_00
         candle_eligible = result[result["Hourly_Status"].isin([
             "نامزد اولیه؛ حجم و خرید تأیید نسبی", "زیر نظر؛ تأیید کامل نیست"
         ])]
-        candle_check_idx = candle_eligible.sort_values(
+        # CEX fallback rows already contain a completed exchange OHLCV candle.
+        cex_indices = result.index[result.get("Market_Data_Source", pd.Series("", index=result.index)).isin(["Binance Spot", "OKX Spot", "Kraken Spot"])].tolist()
+        candle_check_idx = candle_eligible.index.difference(cex_indices).tolist()
+        candle_check_idx = result.loc[candle_check_idx].sort_values(
             ["Pump_1h_Score", "Volume_1h_vs_6h_Avg"], ascending=[False, False], na_position="last"
         ).head(10).index.tolist()
-        candle_checked_count = 0
+        candle_checked_count = len(cex_indices)
         # No row may retain a candidate label until its closed candle is verified.
         unchecked_candidate_mask = (
             ~result.index.isin(candle_check_idx)
@@ -1589,6 +1773,8 @@ def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_00
     return result, {
         "checked": len(symbols), "errors": errors, "matched": matched,
         "candle_checked": candle_checked_count if not result.empty else 0,
+        "cex_fallback_checked": cex_checked,
+        "cex_rows": int(result.get("Market_Data_Source", pd.Series(dtype=str)).isin(["Binance Spot", "OKX Spot", "Kraken Spot"]).sum()) if not result.empty else 0,
         "skipped": len(duplicate_symbols),
         "duplicate_pair_skipped": duplicate_pair_skipped,
     }
@@ -2661,26 +2847,27 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
     st.caption(
         "علاوه بر حجم و نسبت خرید به فروش، آخرین کندل یک‌ساعته بسته‌شده از OHLCV جفت DEX بررسی می‌شود. "
         "کندل قرمز یا داده کندل ناموجود اجازه صدور وضعیت کاندید اولیه نمی‌دهد. "
-        "اسکن حداکثر ۳۰ ارز نقدشونده از فهرست CoinGecko را با جستجوی DEX Screener بررسی می‌کند؛ "
-        "بنابراین پوشش آن فقط جفت‌های DEX پیدا‌شده است و نماینده کل معاملات صرافی‌های متمرکز نیست."
+        "اسکن تا ۱۰۰ ارز بازار را بررسی می‌کند: ابتدا جفت‌های DEX و در صورت نبود جفت مناسب، کندل عمومی Binance/OKX/Kraken را بدون API Key می‌خواند. "
+        "استیبل‌کوین‌ها حذف می‌شوند؛ برای ردیف‌های CEX، نقدشوندگی DEX و سهم خرید فقط در صورت ارائه منبع نمایش داده می‌شود."
     )
     if data_source != "CoinGecko market":
         st.info("برای ساخت فهرست نمادهای بازار، منبع زنده CoinGecko market را انتخاب کن.")
     else:
-        if st.button("🚀 اجرای رادار یک‌ساعته (۳۰ ارز نقدشونده)", key="run_hourly_pump_radar_candle_v2", type="primary"):
-            with st.spinner("در حال بررسی داده‌های یک‌ساعته DEX برای حداکثر ۳۰ ارز نقدشونده..."):
-                hourly_result, hourly_meta = scan_hourly_pump_radar(df, max_coins=30)
-            st.session_state["hourly_pump_radar_results_candle_v2"] = hourly_result
-            st.session_state["hourly_pump_radar_meta_candle_v2"] = hourly_meta
-            st.session_state["hourly_pump_radar_time_candle_v2"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
+        if st.button("🚀 اجرای رادار یک‌ساعته (تا ۱۰۰ ارز)", key="run_hourly_pump_radar_candle_v3", type="primary"):
+            with st.spinner("در حال بررسی DEX و کندل‌های عمومی صرافی‌ها برای حداکثر ۱۰۰ ارز..."):
+                hourly_result, hourly_meta = scan_hourly_pump_radar(df, max_coins=100)
+            st.session_state["hourly_pump_radar_results_candle_v3"] = hourly_result
+            st.session_state["hourly_pump_radar_meta_candle_v3"] = hourly_meta
+            st.session_state["hourly_pump_radar_time_candle_v3"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        hourly_result = st.session_state.get("hourly_pump_radar_results_candle_v2")
+        hourly_result = st.session_state.get("hourly_pump_radar_results_candle_v3")
         if isinstance(hourly_result, pd.DataFrame):
-            meta = st.session_state.get("hourly_pump_radar_meta_candle_v2", {})
+            meta = st.session_state.get("hourly_pump_radar_meta_candle_v3", {})
             st.caption(
-                f"آخرین اسکن: {st.session_state.get('hourly_pump_radar_time_candle_v2', '—')} • "
+                f"آخرین اسکن: {st.session_state.get('hourly_pump_radar_time_candle_v3', '—')} • "
                 f"نمادهای بررسی‌شده: {meta.get('checked', 0)} • جفت‌های منطبق: {meta.get('matched', 0)} • "
-                f"بررسی کندل: {meta.get('candle_checked', 0)} جفت • جفت تکراری حذف‌شده: {meta.get('duplicate_pair_skipped', 0)} • "
+                f"بررسی کندل: {meta.get('candle_checked', 0)} • ردیف CEX: {meta.get('cex_rows', 0)} • "
+                f"جفت تکراری حذف‌شده: {meta.get('duplicate_pair_skipped', 0)} • "
                 f"خطاهای دریافت: {meta.get('errors', 0)}"
             )
             if hourly_result.empty:
@@ -2708,6 +2895,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                     "Previous_1h_Candle": "کندل قبلی",
                     "Hourly_Status": "وضعیت", "Chain": "شبکه", "DEX": "صرافی غیرمتمرکز",
                     "Base_Token_Address": "آدرس قرارداد توکن", "Pair_URL": "لینک جفت معاملاتی",
+                    "Market_Data_Source": "منبع داده", "Buy_Pressure_Type": "نوع سنجش فشار خرید",
                 })
                 hourly_cols = [
                     "ارز", "نماد", "تغییر ۱ساعته٪", "حجم واقعی ۱ساعته USD",
@@ -2715,14 +2903,14 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                     "تعداد فروش ۱ساعته", "سهم تعداد خرید٪", "نقدشوندگی USD",
                     "آخرین کندل بسته‌شده ۱ساعته", "زمان کندل UTC", "کندل قبلی",
                     "تغییر ۲۴ساعته٪", "امتیاز رادار ۱ساعته", "وضعیت",
-                    "شبکه", "صرافی غیرمتمرکز", "آدرس قرارداد توکن", "لینک جفت معاملاتی",
+                    "شبکه", "صرافی غیرمتمرکز", "منبع داده", "نوع سنجش فشار خرید", "آدرس قرارداد توکن", "لینک جفت معاملاتی",
                 ]
                 hourly_cols = [c for c in hourly_cols if c in hourly_display.columns]
                 st.dataframe(
                     hourly_display[hourly_cols].head(30),
                     use_container_width=True, hide_index=True,
                     column_config={
-                        "لینک جفت معاملاتی": st.column_config.LinkColumn("جفت در DEX Screener"),
+                        "لینک جفت معاملاتی": st.column_config.LinkColumn("بازار / جفت معاملاتی"),
                     "آدرس قرارداد توکن": st.column_config.TextColumn("قرارداد توکن", help="برای تشخیص برخورد نمادها؛ قبل از معامله با منبع رسمی تطبیق بده."),
                         "تغییر ۱ساعته٪": st.column_config.NumberColumn(format="%.2f%%"),
                         "تغییر ۲۴ساعته٪": st.column_config.NumberColumn(format="%.2f%%"),
@@ -2737,7 +2925,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                     "غلبه تعداد خرید، نقدشوندگی و حداقل فعالیت تأیید نسبی داشته باشند. حداکثر ۱۰ جفت برتر برای OHLCV بررسی می‌شوند؛ "
                     "بقیه تا بررسی کندل کاندید محسوب نمی‌شوند. سهم خرید بر اساس تعداد معاملات است، نه دلار؛ "
                     "حجم ۱ساعته، حجم معامله‌شده گزارش‌شده توسط DEX است و ورود خالص پول یا خرید نهنگ را ثابت نمی‌کند. "
-                    "نمادها ممکن است در چند قرارداد تکرار شوند؛ یک جفت معاملاتی در این رادار به بیش از یک نماد اختصاص داده نمی‌شود. قبل از هر تصمیم لینک و قرارداد را بررسی کن."
+                    "برای DEX، سهم خرید بر اساس تعداد معاملات است؛ برای Binance سهم حجم خرید تیکر گزارش می‌شود؛ این دو معیار یکسان نیستند. ردیف CEX نقدشوندگی DEX ندارد و تا تأیید مستقل نقدشوندگی کاندید آماده نمی‌شود. نبود کندل نیز هرگز سیگنال مثبت نیست. قبل از هر تصمیم لینک و بازار را بررسی کن."
                 )
         else:
             st.info("برای شروع، دکمه اجرای رادار یک‌ساعته را بزن. این اسکن خودکار در هر بار تازه‌سازی اجرا نمی‌شود تا درخواست API بی‌دلیل زیاد نشود.")

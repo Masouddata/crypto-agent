@@ -133,6 +133,7 @@ small, .stMarkdown small { color: #465b75 !important; font-size: .86rem !importa
 """, unsafe_allow_html=True)
 
 CG_API = "https://api.coingecko.com/api/v3"
+CMC_API = "https://pro-api.coinmarketcap.com"
 DEX_API = "https://api.dexscreener.com"
 NEWS_API = "https://cryptopanic.com/api/v1/posts/"
 
@@ -715,6 +716,274 @@ def fetch_market_pages(currency, pages, api_key):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+
+# =========================================================
+# COINMARKETCAP BROAD-MARKET EARLY-MOVE RADAR
+# =========================================================
+def cmc_api_get(path, params, api_key):
+    if not api_key:
+        raise ValueError("کلید CoinMarketCap وارد نشده است. آن را در تنظیمات اسکنر وارد کن.")
+    response = _http_session().get(
+        f"{CMC_API}{path}", params=params,
+        headers={"X-CMC_PRO_API_KEY": api_key, "Accept": "application/json"},
+        timeout=30,
+    )
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After", "60")
+        raise requests.HTTPError(
+            f"CoinMarketCap محدودیت درخواست (429) اعمال کرده؛ Retry-After={retry_after}. "
+            "درخواست را پشت سر هم تکرار نکن.", response=response
+        )
+    response.raise_for_status()
+    payload = response.json()
+    status = payload.get("status", {}) if isinstance(payload, dict) else {}
+    code = str(status.get("error_code", "0"))
+    if code not in ("0", "None", ""):
+        message = status.get("error_message") or f"CMC error {code}"
+        raise ValueError(f"CoinMarketCap: {message}")
+    return payload.get("data")
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_cmc_market_universe(limit, api_key):
+    """CMC active listings, normalized to the scanner's common market schema."""
+    raw = cmc_api_get(
+        "/v3/cryptocurrency/listings/latest",
+        {"start": 1, "limit": int(limit), "convert": "USD",
+         "sort": "market_cap", "sort_dir": "desc",
+         "aux": "num_market_pairs,cmc_rank,date_added,tags,platform,max_supply,circulating_supply,total_supply"},
+        api_key,
+    )
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("CoinMarketCap فهرست فعالی برنگرداند.")
+    rows = []
+    for item in raw:
+        quote_container = item.get("quote") or []
+        if isinstance(quote_container, list):
+            quote = next((x for x in quote_container if str(x.get("symbol", "")).upper() == "USD"), {})
+        elif isinstance(quote_container, dict):
+            quote = quote_container.get("USD", {})
+        else:
+            quote = {}
+        tags = item.get("tags") or []
+        if isinstance(tags, list):
+            tag_text = " ".join(str(x.get("slug", x) if isinstance(x, dict) else x) for x in tags).lower()
+        else:
+            tag_text = str(tags).lower()
+        rows.append({
+            "Coin": item.get("name"), "Symbol": str(item.get("symbol", "")).upper(),
+            "CMC_ID": int(item.get("id")) if item.get("id") is not None else np.nan,
+            "CMC_Slug": item.get("slug"), "CMC_Tags": tag_text,
+            "Price": quote.get("price"), "Change_1h_Percent": quote.get("percent_change_1h"),
+            "Change_24h_Percent": quote.get("percent_change_24h"),
+            "Change_7d_Percent": quote.get("percent_change_7d"),
+            "Volume_24h": quote.get("volume_24h"), "Market_Cap": quote.get("market_cap"),
+            "Market_Cap_Rank": item.get("cmc_rank"),
+            "Circulating_Supply": item.get("circulating_supply"),
+            "Total_Supply": item.get("total_supply"),
+            "Num_Market_Pairs": item.get("num_market_pairs"),
+            "Last_Updated": item.get("last_updated"),
+        })
+    frame = pd.DataFrame(rows)
+    for col in ["Price", "Change_1h_Percent", "Change_24h_Percent", "Change_7d_Percent",
+                "Volume_24h", "Market_Cap", "Market_Cap_Rank", "Num_Market_Pairs"]:
+        frame[col] = numeric(frame[col])
+    # CMC's own stablecoin tag supplements symbol/name heuristics.
+    frame = mark_stablecoins(frame)
+    frame["Is_Stablecoin"] = frame["Is_Stablecoin"] | frame["CMC_Tags"].str.contains(r"stablecoin|stable-coin", case=False, na=False)
+    frame["Is_Excluded_Asset"] = frame["Is_Stablecoin"] | frame["Is_Tokenized_Equity"]
+    return frame
+
+
+def _cmc_data_map(data):
+    if isinstance(data, dict) and "quotes" in data:
+        return {str(data.get("id", "")): data}
+    if isinstance(data, dict):
+        return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+    if isinstance(data, list):
+        return {str(x.get("id", i)): x for i, x in enumerate(data) if isinstance(x, dict)}
+    return {}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_cmc_ohlcv_batch(ids, period, count, api_key):
+    """Fetch CMC OHLCV for multiple CMC IDs in one request."""
+    ids = tuple(int(x) for x in ids if pd.notna(x))
+    if not ids:
+        return {}
+    data = cmc_api_get(
+        "/v2/cryptocurrency/ohlcv/historical",
+        {"id": ",".join(map(str, ids)), "time_period": period,
+         "interval": "daily" if period == "daily" else "hourly",
+         "count": int(count), "convert": "USD", "skip_invalid": "true"},
+        api_key,
+    )
+    result = {}
+    for key, coin in _cmc_data_map(data).items():
+        candles = []
+        for q in coin.get("quotes", []) or []:
+            usd = ((q.get("quote") or {}).get("USD") or {})
+            try:
+                open_time = pd.to_datetime(q.get("time_open"), utc=True, errors="coerce")
+                close_time = pd.to_datetime(q.get("time_close"), utc=True, errors="coerce")
+                opn, close = float(usd.get("open")), float(usd.get("close"))
+                volume = float(usd.get("volume") or 0)
+                if pd.isna(open_time) or pd.isna(close_time) or opn <= 0 or close <= 0:
+                    continue
+                candles.append({"open_time": open_time, "close_time": close_time,
+                                "open": opn, "high": float(usd.get("high") or np.nan),
+                                "low": float(usd.get("low") or np.nan), "close": close,
+                                "volume": volume,
+                                "green": bool(close > opn)})
+            except (TypeError, ValueError):
+                continue
+        result[str(key)] = sorted(candles, key=lambda x: x["open_time"])
+    return result
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_cmc_ath_stats(ids, api_key):
+    ids = tuple(int(x) for x in ids if pd.notna(x))
+    if not ids:
+        return {}
+    data = cmc_api_get(
+        "/v2/cryptocurrency/price-performance-stats/latest",
+        {"id": ",".join(map(str, ids)), "time_period": "all_time", "convert": "USD", "skip_invalid": "true"},
+        api_key,
+    )
+    result = {}
+    for key, item in _cmc_data_map(data).items():
+        try:
+            usd = (((item.get("periods") or {}).get("USD") or {}).get("quote") or {}).get("USD") or {}
+            high = float(usd.get("high"))
+            high_time = usd.get("high_timestamp")
+            if high > 0:
+                result[str(key)] = {"ATH_Price": high, "ATH_Date": high_time}
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def run_cmc_pre_pump_scan(limit, api_key, min_volume_usd=100_000, min_market_cap_usd=1_000_000):
+    """Two-lane CMC scan: strict three-green/volume candidates and relative-strength watchlist."""
+    market = fetch_cmc_market_universe(limit, api_key)
+    btc_row = market[market["Symbol"].eq("BTC")]
+    btc_7d = float(btc_row.iloc[0]["Change_7d_Percent"]) if not btc_row.empty and pd.notna(btc_row.iloc[0]["Change_7d_Percent"]) else 0.0
+    base = market[
+        (~market["Is_Excluded_Asset"].fillna(False))
+        & market["CMC_ID"].notna()
+        & (market["Volume_24h"].fillna(0) >= float(min_volume_usd))
+        & (market["Market_Cap"].fillna(0) >= float(min_market_cap_usd))
+        & (market["Num_Market_Pairs"].fillna(0) >= 3)
+    ].copy()
+    if base.empty:
+        return pd.DataFrame(), pd.DataFrame(), {"universe": len(market), "eligible": 0, "daily_checked": 0, "hourly_checked": 0, "btc_7d": btc_7d}
+
+    ids = base["CMC_ID"].astype(int).tolist()
+    daily_map = {}
+    errors = 0
+    # Chunked batches keep URL length and API request size under control.
+    for start in range(0, len(ids), 75):
+        batch = ids[start:start + 75]
+        try:
+            daily_map.update(fetch_cmc_ohlcv_batch(tuple(batch), "daily", 10, api_key))
+        except Exception:
+            errors += 1
+    today_utc = pd.Timestamp.now(tz="UTC").normalize()
+    analyzed = []
+    for _, coin in base.iterrows():
+        key = str(int(coin["CMC_ID"]))
+        candles = daily_map.get(key, [])
+        completed = [c for c in candles if c["close_time"] < today_utc]
+        if len(completed) < 3:
+            continue
+        last3 = completed[-3:]
+        green_count = sum(1 for c in last3 if c["green"])
+        vols = [float(c["volume"]) for c in last3]
+        vol_increasing = bool(vols[0] < vols[1] < vols[2] and vols[2] > 0)
+        prior_vols = [float(c["volume"]) for c in completed[:-3][-7:] if c["volume"] > 0]
+        vol_vs_prior = (vols[-1] / (sum(prior_vols) / len(prior_vols))) if prior_vols and vols[-1] > 0 else np.nan
+        daily_return = (last3[-1]["close"] / last3[0]["open"] - 1) * 100 if last3[0]["open"] else np.nan
+        analyzed.append({
+            **coin.to_dict(), "Green_Days_Last_3": green_count,
+            "Daily_Volume_1": vols[0], "Daily_Volume_2": vols[1], "Daily_Volume_3": vols[2],
+            "Volume_Increasing_3d": vol_increasing, "Volume_vs_Previous_7d_Avg": vol_vs_prior,
+            "Recent_3d_Return_Percent": daily_return,
+            "Last_Completed_Day": last3[-1]["close_time"].strftime("%Y-%m-%d"),
+            "Daily_Candles_Available": len(completed),
+        })
+    if not analyzed:
+        return pd.DataFrame(), pd.DataFrame(), {"universe": len(market), "eligible": len(base), "daily_checked": 0, "hourly_checked": 0, "errors": errors, "btc_7d": btc_7d}
+    frame = pd.DataFrame(analyzed)
+    # Only assets with a valid three-day trend/volume profile need the ATH stats request.
+    stats_candidates = frame[(frame["Green_Days_Last_3"] == 3) & frame["Volume_Increasing_3d"]]
+    stats_ids = stats_candidates["CMC_ID"].dropna().astype(int).tolist()[:250]
+    ath_map = {}
+    stats_error = None
+    if stats_ids:
+        try:
+            ath_map = fetch_cmc_ath_stats(tuple(stats_ids), api_key)
+        except Exception as exc:
+            stats_error = str(exc)[:220]
+    frame["ATH_Price"] = frame["CMC_ID"].apply(lambda x: (ath_map.get(str(int(x)), {}) or {}).get("ATH_Price") if pd.notna(x) else np.nan)
+    frame["ATH_Date"] = frame["CMC_ID"].apply(lambda x: (ath_map.get(str(int(x)), {}) or {}).get("ATH_Date") if pd.notna(x) else None)
+    frame["ATH_Drawdown_Percent"] = np.where(
+        (frame["ATH_Price"].notna()) & (frame["ATH_Price"] > frame["Price"]),
+        (1 - frame["Price"] / frame["ATH_Price"]) * 100, 0.0
+    )
+    frame["Relative_Strength_vs_BTC_7d"] = frame["Change_7d_Percent"].fillna(0) - btc_7d
+
+    # Candidates require all five explicit filters, including verified CMC ATH below current price.
+    candidates = frame[
+        (frame["Green_Days_Last_3"] == 3)
+        & frame["Volume_Increasing_3d"]
+        & frame["ATH_Price"].notna()
+        & (frame["Price"] < frame["ATH_Price"])
+        & (frame["Market_Cap"].fillna(0) >= min_market_cap_usd)
+        & (frame["Volume_24h"].fillna(0) >= min_volume_usd)
+    ].copy()
+    candidates["Signal"] = "کاندید آماده؛ ۳ کندل سبز + حجم افزایشی + زیر ATH"
+
+    # Watchlist: relative strength vs BTC and volume expansion, even if three green candles are absent.
+    watch = frame[
+        (frame["Relative_Strength_vs_BTC_7d"] > 0)
+        & (frame["Volume_vs_Previous_7d_Avg"].fillna(0) >= 1.20)
+        & (~frame["CMC_ID"].isin(candidates["CMC_ID"]))
+    ].copy()
+    watch["Signal"] = "زیرنظر؛ قدرت نسبی در برابر BTC + افزایش حجم"
+
+    # Confirm the latest completed 1h candle for the strongest 50 candidates/watchlist entries.
+    hourly_targets = pd.concat([candidates, watch]).drop_duplicates("CMC_ID").sort_values(
+        ["Relative_Strength_vs_BTC_7d", "Volume_24h"], ascending=False
+    ).head(50)
+    hourly_ids = hourly_targets["CMC_ID"].dropna().astype(int).tolist()
+    hourly_map = {}
+    if hourly_ids:
+        try:
+            hourly_map = fetch_cmc_ohlcv_batch(tuple(hourly_ids), "hourly", 5, api_key)
+        except Exception as exc:
+            errors += 1
+            hourly_map = {}
+    def hourly_fields(row):
+        candles = hourly_map.get(str(int(row["CMC_ID"])), []) if pd.notna(row["CMC_ID"]) else []
+        now = pd.Timestamp.now(tz="UTC")
+        closed = [c for c in candles if c["close_time"] <= now]
+        last = closed[-1] if closed else None
+        return pd.Series({
+            "Last_Closed_1h_Candle": ("سبز" if last["green"] else ("قرمز" if last["close"] < last["open"] else "خنثی")) if last else "داده موجود نیست",
+            "Last_Closed_1h_Time_UTC": last["close_time"].strftime("%Y-%m-%d %H:%M UTC") if last else None,
+        })
+    for result in (candidates, watch):
+        if not result.empty:
+            h = result.apply(hourly_fields, axis=1)
+            result["Last_Closed_1h_Candle"] = h["Last_Closed_1h_Candle"]
+            result["Last_Closed_1h_Time_UTC"] = h["Last_Closed_1h_Time_UTC"]
+    meta = {"universe": len(market), "eligible": len(base), "daily_checked": len(frame),
+            "hourly_checked": len(hourly_ids), "errors": errors, "btc_7d": btc_7d,
+            "ath_stats_error": stats_error}
+    return candidates.sort_values(["Relative_Strength_vs_BTC_7d", "Volume_24h"], ascending=False), \
+           watch.sort_values(["Relative_Strength_vs_BTC_7d", "Volume_24h"], ascending=False), meta
+
 def fetch_history(coin_id, currency, days, api_key):
     payload = safe_get(
         f"{CG_API}/coins/{coin_id}/market_chart",
@@ -1709,6 +1978,13 @@ with st.sidebar:
             help="Starts with up to 1,000 market coins. Reduce to 250 or 500 if CoinGecko rate limits occur.",
         )
         refresh_seconds = st.selectbox("فاصله به‌روزرسانی", [60, 120, 300, 600], index=1)
+    cmc_key_input = st.text_input(
+        "کلید API کوین‌مارکت‌کپ (CMC)",
+        value=secret_or_env("COINMARKETCAP_API_KEY") or secret_or_env("CMC_PRO_API_KEY"),
+        type="password",
+        help="برای فهرست بازار و داده‌های OHLCV تاریخی. دسترسی OHLCV و ATH در API رسمی CMC به پلن Startup یا بالاتر نیاز دارد.",
+        key="cmc_api_key_input",
+    )
     uploaded = st.file_uploader("انتخاب فایل داده CSV", type=["csv"])
     st.divider()
     st.subheader("🔬 تحلیل تکنیکال")
@@ -1942,9 +2218,9 @@ def fetch_fear_greed_history():
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_altcoin_season_index():
+def fetch_altcoin_season_index(key_override=""):
     """Fetch CMC Altcoin Season Index; prefer a personal API-key rate pool."""
-    cmc_key = secret_or_env("COINMARKETCAP_API_KEY") or secret_or_env("CMC_PRO_API_KEY")
+    cmc_key = (key_override or secret_or_env("COINMARKETCAP_API_KEY") or secret_or_env("CMC_PRO_API_KEY")).strip()
     if cmc_key:
         # Authenticated requests use the user's own CMC rate limit instead of
         # the shared keyless IP pool that commonly returns HTTP 429.
@@ -2124,7 +2400,7 @@ if section == "🏠 نمای کلی":
         if time.time() < alt_retry_until:
             wait_left = max(1, int(alt_retry_until - time.time()))
             raise RuntimeError(f"برای جلوگیری از تکرار خطای 429، دریافت شاخص موقتاً متوقف است؛ حدود {wait_left} ثانیه دیگر دوباره صفحه را تازه کنید.")
-        alt_data = fetch_altcoin_season_index()
+        alt_data = fetch_altcoin_season_index(st.session_state.get("cmc_api_key_input", ""))
         st.session_state.pop("cmc_altcoin_retry_until", None)
         alt_value = alt_data["value"]
         if alt_value < 25:
@@ -2311,6 +2587,73 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
     st.divider()
     st.subheader("🛰️ فرصت‌های احتمالی پیش از رشد")
     st.caption("استیبل‌کوین‌ها حذف شده‌اند. سیگنال معتبر نیازمند خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه، نقدشوندگی مناسب و بازار BTC غیرنزولی است. درصد پوشش نشان می‌دهد چه مقدار از هفت عامل واقعاً داده داشته‌اند.")
+
+    # CoinMarketCap broad-universe radar: no 30-coin CoinGecko cutoff.
+    st.markdown("### 🌐 رادار گسترده CoinMarketCap")
+    st.caption(
+        "CMC فهرست ارزهای فعال را می‌سازد؛ سپس کندل‌های روزانه کامل‌شده، حجم سه‌روزه، ATH و قدرت نسبی در برابر BTC بررسی می‌شوند. "
+        "استیبل‌کوین‌ها و بازارهای کم‌عمق حذف می‌شوند. این اسکن جدا از منبع اصلی CoinGecko کار می‌کند."
+    )
+    cmc_key = (st.session_state.get("cmc_api_key_input") or secret_or_env("COINMARKETCAP_API_KEY") or secret_or_env("CMC_PRO_API_KEY")).strip()
+    cmc_a, cmc_b = st.columns([1, 2])
+    with cmc_a:
+        cmc_universe_limit = st.selectbox("تعداد ارزهای فهرست CMC", [250, 500, 1000], index=1, key="cmc_universe_limit")
+    with cmc_b:
+        st.caption("حجم ۲۴ساعته حداقل ۱۰۰ هزار دلار • ارزش بازار حداقل ۱ میلیون دلار • حداقل ۳ بازار معاملاتی")
+    if not cmc_key:
+        st.info("برای فعال‌سازی این رادار، کلید API کوین‌مارکت‌کپ را در کادر تنظیمات کناری وارد کن. کلید در این برنامه به‌صورت رمز عبور نمایش داده می‌شود.")
+    elif st.button("🚀 اسکن گسترده بازار با CoinMarketCap", key="run_cmc_broad_pre_pump", type="primary"):
+        with st.spinner(f"در حال دریافت {cmc_universe_limit:,} ارز فعال CMC و بررسی کندل‌های روزانه..."):
+            try:
+                cmc_candidates, cmc_watch, cmc_meta = run_cmc_pre_pump_scan(cmc_universe_limit, cmc_key)
+                st.session_state["cmc_pre_pump_candidates_v1"] = cmc_candidates
+                st.session_state["cmc_pre_pump_watch_v1"] = cmc_watch
+                st.session_state["cmc_pre_pump_meta_v1"] = cmc_meta
+                st.session_state["cmc_pre_pump_time_v1"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
+            except Exception as exc:
+                st.error(f"اسکن CMC کامل نشد: {str(exc)[:500]}")
+                if "403" in str(exc) or "plan" in str(exc).lower() or "subscription" in str(exc).lower():
+                    st.warning("طبق مستندات CMC، دسترسی به OHLCV تاریخی و آمار ATH از پلن Startup یا بالاتر شروع می‌شود؛ پلن Basic این داده‌ها را ارائه نمی‌کند.")
+
+    cmc_candidates = st.session_state.get("cmc_pre_pump_candidates_v1")
+    cmc_watch = st.session_state.get("cmc_pre_pump_watch_v1")
+    if isinstance(cmc_candidates, pd.DataFrame) and isinstance(cmc_watch, pd.DataFrame):
+        cm = st.session_state.get("cmc_pre_pump_meta_v1", {})
+        st.caption(
+            f"آخرین اسکن: {st.session_state.get('cmc_pre_pump_time_v1', '—')} • "
+            f"فهرست CMC: {cm.get('universe', 0):,} • واجد شرایط نقدشوندگی: {cm.get('eligible', 0):,} • "
+            f"کندل روزانه بررسی‌شده: {cm.get('daily_checked', 0):,} • تأیید ساعتی: {cm.get('hourly_checked', 0):,} • "
+            f"تغییر ۷روزه BTC: {cm.get('btc_7d', 0):+.2f}%"
+        )
+        m1, m2, m3 = st.columns(3)
+        m1.metric("کاندیدهای آماده", len(cmc_candidates))
+        m2.metric("رادار زیرنظر", len(cmc_watch))
+        m3.metric("خطاهای دسته‌ای API", cm.get("errors", 0))
+        cmc_cols = {
+            "Coin": "ارز", "Symbol": "نماد", "Market_Cap_Rank": "رتبه CMC",
+            "Price": "قیمت USD", "Change_1h_Percent": "تغییر ۱ساعته٪",
+            "Change_24h_Percent": "تغییر ۲۴ساعته٪", "Change_7d_Percent": "تغییر ۷روزه٪",
+            "Relative_Strength_vs_BTC_7d": "قدرت نسبی نسبت به BTC٪",
+            "Green_Days_Last_3": "تعداد کندل سبز از ۳ روز", "Volume_Increasing_3d": "حجم سه‌روزه افزایشی",
+            "Volume_vs_Previous_7d_Avg": "حجم روز آخر / میانگین قبلی",
+            "ATH_Price": "سقف تاریخی USD", "ATH_Drawdown_Percent": "فاصله از ATH٪",
+            "Last_Closed_1h_Candle": "آخرین کندل بسته‌شده ۱ساعته",
+            "Last_Closed_1h_Time_UTC": "زمان کندل ساعتی UTC", "Volume_24h": "حجم ۲۴ساعته USD",
+            "Market_Cap": "ارزش بازار USD", "Num_Market_Pairs": "تعداد بازارها", "Signal": "وضعیت رادار"
+        }
+        st.markdown("#### 🟢 کاندیدهای آماده؛ تمام شروط اصلی برقرار")
+        if cmc_candidates.empty:
+            st.info("فعلاً هیچ ارزی تمام شروط سخت‌گیرانه را ندارد. این نتیجه در بازار نزولی طبیعی است.")
+        else:
+            st.dataframe(cmc_candidates.rename(columns=cmc_cols), use_container_width=True, hide_index=True)
+        st.markdown("#### 🟡 رادار زیرنظر؛ قدرت نسبی در بازار ضعیف")
+        if cmc_watch.empty:
+            st.info("در این اسکن، ارزی با قدرت نسبی مثبت و افزایش حجم کافی برای زیرنظر پیدا نشد.")
+        else:
+            st.dataframe(cmc_watch.rename(columns=cmc_cols), use_container_width=True, hide_index=True)
+        if cm.get("ath_stats_error"):
+            st.warning("داده ATH از CMC دریافت نشد؛ بنابراین هیچ ارزی بدون تأیید سقف تاریخی به فهرست کاندید آماده راه پیدا نکرد. جزئیات: " + str(cm.get("ath_stats_error")))
+        st.caption("نکته: سه کندل روزانه کامل‌شده بر اساس UTC سنجیده می‌شوند. کندل یک‌ساعته فقط اطلاعات تأییدی است؛ رنگ آن از آخرین کندل کامل‌شده CMC گرفته می‌شود. کاندید آماده به معنی توصیه خرید یا تضمین پامپ نیست.")
 
     # Dedicated 1-hour early-pump radar. It is on-demand to avoid 30 API calls
     # on every Streamlit rerun and uses DEX-reported hourly volume/transactions.

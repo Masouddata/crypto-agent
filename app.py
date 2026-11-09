@@ -626,44 +626,6 @@ def calculate_pre_pump_score(frame):
     return out
 
 
-def weekly_uptrend_green_days_from_history(history, lookback_days=7):
-    """Find positive weekly price structure with at least one green completed UTC daily candle."""
-    if history is None or history.empty or not {"Time", "price"}.issubset(history.columns):
-        return None
-    frame = history[["Time", "price"]].copy().dropna()
-    frame["Time"] = pd.to_datetime(frame["Time"], utc=True, errors="coerce")
-    frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
-    frame = frame.dropna().sort_values("Time").set_index("Time")
-    daily = frame["price"].resample("1D").agg(open="first", close="last").dropna()
-    today_utc = pd.Timestamp.now(tz="UTC").normalize()
-    daily = daily[daily.index < today_utc].tail(int(lookback_days))
-    if len(daily) < int(lookback_days):
-        return None
-
-    daily["green"] = daily["close"] > daily["open"]
-    first_open = float(daily.iloc[0]["open"])
-    last_close = float(daily.iloc[-1]["close"])
-    if first_open <= 0:
-        return None
-    weekly_change = (last_close / first_open - 1.0) * 100.0
-    closes = daily["close"].to_numpy(dtype=float)
-    slope = float(np.polyfit(np.arange(len(closes)), closes, 1)[0])
-    green_count = int(daily["green"].sum())
-
-    # Any strictly positive candle counts, including very small gains.
-    if weekly_change <= 0 or slope <= 0 or green_count < 1:
-        return None
-    return {
-        "Green_Days_7d": green_count,
-        "Weekly_Change_Percent": float(weekly_change),
-        "Trend_Slope_Per_Day": slope,
-        "First_Day": daily.index[0].strftime("%Y-%m-%d"),
-        "Last_Day": daily.index[-1].strftime("%Y-%m-%d"),
-        "Last_Daily_Close": last_close,
-    }
-
-
-
 # =========================================================
 # DATA SOURCES
 # =========================================================
@@ -725,12 +687,14 @@ def fetch_market_pages(currency, pages, api_key):
         "Market_Cap_Rank": col("market_cap_rank"),
         "Circulating_Supply": col("circulating_supply"),
         "Total_Supply": col("total_supply"),
+        "ATH_Price": col("ath"),
+        "ATH_Date": col("ath_date"),
         "ATH_Change_Percent": col("ath_change_percentage"),
         "Last_Updated": col("last_updated"),
     })
     for c in ["Price", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h",
               "Market_Cap", "Market_Cap_Rank", "Circulating_Supply", "Total_Supply",
-              "ATH_Change_Percent"]:
+              "ATH_Price", "ATH_Change_Percent"]:
         df[c] = numeric(df[c])
     # Market-only preliminary score. It is explicitly not a calibrated probability.
     ch24 = df["Change_24h_Percent"].fillna(0)
@@ -1619,11 +1583,36 @@ def fetch_fear_greed_history():
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_altcoin_season_index():
-    """CoinMarketCap public/keyless Altcoin Season Index endpoint."""
-    payload = safe_get(
-        "https://pro-api.coinmarketcap.com/public-api/v1/altcoin-season-index/latest",
-        timeout=15,
-    )
+    """Fetch CMC Altcoin Season Index; prefer a personal API-key rate pool."""
+    cmc_key = secret_or_env("COINMARKETCAP_API_KEY") or secret_or_env("CMC_PRO_API_KEY")
+    if cmc_key:
+        # Authenticated requests use the user's own CMC rate limit instead of
+        # the shared keyless IP pool that commonly returns HTTP 429.
+        url = "https://pro-api.coinmarketcap.com/v1/altcoin-season-index/latest"
+        headers = {"X-CMC_PRO_API_KEY": cmc_key, "Accept": "application/json"}
+    else:
+        # This endpoint is also available without a key, but its IP pool is shared.
+        url = "https://pro-api.coinmarketcap.com/public-api/v1/altcoin-season-index/latest"
+        headers = {"Accept": "application/json"}
+
+    # Do not rapidly retry 429s: CMC's public endpoint is IP-throttled.
+    response = _http_session().get(url, headers=headers, timeout=15)
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After", "60")
+        try:
+            retry_seconds = max(1, int(float(retry_after)))
+        except (TypeError, ValueError):
+            retry_seconds = 60
+        raise requests.HTTPError(
+            f"CoinMarketCap محدودیت درخواست (429) اعمال کرده؛ {retry_seconds} ثانیه بعد دوباره تلاش کنید. "
+            "اگر کلید CMC دارید، آن را با نام COINMARKETCAP_API_KEY در Secrets قرار دهید.",
+            response=response,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    status = payload.get("status", {}) if isinstance(payload, dict) else {}
+    if status and str(status.get("error_code", "0")) not in ("0", "None", ""):
+        raise ValueError(f"CMC API: {status.get('error_message') or status.get('error_code')}")
     data = payload.get("data", {}) if isinstance(payload, dict) else {}
     value = data.get("altcoin_index")
     if value is None:
@@ -1771,7 +1760,12 @@ if section == "🏠 نمای کلی":
             st.warning(f"شاخص ترس و طمع فعلاً دریافت نشد: {str(exc)[:180]}")
 
     try:
+        alt_retry_until = float(st.session_state.get("cmc_altcoin_retry_until", 0) or 0)
+        if time.time() < alt_retry_until:
+            wait_left = max(1, int(alt_retry_until - time.time()))
+            raise RuntimeError(f"برای جلوگیری از تکرار خطای 429، دریافت شاخص موقتاً متوقف است؛ حدود {wait_left} ثانیه دیگر دوباره صفحه را تازه کنید.")
         alt_data = fetch_altcoin_season_index()
+        st.session_state.pop("cmc_altcoin_retry_until", None)
         alt_value = alt_data["value"]
         if alt_value < 25:
             alt_label = "فصل بیت‌کوین"
@@ -1790,8 +1784,16 @@ if section == "🏠 نمای کلی":
             if alt_data.get("snapshot_time"):
                 st.caption(f"زمان ثبت داده: {alt_data['snapshot_time']}")
     except Exception as exc:
+        response = getattr(exc, "response", None)
+        if response is not None and response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "60")
+            try:
+                cooldown = max(30, int(float(retry_after)))
+            except (TypeError, ValueError):
+                cooldown = 60
+            st.session_state["cmc_altcoin_retry_until"] = time.time() + cooldown
         with alt_col:
-            st.warning(f"شاخص فصل آلت‌کوین‌ها فعلاً دریافت نشد: {str(exc)[:180]}")
+            st.warning(f"شاخص فصل آلت‌کوین‌ها فعلاً دریافت نشد: {str(exc)[:240]}")
 
     st.divider()
 
@@ -2111,6 +2113,72 @@ if section == "📊 نمودارها و ریزش‌ها":
     else:
         st.info("داده کافی برای رتبه‌بندی ریزش هفتگی موجود نیست.")
 
+    # Historical high recovery watchlist: separate from active pre-pump signals.
+    st.divider()
+    st.subheader("🏔️ رادار فاصله از سقف تاریخی با بررسی پتانسیل برگشت")
+    st.caption("این جدول ارزهایی را جدا می‌کند که قیمت فعلی‌شان پایین‌تر از سقف تاریخی است؛ رتبه‌بندی فقط بر اساس فاصله از ATH نیست و فعالیت بازار و مومنتوم اخیر هم بررسی می‌شود. امتیاز، احتمال آماری یا وعده بازگشت به سقف نیست.")
+    ath_view = df[~df["Is_Excluded_Asset"].fillna(False)].copy()
+    for _col in ["Price", "ATH_Price", "ATH_Change_Percent", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Market_Cap", "PrePump_Score"]:
+        if _col in ath_view.columns:
+            ath_view[_col] = numeric(ath_view[_col])
+    # CoinGecko's ATH change is negative when price is below its historical high.
+    ath_view["ATH_Drawdown_Percent"] = (-ath_view["ATH_Change_Percent"]).clip(lower=0)
+    ath_view["Gain_Needed_To_ATH_Percent"] = np.where(
+        (ath_view["Price"] > 0) & (ath_view["ATH_Price"] > ath_view["Price"]),
+        (ath_view["ATH_Price"] / ath_view["Price"] - 1) * 100, np.nan
+    )
+    # Screen out inactive / tiny markets and assets almost entirely collapsed.
+    ath_view = ath_view[
+        (ath_view["ATH_Drawdown_Percent"] >= 10)
+        & (ath_view["ATH_Drawdown_Percent"] <= 95)
+        & (ath_view["Volume_24h"].fillna(0) >= 50000)
+        & (ath_view["Market_Cap"].fillna(0) >= 1000000)
+        & (ath_view["Price"] > 0)
+        & (ath_view["ATH_Price"] > ath_view["Price"])
+    ].copy()
+    if not ath_view.empty:
+        # Recovery-screen score rewards a meaningful discount only when current activity/momentum exists.
+        dd_score = (ath_view["ATH_Drawdown_Percent"].clip(10, 80) - 10) / 70 * 25
+        momentum_7d = ath_view["Change_7d_Percent"].fillna(-15).clip(-15, 20)
+        momentum_score = ((momentum_7d + 15) / 35 * 25)
+        momentum_24h = ath_view["Change_24h_Percent"].fillna(-5).clip(-5, 10)
+        daily_score = ((momentum_24h + 5) / 15 * 10)
+        turnover = (ath_view["Volume_24h"].fillna(0) / ath_view["Market_Cap"].replace(0, np.nan)).fillna(0)
+        activity_score = (turnover.clip(0, 0.30) / 0.30 * 20)
+        pump_score = numeric(ath_view["PrePump_Score"]).fillna(40).clip(0, 100) / 100 * 20
+        ath_view["Recovery_Screen_Score"] = (dd_score + momentum_score + daily_score + activity_score + pump_score).clip(0, 100).round(1)
+        ath_view["Recovery_Screen_Status"] = np.select(
+            [
+                (ath_view["Recovery_Screen_Score"] >= 70) & (ath_view["Change_7d_Percent"] > 0),
+                (ath_view["Recovery_Screen_Score"] >= 55),
+                (ath_view["Change_7d_Percent"] < 0),
+            ],
+            ["بررسی جدی‌تر؛ مومنتوم مثبت", "زیرنظر؛ نیازمند تأیید", "فعلاً ضعیف؛ روند اخیر منفی"],
+            default="فقط فاصله از سقف؛ تأیید ناکافی",
+        )
+        ath_view = ath_view.sort_values(["Recovery_Screen_Score", "Change_7d_Percent"], ascending=[False, False]).head(40)
+        ath_cols = ["Coin", "Symbol", "Price", "ATH_Price", "ATH_Date", "ATH_Drawdown_Percent", "Gain_Needed_To_ATH_Percent", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Recovery_Screen_Score", "Recovery_Screen_Status"]
+        ath_display = ath_view[[c for c in ath_cols if c in ath_view.columns]].rename(columns={
+            "Coin": "ارز", "Symbol": "نماد", "Price": "قیمت فعلی", "ATH_Price": "قیمت سقف تاریخی",
+            "ATH_Date": "تاریخ سقف تاریخی", "ATH_Drawdown_Percent": "فاصله از سقف (%)",
+            "Gain_Needed_To_ATH_Percent": "رشد لازم تا سقف (%)", "Change_24h_Percent": "تغییر ۲۴ساعته (%)",
+            "Change_7d_Percent": "تغییر ۷روزه (%)", "Volume_24h": "حجم ۲۴ساعته (USD)",
+            "Recovery_Screen_Score": "امتیاز بررسی برگشت / ۱۰۰", "Recovery_Screen_Status": "وضعیت بررسی",
+        })
+        st.dataframe(ath_display, use_container_width=True, hide_index=True, column_config={
+            "قیمت فعلی": st.column_config.NumberColumn(format="$%.8g"),
+            "قیمت سقف تاریخی": st.column_config.NumberColumn(format="$%.8g"),
+            "فاصله از سقف (%)": st.column_config.NumberColumn(format="%.1f%%"),
+            "رشد لازم تا سقف (%)": st.column_config.NumberColumn(format="%.1f%%"),
+            "تغییر ۲۴ساعته (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "تغییر ۷روزه (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "حجم ۲۴ساعته (USD)": st.column_config.NumberColumn(format="$%.0f"),
+            "امتیاز بررسی برگشت / ۱۰۰": st.column_config.NumberColumn(format="%.1f"),
+        })
+        st.caption("فیلتر اولیه: افت ۱۰ تا ۹۵ درصد از ATH، ارزش بازار حداقل ۱ میلیون دلار و حجم ۲۴ساعته حداقل ۵۰ هزار دلار. ارزهای کم‌فعال/بسیار فروپاشیده حذف می‌شوند. برای نمونه، افت ۸۰٪ به معنی نیاز به رشد ۴۰۰٪ برای بازگشت به سقف است؛ درصد رشد لازم با درصد افت برابر نیست.")
+    else:
+        st.info("در داده فعلی، ارزی که هم پایین‌تر از سقف تاریخی باشد و هم از فیلتر حداقل فعالیت و نقدشوندگی عبور کند پیدا نشد.")
+
     # Alerts for sharp moves
     st.subheader("🔔 هشدار حرکت‌های غیرعادی بازار")
     alerts = df[(numeric(df["Change_24h_Percent"]).abs() >= 5) | (numeric(df["Change_7d_Percent"]).abs() >= 15)].copy()
@@ -2184,94 +2252,6 @@ if section == "📊 نمودارها و ریزش‌ها":
             st.info("در ۴۰ ارز نقدشونده بررسی‌شده، موردی با حداقل ۵ کندل سبز متوالی و بازده مثبت پیدا نشد.")
         if st.session_state.get("green_streak_scan_errors", 0):
             st.caption(f"تعداد {st.session_state['green_streak_scan_errors']} درخواست تاریخی با خطا یا محدودیت منبع روبه‌رو شد؛ بنابراین این اسکن پوشش کامل بازار نیست.")
-
-    # Weekly uptrend scan: positive 7-day structure and at least one green daily candle.
-    st.divider()
-    st.subheader("📈 ارزهای با روند صعودی در هفته اخیر و کندل سبز")
-    st.caption("حتی رشدهای بسیار کوچک هم پذیرفته می‌شوند: بازده کل ۷ روز باید مثبت، شیب روند صعودی و حداقل یک کندل روزانه سبز در ۷ روز کامل UTC وجود داشته باشد. فقط ۴۰ ارز نقدشونده‌تر بررسی می‌شوند.")
-    if data_source != "CoinGecko market" or "CoinGecko_ID" not in df.columns:
-        st.info("برای بررسی روند هفتگی، منبع داده CoinGecko market را انتخاب کن.")
-    else:
-        if st.button("🔎 اسکن روند صعودی هفتگی", type="primary", key="scan_weekly_uptrend_green"):
-            weekly_universe = df.copy()
-            if "Is_Excluded_Asset" in weekly_universe.columns:
-                weekly_universe = weekly_universe[~weekly_universe["Is_Excluded_Asset"].fillna(False)]
-            weekly_universe["_scan_volume"] = numeric(weekly_universe["Volume_24h"]).fillna(0)
-            weekly_universe = weekly_universe[
-                weekly_universe["CoinGecko_ID"].notna()
-            ].sort_values("_scan_volume", ascending=False).head(40)
-
-            weekly_found = []
-            weekly_errors = 0
-
-            def _scan_one_weekly_uptrend(row):
-                hist = fetch_history(str(row["CoinGecko_ID"]), currency, 30, cg_key)
-                result = weekly_uptrend_green_days_from_history(hist, lookback_days=7)
-                if result:
-                    return {
-                        "Coin": row.get("Coin", ""),
-                        "Symbol": row.get("Symbol", ""),
-                        **result,
-                        "Change_24h_Percent": row.get("Change_24h_Percent", np.nan),
-                        "Volume_24h": row.get("Volume_24h", np.nan),
-                    }
-                return None
-
-            with st.spinner(f"در حال بررسی روند هفتگی {len(weekly_universe)} ارز نقدشونده..."):
-                with ThreadPoolExecutor(max_workers=6) as pool:
-                    futures = [
-                        pool.submit(_scan_one_weekly_uptrend, row)
-                        for _, row in weekly_universe.iterrows()
-                    ]
-                    for future in futures:
-                        try:
-                            item = future.result()
-                            if item:
-                                weekly_found.append(item)
-                        except Exception:
-                            weekly_errors += 1
-
-            weekly_result_df = pd.DataFrame(weekly_found)
-            if not weekly_result_df.empty:
-                weekly_result_df = weekly_result_df.sort_values(
-                    ["Weekly_Change_Percent", "Green_Days_7d"],
-                    ascending=[False, False],
-                    kind="mergesort",
-                )
-            st.session_state["weekly_uptrend_green_results"] = weekly_result_df
-            st.session_state["weekly_uptrend_green_errors"] = weekly_errors
-
-        weekly_results = st.session_state.get("weekly_uptrend_green_results", pd.DataFrame())
-        if isinstance(weekly_results, pd.DataFrame) and not weekly_results.empty:
-            weekly_display = weekly_results.rename(columns={
-                "Coin": "ارز",
-                "Symbol": "نماد",
-                "Green_Days_7d": "تعداد کندل سبز در ۷ روز",
-                "Weekly_Change_Percent": "تغییر کل ۷ روز (%)",
-                "Trend_Slope_Per_Day": "شیب روند روزانه",
-                "First_Day": "اولین روز بررسی",
-                "Last_Day": "آخرین روز بررسی",
-                "Last_Daily_Close": "آخرین بسته‌شدن روزانه",
-                "Change_24h_Percent": "تغییر ۲۴ساعته (%)",
-                "Volume_24h": "حجم ۲۴ساعته",
-            })
-            st.dataframe(
-                weekly_display,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "تغییر کل ۷ روز (%)": st.column_config.NumberColumn(format="%.4f%%"),
-                    "تغییر ۲۴ساعته (%)": st.column_config.NumberColumn(format="%.4f%%"),
-                    "شیب روند روزانه": st.column_config.NumberColumn(format="%.8g"),
-                    "آخرین بسته‌شدن روزانه": st.column_config.NumberColumn(format="%.8g"),
-                    "حجم ۲۴ساعته": st.column_config.NumberColumn(format="$%.2f"),
-                },
-            )
-            st.success(f"{len(weekly_results)} ارز با روند صعودی هفتگی و حداقل یک کندل سبز پیدا شد.")
-        elif "weekly_uptrend_green_results" in st.session_state:
-            st.info("در ۴۰ ارز نقدشونده بررسی‌شده، موردی با شرایط روند صعودی هفتگی پیدا نشد.")
-        if st.session_state.get("weekly_uptrend_green_errors", 0):
-            st.caption(f"{st.session_state['weekly_uptrend_green_errors']} درخواست تاریخی با خطا یا محدودیت منبع روبه‌رو شد؛ پوشش اسکن کامل بازار نیست.")
 
     # Market chart
     chart_source = filtered if not filtered.empty else df.head(50)

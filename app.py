@@ -646,30 +646,85 @@ def _fetch_market_page(currency, page, api_key):
     )
 
 
-@st.cache_data(ttl=150, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_pages(currency, pages, api_key):
-    """Fetch market pages concurrently (max 3 workers); cache the assembled result."""
-    page_numbers = list(range(1, int(pages) + 1))
-    rows_by_page = {}
-    # Three concurrent requests improve multi-page scans without creating a large
-    # burst against CoinGecko. Results are reassembled in page/rank order.
-    with ThreadPoolExecutor(max_workers=min(3, len(page_numbers) or 1)) as pool:
-        futures = {
-            page: pool.submit(_fetch_market_page, currency, page, api_key)
-            for page in page_numbers
-        }
-        for page in page_numbers:
-            data = futures[page].result()
-            rows_by_page[page] = data if isinstance(data, list) else []
+    """Fetch CoinGecko market pages sequentially to avoid HTTP 429 bursts.
 
+    Successful earlier pages are retained if a later page is rate-limited.
+    The result is cached for five minutes to avoid repeating the same requests
+    on Streamlit reruns. A warning is stored in DataFrame.attrs when coverage
+    is partial.
+    """
+    page_numbers = list(range(1, int(pages) + 1))
     rows = []
+    warning = ""
+
     for page in page_numbers:
-        data = rows_by_page[page]
-        if not data:
-            break
-        rows.extend(data)
-        if len(data) < 250:
-            break
+        # A small gap between pages reduces burst pressure on the public API.
+        if page > 1:
+            time.sleep(2.0)
+        response = None
+        last_error = None
+        data = None
+        # Longer, rate-limit-aware retries specifically for CoinGecko.
+        for attempt in range(5):
+            try:
+                response = _http_session().get(
+                    f"{CG_API}/coins/markets",
+                    params={
+                        "vs_currency": currency,
+                        "order": "market_cap_desc",
+                        "per_page": 250,
+                        "page": int(page),
+                        "sparkline": "false",
+                        "price_change_percentage": "24h,7d",
+                    },
+                    headers=cg_headers(api_key),
+                    timeout=30,
+                )
+                if response.status_code == 429:
+                    last_error = requests.HTTPError(
+                        f"CoinGecko rate limit (429) on page {page}", response=response
+                    )
+                    if attempt < 4:
+                        retry_after = response.headers.get("Retry-After")
+                        try:
+                            delay = max(3.0, float(retry_after)) if retry_after else min(30.0, 3.0 * (2 ** attempt))
+                        except (TypeError, ValueError):
+                            delay = min(30.0, 3.0 * (2 ** attempt))
+                        time.sleep(delay)
+                        continue
+                    break
+                response.raise_for_status()
+                data = response.json()
+                break
+            except requests.RequestException as exc:
+                last_error = exc
+                if response is not None and response.status_code not in _HTTP_RETRY_STATUSES:
+                    break
+                if attempt < 4:
+                    time.sleep(min(20.0, 2.0 * (2 ** attempt)))
+            except ValueError as exc:
+                last_error = exc
+                break
+
+        if isinstance(data, list) and data:
+            rows.extend(data)
+            if len(data) < 250:
+                break
+        else:
+            detail = str(last_error or "empty response")
+            if rows:
+                warning = (
+                    f"CoinGecko page {page} was unavailable ({detail}). "
+                    f"Showing the {len(rows)} coins fetched from earlier pages; "
+                    "increase coverage later when the API rate limit clears."
+                )
+                break
+            raise RuntimeError(
+                f"CoinGecko could not provide market page {page}: {detail}. "
+                "Wait a few minutes, use a CoinGecko Demo API key, or temporarily reduce coverage to 250 coins."
+            )
 
     if not rows:
         raise ValueError("CoinGecko returned no market rows.")
@@ -688,34 +743,10 @@ def fetch_market_pages(currency, pages, api_key):
         "Market_Cap_Rank": col("market_cap_rank"),
         "Circulating_Supply": col("circulating_supply"),
         "Total_Supply": col("total_supply"),
-        "ATH_Price": col("ath"),
-        "ATH_Date": col("ath_date"),
-        "ATH_Change_Percent": col("ath_change_percentage"),
-        "Last_Updated": col("last_updated"),
     })
-    for c in ["Price", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h",
-              "Market_Cap", "Market_Cap_Rank", "Circulating_Supply", "Total_Supply",
-              "ATH_Price", "ATH_Change_Percent"]:
-        df[c] = numeric(df[c])
-    # Market-only preliminary score. It is explicitly not a calibrated probability.
-    ch24 = df["Change_24h_Percent"].fillna(0)
-    ch7 = df["Change_7d_Percent"].fillna(0)
-    df["Market_Momentum_Score"] = (50 + 1.4 * ch24 + 0.8 * ch7).clip(0, 100).round(2)
-    df["Technical_Score"] = np.nan
-    df["RSI_14"] = np.nan
-    df["MACD"] = np.nan
-    df["MACD_Signal"] = np.nan
-    df["Trend_7d_Percent"] = np.nan
-    df["Technical_Signal"] = "Not calculated"
-    df["News_Score"] = np.nan
-    df["News_Summary"] = "News API not configured"
-    df["Pump_Potential_Score"] = df["Market_Momentum_Score"]
-    df["Risk_Level"] = "Unassessed"
-    df["Signal"] = "Watch"
+    df.attrs["market_fetch_warning"] = warning
     return df
 
-
-@st.cache_data(ttl=300, show_spinner=False)
 
 # =========================================================
 # COINMARKETCAP BROAD-MARKET EARLY-MOVE RADAR
@@ -2145,8 +2176,8 @@ def cryptometer_watchlist(results):
 # =========================================================
 st.title("📡 اسکنر هوشمند بازار ارزهای دیجیتال")
 st.caption("پایش گسترده بازار • شناسایی فرصت‌های پیش از رشد • رادار انباشت • افزایش حجم • کنترل ریسک")
-st.caption("Build 2026-11-08.2 • Parallel fetch + pooled HTTP + smart cache • Analysis engine preserved")
-st.caption("سرعت دریافت بهینه شده: صفحات بازار و درخواست‌های مستقل هم‌زمان اجرا می‌شوند؛ پاسخ‌ها کش می‌شوند و خطاهای موقت/محدودیت API با تلاش مجدد کنترل‌شده مدیریت می‌شوند.")
+st.caption("Build 2026-11-09.3 • Rate-limit-aware market fetch + pooled HTTP + smart cache • Analysis engine preserved")
+st.caption("دریافت بازار با فاصله‌گذاری بین صفحات و تلاش مجدد هوشمند انجام می‌شود؛ پاسخ‌ها ۵ دقیقه کش می‌شوند و در صورت محدودیت صفحه بعد، داده صفحات موفق حفظ می‌شود.")
 st.warning(
     "امتیازها ابزار غربالگری‌اند، نه احتمال قطعی پامپ یا توصیه مالی. داده‌های ناقص به‌عنوان سیگنال مثبت فرض نمی‌شوند؛ درصد پوشش شواهد را کنار امتیاز ببین."
 )
@@ -2223,6 +2254,9 @@ if data_source == "CoinGecko market":
         with st.spinner("Fetching CoinGecko market pages..."):
             df = fetch_market_pages(currency, pages, cg_key)
         dataset_name = "CoinGecko market API"
+        market_warning = df.attrs.get("market_fetch_warning", "")
+        if market_warning:
+            st.warning(market_warning)
     except Exception as exc:
         st.error(f"Could not fetch CoinGecko market data: {exc}")
         st.info("Check internet/API limits. You can reduce market coverage or upload a CSV instead.")

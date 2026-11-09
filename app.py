@@ -736,6 +736,48 @@ def fetch_history(coin_id, currency, days, api_key):
     return prices.dropna(subset=["price"])
 
 
+def analyze_recent_recovery_trend(history, lookback_days=7):
+    """Require a non-falling short-term trend using completed UTC daily closes."""
+    if history is None or history.empty or not {"Time", "price"}.issubset(history.columns):
+        return None
+    frame = history[["Time", "price"]].copy().dropna()
+    frame["Time"] = pd.to_datetime(frame["Time"], utc=True, errors="coerce")
+    frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+    frame = frame.dropna().sort_values("Time").set_index("Time")
+    daily = frame["price"].resample("1D").agg(open="first", close="last").dropna()
+    today_utc = pd.Timestamp.now(tz="UTC").normalize()
+    daily = daily[daily.index < today_utc]
+    if len(daily) < max(lookback_days, 5):
+        return None
+    recent = daily.tail(lookback_days)
+    closes = recent["close"].to_numpy(dtype=float)
+    if len(closes) < 5 or closes[0] <= 0:
+        return None
+    recent_3d_change = (closes[-1] / closes[-4] - 1) * 100 if closes[-4] else np.nan
+    previous_3d_change = (closes[-4] / closes[-7] - 1) * 100 if len(closes) >= 7 and closes[-7] else np.nan
+    last3 = closes[-3:]
+    slope = float(np.polyfit(np.arange(len(last3)), last3, 1)[0])
+    slope_pct = (slope / float(np.mean(last3))) * 100 if np.mean(last3) else 0.0
+    weekly_change = (closes[-1] / closes[0] - 1) * 100
+    # Positive last-three-day return and positive close slope are required.
+    # A flat/negative short-term trend is not promoted as a recovery opportunity.
+    if recent_3d_change > 0 and slope > 0:
+        status = "برگشت صعودی؛ تأیید اولیه"
+        eligible = True
+    else:
+        status = "روند هنوز نزولی/بدون تأیید"
+        eligible = False
+    return {
+        "Recent_3d_Change_Percent": float(recent_3d_change),
+        "Previous_3d_Change_Percent": float(previous_3d_change) if pd.notna(previous_3d_change) else np.nan,
+        "Recent_7d_Change_Percent": float(weekly_change),
+        "Recent_3d_Slope_Percent": float(slope_pct),
+        "Recovery_Trend_Status": status,
+        "Recovery_Trend_Eligible": eligible,
+        "Trend_Last_Date": recent.index[-1].strftime("%Y-%m-%d"),
+    }
+
+
 def green_candle_streak_from_history(history, min_days=5):
     """Aggregate intraday market-chart samples into UTC daily candles and find green runs."""
     if history is None or history.empty or not {"Time", "price"}.issubset(history.columns):
@@ -2137,6 +2179,44 @@ if section == "📊 نمودارها و ریزش‌ها":
         & (ath_view["ATH_Price"] > ath_view["Price"])
     ].copy()
     if not ath_view.empty:
+        if data_source != "CoinGecko market" or "CoinGecko_ID" not in ath_view.columns:
+            st.info("برای تأیید برگشت روند، منبع CoinGecko market و شناسه تاریخی ارز لازم است.")
+            ath_view = ath_view.iloc[0:0].copy()
+        else:
+            st.caption("فقط ارزهایی در فهرست فرصت بازیابی می‌مانند که در ۳ روز کامل اخیر بازده مثبت و شیب قیمت مثبت داشته باشند؛ ارزهای با روند نزولی یا بدون تأیید حذف می‌شوند.")
+            if st.button("🔎 بررسی برگشت روند ارزهای زیر ATH", type="primary", key="scan_ath_recovery_trend"):
+                trend_universe = ath_view.copy()
+                trend_universe["_scan_volume"] = numeric(trend_universe["Volume_24h"]).fillna(0)
+                trend_universe = trend_universe.sort_values("_scan_volume", ascending=False).head(40)
+                trend_rows, trend_errors = [], 0
+                def _scan_ath_trend(row):
+                    hist = fetch_history(str(row["CoinGecko_ID"]), currency, 30, cg_key)
+                    trend = analyze_recent_recovery_trend(hist, lookback_days=7)
+                    if trend:
+                        return {"CoinGecko_ID": row["CoinGecko_ID"], **trend}
+                    return None
+                with st.spinner(f"در حال بررسی روند روزانه {len(trend_universe)} ارز نقدشونده..."):
+                    with ThreadPoolExecutor(max_workers=4) as pool:
+                        futures = [pool.submit(_scan_ath_trend, row) for _, row in trend_universe.iterrows()]
+                        for future in futures:
+                            try:
+                                item = future.result()
+                                if item:
+                                    trend_rows.append(item)
+                            except Exception:
+                                trend_errors += 1
+                st.session_state["ath_recovery_trend_results"] = pd.DataFrame(trend_rows)
+                st.session_state["ath_recovery_trend_errors"] = trend_errors
+            trend_result = st.session_state.get("ath_recovery_trend_results")
+            if isinstance(trend_result, pd.DataFrame) and not trend_result.empty:
+                ath_view = ath_view.merge(trend_result, on="CoinGecko_ID", how="inner")
+                ath_view = ath_view[ath_view["Recovery_Trend_Eligible"].fillna(False)].copy()
+            else:
+                ath_view = ath_view.iloc[0:0].copy()
+                st.info("برای نمایش فرصت‌های بازیابی، دکمه بررسی برگشت روند را بزن. تا قبل از دریافت تاریخچه، هیچ ارزی به‌عنوان روند برگشتی تأیید نمی‌شود.")
+            if st.session_state.get("ath_recovery_trend_errors", 0):
+                st.caption(f"تعداد خطاهای دریافت تاریخچه: {st.session_state['ath_recovery_trend_errors']}؛ این ارزها بدون تأیید باقی مانده‌اند.")
+    if not ath_view.empty:
         # Recovery-screen score rewards a meaningful discount only when current activity/momentum exists.
         dd_score = (ath_view["ATH_Drawdown_Percent"].clip(10, 80) - 10) / 70 * 25
         momentum_7d = ath_view["Change_7d_Percent"].fillna(-15).clip(-15, 20)
@@ -2146,7 +2226,8 @@ if section == "📊 نمودارها و ریزش‌ها":
         turnover = (ath_view["Volume_24h"].fillna(0) / ath_view["Market_Cap"].replace(0, np.nan)).fillna(0)
         activity_score = (turnover.clip(0, 0.30) / 0.30 * 20)
         pump_score = numeric(ath_view["PrePump_Score"]).fillna(40).clip(0, 100) / 100 * 20
-        ath_view["Recovery_Screen_Score"] = (dd_score + momentum_score + daily_score + activity_score + pump_score).clip(0, 100).round(1)
+        trend_bonus = (ath_view["Recent_3d_Change_Percent"].clip(0, 8) / 8 * 10)
+        ath_view["Recovery_Screen_Score"] = (dd_score + momentum_score + daily_score + activity_score + pump_score + trend_bonus).clip(0, 100).round(1)
         ath_view["Recovery_Screen_Status"] = np.select(
             [
                 (ath_view["Recovery_Screen_Score"] >= 70) & (ath_view["Change_7d_Percent"] > 0),
@@ -2157,13 +2238,15 @@ if section == "📊 نمودارها و ریزش‌ها":
             default="فقط فاصله از سقف؛ تأیید ناکافی",
         )
         ath_view = ath_view.sort_values(["Recovery_Screen_Score", "Change_7d_Percent"], ascending=[False, False]).head(40)
-        ath_cols = ["Coin", "Symbol", "Price", "ATH_Price", "ATH_Date", "ATH_Drawdown_Percent", "Gain_Needed_To_ATH_Percent", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Recovery_Screen_Score", "Recovery_Screen_Status"]
+        ath_cols = ["Coin", "Symbol", "Price", "ATH_Price", "ATH_Date", "ATH_Drawdown_Percent", "Gain_Needed_To_ATH_Percent", "Change_24h_Percent", "Change_7d_Percent", "Recent_3d_Change_Percent", "Recent_3d_Slope_Percent", "Trend_Last_Date", "Volume_24h", "Recovery_Screen_Score", "Recovery_Trend_Status", "Recovery_Screen_Status"]
         ath_display = ath_view[[c for c in ath_cols if c in ath_view.columns]].rename(columns={
             "Coin": "ارز", "Symbol": "نماد", "Price": "قیمت فعلی", "ATH_Price": "قیمت سقف تاریخی",
             "ATH_Date": "تاریخ سقف تاریخی", "ATH_Drawdown_Percent": "فاصله از سقف (%)",
             "Gain_Needed_To_ATH_Percent": "رشد لازم تا سقف (%)", "Change_24h_Percent": "تغییر ۲۴ساعته (%)",
-            "Change_7d_Percent": "تغییر ۷روزه (%)", "Volume_24h": "حجم ۲۴ساعته (USD)",
-            "Recovery_Screen_Score": "امتیاز بررسی برگشت / ۱۰۰", "Recovery_Screen_Status": "وضعیت بررسی",
+            "Change_7d_Percent": "تغییر ۷روزه (%)", "Recent_3d_Change_Percent": "تغییر ۳ روز اخیر (%)",
+            "Recent_3d_Slope_Percent": "شیب روند ۳ روزه (%)", "Trend_Last_Date": "آخرین روز بررسی‌شده",
+            "Volume_24h": "حجم ۲۴ساعته (USD)", "Recovery_Screen_Score": "امتیاز بررسی برگشت / ۱۰۰",
+            "Recovery_Trend_Status": "وضعیت روند کوتاه‌مدت", "Recovery_Screen_Status": "وضعیت بررسی",
         })
         st.dataframe(ath_display, use_container_width=True, hide_index=True, column_config={
             "قیمت فعلی": st.column_config.NumberColumn(format="$%.8g"),
@@ -2172,12 +2255,17 @@ if section == "📊 نمودارها و ریزش‌ها":
             "رشد لازم تا سقف (%)": st.column_config.NumberColumn(format="%.1f%%"),
             "تغییر ۲۴ساعته (%)": st.column_config.NumberColumn(format="%.2f%%"),
             "تغییر ۷روزه (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "تغییر ۳ روز اخیر (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "شیب روند ۳ روزه (%)": st.column_config.NumberColumn(format="%.3f%%"),
             "حجم ۲۴ساعته (USD)": st.column_config.NumberColumn(format="$%.0f"),
             "امتیاز بررسی برگشت / ۱۰۰": st.column_config.NumberColumn(format="%.1f"),
         })
-        st.caption("فیلتر اولیه: افت ۱۰ تا ۹۵ درصد از ATH، ارزش بازار حداقل ۱ میلیون دلار و حجم ۲۴ساعته حداقل ۵۰ هزار دلار. ارزهای کم‌فعال/بسیار فروپاشیده حذف می‌شوند. برای نمونه، افت ۸۰٪ به معنی نیاز به رشد ۴۰۰٪ برای بازگشت به سقف است؛ درصد رشد لازم با درصد افت برابر نیست.")
+        st.caption("فیلتر اولیه: افت ۱۰ تا ۹۵ درصد از ATH، ارزش بازار حداقل ۱ میلیون دلار و حجم ۲۴ساعته حداقل ۵۰ هزار دلار. شرط روند: بازده ۳ روز کامل اخیر و شیب قیمت هر دو مثبت باشند؛ ارزهای نزولی یا بدون تأیید حذف می‌شوند. داده روز جاری ناقص است و در محاسبه وارد نمی‌شود. افت ۸۰٪ به معنی نیاز به رشد ۴۰۰٪ برای بازگشت به سقف است.")
     else:
-        st.info("در داده فعلی، ارزی که هم پایین‌تر از سقف تاریخی باشد و هم از فیلتر حداقل فعالیت و نقدشوندگی عبور کند پیدا نشد.")
+        if not st.session_state.get("ath_recovery_trend_results") is not None:
+            st.info("پس از اجرای اسکن روند، فقط ارزهایی نمایش داده می‌شوند که نزول آن‌ها در داده‌های روزانه برگشته باشد.")
+        else:
+            st.info("فعلاً ارزی که هم شرایط فاصله از ATH و نقدشوندگی را داشته باشد و هم برگشت صعودی ۳ روز اخیرش تأیید شود پیدا نشد؛ این بهتر از معرفی ارز نزولی به‌عنوان فرصت است.")
 
     # Alerts for sharp moves
     st.subheader("🔔 هشدار حرکت‌های غیرعادی بازار")

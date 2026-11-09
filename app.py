@@ -3139,11 +3139,24 @@ if section == "📊 نمودارها و ریزش‌ها":
     st.subheader("🏔️ رادار فاصله از سقف تاریخی با بررسی پتانسیل برگشت")
     st.caption("این جدول ارزهایی را جدا می‌کند که قیمت فعلی‌شان پایین‌تر از سقف تاریخی است؛ رتبه‌بندی فقط بر اساس فاصله از ATH نیست و فعالیت بازار و مومنتوم اخیر هم بررسی می‌شود. امتیاز، احتمال آماری یا وعده بازگشت به سقف نیست.")
     ath_view = df[~df["Is_Excluded_Asset"].fillna(False)].copy()
-    for _col in ["Price", "ATH_Price", "ATH_Change_Percent", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Market_Cap", "PrePump_Score"]:
+    # Normalize optional ATH fields: different market sources expose different schemas.
+    for _col in ["Price", "ATH_Price", "ATH_Change_Percent", "ATH_Drawdown_Percent", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Market_Cap", "PrePump_Score"]:
         if _col in ath_view.columns:
             ath_view[_col] = numeric(ath_view[_col])
-    # CoinGecko's ATH change is negative when price is below its historical high.
-    ath_view["ATH_Drawdown_Percent"] = (-ath_view["ATH_Change_Percent"]).clip(lower=0)
+    if "ATH_Drawdown_Percent" in ath_view.columns:
+        # Prefer an already calculated drawdown supplied by the market-data normalizer.
+        ath_view["ATH_Drawdown_Percent"] = ath_view["ATH_Drawdown_Percent"].clip(lower=0)
+    elif "ATH_Change_Percent" in ath_view.columns:
+        # CoinGecko's ATH change is negative when price is below its historical high.
+        ath_view["ATH_Drawdown_Percent"] = (-ath_view["ATH_Change_Percent"]).clip(lower=0)
+    elif {"Price", "ATH_Price"}.issubset(ath_view.columns):
+        # Fallback for sources that provide ATH price but not ATH change percentage.
+        ath_view["ATH_Drawdown_Percent"] = np.where(
+            (ath_view["Price"] > 0) & (ath_view["ATH_Price"] > ath_view["Price"]),
+            (1 - ath_view["Price"] / ath_view["ATH_Price"]) * 100, 0.0
+        )
+    else:
+        ath_view["ATH_Drawdown_Percent"] = np.nan
     ath_view["Gain_Needed_To_ATH_Percent"] = np.where(
         (ath_view["Price"] > 0) & (ath_view["ATH_Price"] > ath_view["Price"]),
         (ath_view["ATH_Price"] / ath_view["Price"] - 1) * 100, np.nan

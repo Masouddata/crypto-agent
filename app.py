@@ -970,6 +970,8 @@ def fetch_dex_search(query):
             "Pair": p.get("pairAddress", ""),
             "Token": base.get("name", ""),
             "Symbol": str(base.get("symbol", "")).upper(),
+            "Base_Token_Address": base.get("address", ""),
+            "Quote_Token_Address": quote.get("address", ""),
             "Price_USD": p.get("priceUsd"),
             "Change_5m_Percent": price_change.get("m5"),
             "Change_1h_Percent": price_change.get("h1"),
@@ -1028,6 +1030,50 @@ def fetch_dex_search(query):
     return df
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_gecko_hourly_candles(chain, pair_address):
+    """Return the two most recent CLOSED 1h candles for a DEX pool.
+
+    GeckoTerminal timestamps are candle-open UTC timestamps. The still-forming
+    current hour is deliberately excluded so a red/green live candle cannot
+    prematurely change the signal.
+    """
+    network_map = {
+        "ethereum": "eth", "eth": "eth",
+        "bsc": "bsc", "bnb": "bsc",
+        "solana": "solana",
+        "base": "base",
+        "arbitrum": "arbitrum", "optimism": "optimism",
+        "polygon": "polygon_pos", "polygon-pos": "polygon_pos",
+        "avalanche": "avax", "avax": "avax",
+        "fantom": "ftm", "cronos": "cro",
+        "linea": "linea", "zksync": "zksync",
+    }
+    network = network_map.get(str(chain or "").lower().strip())
+    if not network or not pair_address:
+        return None
+    url = f"https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pair_address}/ohlcv/hour"
+    payload = safe_get(
+        url, params={"aggregate": 1, "limit": 8, "currency": "usd", "token": "base"},
+        headers={"Accept": "application/json;version=20230203"}, timeout=15
+    )
+    candles = (((payload or {}).get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []
+    now_ts = int(time.time())
+    closed = []
+    for item in candles:
+        try:
+            ts, opn, high, low, close, volume = item[:6]
+            ts, opn, close = int(ts), float(opn), float(close)
+            if ts + 3600 <= now_ts and opn > 0 and close > 0:
+                closed.append({"timestamp": ts, "open": opn, "close": close,
+                               "volume": float(volume or 0),
+                               "color": "سبز" if close > opn else ("قرمز" if close < opn else "خنثی")})
+        except (TypeError, ValueError, IndexError):
+            continue
+    closed.sort(key=lambda x: x["timestamp"], reverse=True)
+    return closed[:2] if closed else None
+
+
 def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_000):
     """
     Screen the most liquid CoinGecko-listed assets using DEX Screener's native
@@ -1059,6 +1105,8 @@ def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_00
     )
     market_lookup = base.set_index("Symbol").to_dict("index")
     rows, errors, matched = [], 0, 0
+    used_pair_keys = set()
+    duplicate_pair_skipped = 0
 
     for symbol in symbols:
         pairs = results.get(symbol)
@@ -1080,7 +1128,21 @@ def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_00
         pairs = pairs[pairs["Liquidity_USD"].fillna(0) >= float(min_pair_liquidity)]
         if pairs.empty:
             continue
-        pair = pairs.sort_values("Liquidity_USD", ascending=False).iloc[0]
+        pairs = pairs.sort_values("Liquidity_USD", ascending=False)
+        pair = None
+        for _, candidate_pair in pairs.iterrows():
+            pair_key = (
+                str(candidate_pair.get("Chain", "")).lower().strip(),
+                str(candidate_pair.get("Pair", "")).lower().strip(),
+            )
+            if pair_key[1] and pair_key not in used_pair_keys:
+                pair = candidate_pair
+                used_pair_keys.add(pair_key)
+                break
+        if pair is None:
+            # A provider response must never reuse the same pool for another ticker.
+            duplicate_pair_skipped += 1
+            continue
         ch1 = pair.get("Change_1h_Percent")
         vol1 = pair.get("Volume_1h_USD")
         vol6 = pair.get("Volume_6h_USD")
@@ -1179,17 +1241,76 @@ def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_00
             "Hourly_Status": status,
             "Chain": pair.get("Chain", ""),
             "DEX": pair.get("DEX", ""),
+            "Pair_Address": pair.get("Pair", ""),
+            "Base_Token_Address": pair.get("Base_Token_Address", ""),
             "Pair_URL": pair.get("Pair_URL", ""),
+            "Last_Closed_1h_Candle": "بررسی نشده",
+            "Last_Closed_1h_Open": np.nan,
+            "Last_Closed_1h_Close": np.nan,
+            "Last_Closed_1h_Time_UTC": "",
+            "Previous_1h_Candle": "—",
         })
         matched += 1
 
     result = pd.DataFrame(rows)
     if not result.empty:
+        # GeckoTerminal's free public tier is rate-limited (~10 calls/min).
+        # Fetch candles only for the ten strongest preliminary candidates;
+        # all other rows are explicitly prevented from becoming candidates.
+        candle_eligible = result[result["Hourly_Status"].isin([
+            "نامزد اولیه؛ حجم و خرید تأیید نسبی", "زیر نظر؛ تأیید کامل نیست"
+        ])]
+        candle_check_idx = candle_eligible.sort_values(
+            ["Pump_1h_Score", "Volume_1h_vs_6h_Avg"], ascending=[False, False], na_position="last"
+        ).head(10).index.tolist()
+        candle_checked_count = 0
+        # No row may retain a candidate label until its closed candle is verified.
+        unchecked_candidate_mask = (
+            ~result.index.isin(candle_check_idx)
+            & result["Hourly_Status"].eq("نامزد اولیه؛ حجم و خرید تأیید نسبی")
+        )
+        result.loc[unchecked_candidate_mask, "Hourly_Status"] = "کندل بررسی نشد؛ کاندید نیست"
+        for idx in candle_check_idx:
+            row = result.loc[idx]
+            try:
+                candles = fetch_gecko_hourly_candles(row.get("Chain"), row.get("Pair_Address", ""))
+            except Exception:
+                candles = None
+            if not candles:
+                result.at[idx, "Hourly_Status"] = "کندل بررسی نشد؛ کاندید نیست"
+                result.at[idx, "Last_Closed_1h_Candle"] = "داده کندل در دسترس نیست"
+                continue
+            latest = candles[0]
+            candle_checked_count += 1
+            result.at[idx, "Last_Closed_1h_Candle"] = latest["color"]
+            result.at[idx, "Last_Closed_1h_Open"] = latest["open"]
+            result.at[idx, "Last_Closed_1h_Close"] = latest["close"]
+            result.at[idx, "Last_Closed_1h_Time_UTC"] = pd.to_datetime(latest["timestamp"], unit="s", utc=True).strftime("%Y-%m-%d %H:%M")
+            if len(candles) > 1:
+                result.at[idx, "Previous_1h_Candle"] = candles[1]["color"]
+            if latest["color"] != "سبز":
+                result.at[idx, "Hourly_Status"] = (
+                    "در انتظار تأیید؛ آخرین کندل قرمز" if latest["color"] == "قرمز"
+                    else "در انتظار تأیید؛ کندل خنثی"
+                )
+            elif row.get("Hourly_Status") == "نامزد اولیه؛ حجم و خرید تأیید نسبی":
+                result.at[idx, "Hourly_Status"] = "نامزد اولیه؛ کندل سبز تأیید شد"
+            elif row.get("Hourly_Status") == "زیر نظر؛ تأیید کامل نیست":
+                result.at[idx, "Hourly_Status"] = "زیر نظر؛ کندل سبز، شروط ناقص"
+
+        # Final safety invariant: the internal preliminary label must never reach the UI.
+        result.loc[
+            result["Hourly_Status"].eq("نامزد اولیه؛ حجم و خرید تأیید نسبی"),
+            "Hourly_Status"
+        ] = "کندل بررسی نشد؛ کاندید نیست"
         status_order = {
-            "نامزد اولیه؛ حجم و خرید تأیید نسبی": 0,
-            "زیر نظر؛ تأیید کامل نیست": 1,
-            "حرکت تند؛ احتمالاً دیرهنگام": 2,
-            "شرایط اولیه کافی نیست": 3,
+            "نامزد اولیه؛ کندل سبز تأیید شد": 0,
+            "زیر نظر؛ کندل سبز، شروط ناقص": 1,
+            "در انتظار تأیید؛ آخرین کندل قرمز": 2,
+            "در انتظار تأیید؛ کندل خنثی": 3,
+            "کندل بررسی نشد؛ کاندید نیست": 4,
+            "حرکت تند؛ احتمالاً دیرهنگام": 5,
+            "شرایط اولیه کافی نیست": 6,
         }
         result["_status_order"] = result["Hourly_Status"].map(status_order).fillna(9)
         result = result.sort_values(
@@ -1198,7 +1319,9 @@ def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_00
         ).drop(columns="_status_order").reset_index(drop=True)
     return result, {
         "checked": len(symbols), "errors": errors, "matched": matched,
+        "candle_checked": candle_checked_count if not result.empty else 0,
         "skipped": len(duplicate_symbols),
+        "duplicate_pair_skipped": duplicate_pair_skipped,
     }
 
 
@@ -2193,34 +2316,35 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
     # on every Streamlit rerun and uses DEX-reported hourly volume/transactions.
     st.markdown("### ⏱️ رادار شکار پامپ یک‌ساعته")
     st.caption(
-        "اولویت این جدول تایم‌فریم ۱ ساعته است: تغییر قیمت، حجم معامله‌شده واقعی در همان ساعت، "
-        "شتاب حجم نسبت به میانگین ۶ ساعت، و نسبت تعداد خرید به فروش. "
+        "علاوه بر حجم و نسبت خرید به فروش، آخرین کندل یک‌ساعته بسته‌شده از OHLCV جفت DEX بررسی می‌شود. "
+        "کندل قرمز یا داده کندل ناموجود اجازه صدور وضعیت کاندید اولیه نمی‌دهد. "
         "اسکن حداکثر ۳۰ ارز نقدشونده از فهرست CoinGecko را با جستجوی DEX Screener بررسی می‌کند؛ "
         "بنابراین پوشش آن فقط جفت‌های DEX پیدا‌شده است و نماینده کل معاملات صرافی‌های متمرکز نیست."
     )
     if data_source != "CoinGecko market":
         st.info("برای ساخت فهرست نمادهای بازار، منبع زنده CoinGecko market را انتخاب کن.")
     else:
-        if st.button("🚀 اجرای رادار یک‌ساعته (۳۰ ارز نقدشونده)", key="run_hourly_pump_radar", type="primary"):
+        if st.button("🚀 اجرای رادار یک‌ساعته (۳۰ ارز نقدشونده)", key="run_hourly_pump_radar_candle_v2", type="primary"):
             with st.spinner("در حال بررسی داده‌های یک‌ساعته DEX برای حداکثر ۳۰ ارز نقدشونده..."):
                 hourly_result, hourly_meta = scan_hourly_pump_radar(df, max_coins=30)
-            st.session_state["hourly_pump_radar_results"] = hourly_result
-            st.session_state["hourly_pump_radar_meta"] = hourly_meta
-            st.session_state["hourly_pump_radar_time"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
+            st.session_state["hourly_pump_radar_results_candle_v2"] = hourly_result
+            st.session_state["hourly_pump_radar_meta_candle_v2"] = hourly_meta
+            st.session_state["hourly_pump_radar_time_candle_v2"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        hourly_result = st.session_state.get("hourly_pump_radar_results")
+        hourly_result = st.session_state.get("hourly_pump_radar_results_candle_v2")
         if isinstance(hourly_result, pd.DataFrame):
-            meta = st.session_state.get("hourly_pump_radar_meta", {})
+            meta = st.session_state.get("hourly_pump_radar_meta_candle_v2", {})
             st.caption(
-                f"آخرین اسکن: {st.session_state.get('hourly_pump_radar_time', '—')} • "
+                f"آخرین اسکن: {st.session_state.get('hourly_pump_radar_time_candle_v2', '—')} • "
                 f"نمادهای بررسی‌شده: {meta.get('checked', 0)} • جفت‌های منطبق: {meta.get('matched', 0)} • "
+                f"بررسی کندل: {meta.get('candle_checked', 0)} جفت • جفت تکراری حذف‌شده: {meta.get('duplicate_pair_skipped', 0)} • "
                 f"خطاهای دریافت: {meta.get('errors', 0)}"
             )
             if hourly_result.empty:
                 st.warning("برای نمادهای بررسی‌شده جفت DEX با نقدشوندگی حداقل ۱۰۰ هزار دلار و داده یک‌ساعته کافی پیدا نشد.")
             else:
-                confirmed_1h = int(hourly_result["Hourly_Status"].eq("نامزد اولیه؛ حجم و خرید تأیید نسبی").sum())
-                watch_1h = int(hourly_result["Hourly_Status"].eq("زیر نظر؛ تأیید کامل نیست").sum())
+                confirmed_1h = int(hourly_result["Hourly_Status"].eq("نامزد اولیه؛ کندل سبز تأیید شد").sum())
+                watch_1h = int(hourly_result["Hourly_Status"].isin(["زیر نظر؛ کندل سبز، شروط ناقص", "در انتظار تأیید؛ آخرین کندل قرمز", "در انتظار تأیید؛ کندل خنثی", "کندل بررسی نشد؛ کاندید نیست"]).sum())
                 late_1h = int(hourly_result["Hourly_Status"].eq("حرکت تند؛ احتمالاً دیرهنگام").sum())
                 h1a, h1b, h1c = st.columns(3)
                 h1a.metric("نامزدهای اولیه", confirmed_1h)
@@ -2236,15 +2360,19 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                     "Liquidity_USD": "نقدشوندگی USD",
                     "Change_24h_Percent": "تغییر ۲۴ساعته٪",
                     "Pump_1h_Score": "امتیاز رادار ۱ساعته",
+                    "Last_Closed_1h_Candle": "آخرین کندل بسته‌شده ۱ساعته",
+                    "Last_Closed_1h_Time_UTC": "زمان کندل UTC",
+                    "Previous_1h_Candle": "کندل قبلی",
                     "Hourly_Status": "وضعیت", "Chain": "شبکه", "DEX": "صرافی غیرمتمرکز",
-                    "Pair_URL": "لینک جفت معاملاتی",
+                    "Base_Token_Address": "آدرس قرارداد توکن", "Pair_URL": "لینک جفت معاملاتی",
                 })
                 hourly_cols = [
                     "ارز", "نماد", "تغییر ۱ساعته٪", "حجم واقعی ۱ساعته USD",
                     "حجم ۱ساعته / میانگین ۶ساعته", "تعداد خرید ۱ساعته",
                     "تعداد فروش ۱ساعته", "سهم تعداد خرید٪", "نقدشوندگی USD",
+                    "آخرین کندل بسته‌شده ۱ساعته", "زمان کندل UTC", "کندل قبلی",
                     "تغییر ۲۴ساعته٪", "امتیاز رادار ۱ساعته", "وضعیت",
-                    "شبکه", "صرافی غیرمتمرکز", "لینک جفت معاملاتی",
+                    "شبکه", "صرافی غیرمتمرکز", "آدرس قرارداد توکن", "لینک جفت معاملاتی",
                 ]
                 hourly_cols = [c for c in hourly_cols if c in hourly_display.columns]
                 st.dataframe(
@@ -2252,6 +2380,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                     use_container_width=True, hide_index=True,
                     column_config={
                         "لینک جفت معاملاتی": st.column_config.LinkColumn("جفت در DEX Screener"),
+                    "آدرس قرارداد توکن": st.column_config.TextColumn("قرارداد توکن", help="برای تشخیص برخورد نمادها؛ قبل از معامله با منبع رسمی تطبیق بده."),
                         "تغییر ۱ساعته٪": st.column_config.NumberColumn(format="%.2f%%"),
                         "تغییر ۲۴ساعته٪": st.column_config.NumberColumn(format="%.2f%%"),
                         "حجم واقعی ۱ساعته USD": st.column_config.NumberColumn(format="$%.0f"),
@@ -2261,10 +2390,11 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                     },
                 )
                 st.caption(
-                    "نامزد اولیه یعنی حرکت ۱ساعته هنوز محدود است و هم‌زمان شتاب حجم، غلبه تعداد خرید، "
-                    "نقدشوندگی و حداقل فعالیت تأیید نسبی دارند. سهم خرید بر اساس تعداد معاملات است، نه دلار؛ "
+                    "نامزد اولیه فقط وقتی صادر می‌شود که آخرین کندل بسته‌شده ۱ساعته سبز باشد و هم‌زمان شتاب حجم، "
+                    "غلبه تعداد خرید، نقدشوندگی و حداقل فعالیت تأیید نسبی داشته باشند. حداکثر ۱۰ جفت برتر برای OHLCV بررسی می‌شوند؛ "
+                    "بقیه تا بررسی کندل کاندید محسوب نمی‌شوند. سهم خرید بر اساس تعداد معاملات است، نه دلار؛ "
                     "حجم ۱ساعته، حجم معامله‌شده گزارش‌شده توسط DEX است و ورود خالص پول یا خرید نهنگ را ثابت نمی‌کند. "
-                    "نمادها ممکن است در چند قرارداد تکرار شوند؛ قبل از هر تصمیم لینک و قرارداد را بررسی کن."
+                    "نمادها ممکن است در چند قرارداد تکرار شوند؛ یک جفت معاملاتی در این رادار به بیش از یک نماد اختصاص داده نمی‌شود. قبل از هر تصمیم لینک و قرارداد را بررسی کن."
                 )
         else:
             st.info("برای شروع، دکمه اجرای رادار یک‌ساعته را بزن. این اسکن خودکار در هر بار تازه‌سازی اجرا نمی‌شود تا درخواست API بی‌دلیل زیاد نشود.")

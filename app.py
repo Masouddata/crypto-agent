@@ -959,6 +959,8 @@ def fetch_dex_search(query):
         quote = p.get("quoteToken") or {}
         txns = p.get("txns") or {}
         h24 = txns.get("h24") or {}
+        h6 = txns.get("h6") or {}
+        h1 = txns.get("h1") or {}
         vol = p.get("volume") or {}
         liq = p.get("liquidity") or {}
         price_change = p.get("priceChange") or {}
@@ -973,8 +975,14 @@ def fetch_dex_search(query):
             "Change_1h_Percent": price_change.get("h1"),
             "Change_6h_Percent": price_change.get("h6"),
             "Change_24h_Percent": price_change.get("h24"),
+            "Volume_1h_USD": vol.get("h1"),
+            "Volume_6h_USD": vol.get("h6"),
             "Volume_24h_USD": vol.get("h24"),
             "Liquidity_USD": liq.get("usd"),
+            "Buys_1h": h1.get("buys"),
+            "Sells_1h": h1.get("sells"),
+            "Buys_6h": h6.get("buys"),
+            "Sells_6h": h6.get("sells"),
             "Buys_24h": h24.get("buys"),
             "Sells_24h": h24.get("sells"),
             "Pair_URL": p.get("url", ""),
@@ -983,7 +991,9 @@ def fetch_dex_search(query):
     df = pd.DataFrame(rows)
     if not df.empty:
         for c in ["Price_USD", "Change_5m_Percent", "Change_1h_Percent", "Change_6h_Percent",
-                  "Change_24h_Percent", "Volume_24h_USD", "Liquidity_USD", "Buys_24h", "Sells_24h"]:
+                  "Change_24h_Percent", "Volume_1h_USD", "Volume_6h_USD", "Volume_24h_USD",
+                  "Liquidity_USD", "Buys_1h", "Sells_1h", "Buys_6h", "Sells_6h",
+                  "Buys_24h", "Sells_24h"]:
             df[c] = numeric(df[c])
         # Simple DEX screening score, deliberately penalizes low liquidity.
         ch = df["Change_24h_Percent"].fillna(0).clip(-50, 100)
@@ -1016,6 +1026,180 @@ def fetch_dex_search(query):
                            np.where(liq < 200000, "Medium: check liquidity", "Review contract / market"))
         df = df.sort_values(["DEX_Screen_Score", "Liquidity_USD"], ascending=False, na_position="last")
     return df
+
+
+def scan_hourly_pump_radar(market_frame, max_coins=30, min_pair_liquidity=100_000):
+    """
+    Screen the most liquid CoinGecko-listed assets using DEX Screener's native
+    1h price change, 1h traded volume, and 1h buy/sell transaction counts.
+    This is DEX-pair coverage, not a complete CEX/all-market scan.
+    """
+    if market_frame is None or market_frame.empty or "Symbol" not in market_frame.columns:
+        return pd.DataFrame(), {"checked": 0, "errors": 0, "matched": 0, "skipped": 0}
+
+    base = mark_stablecoins(market_frame)
+    base = base[~base["Is_Excluded_Asset"].fillna(False)].copy()
+    for col in ["Volume_24h", "Market_Cap"]:
+        if col in base.columns:
+            base[col] = numeric(base[col])
+    base = base[base["Symbol"].notna()].copy()
+    base["Symbol"] = base["Symbol"].astype(str).str.upper().str.strip()
+    base = base[base["Symbol"].str.fullmatch(r"[A-Z0-9]{2,15}", na=False)]
+    # Avoid ambiguous ticker mappings: one symbol must identify only one market row.
+    duplicate_symbols = set(base.loc[base["Symbol"].duplicated(keep=False), "Symbol"])
+    base = base[~base["Symbol"].isin(duplicate_symbols)]
+    base = base.sort_values("Volume_24h", ascending=False, na_position="last").head(int(max_coins))
+    symbols = base["Symbol"].drop_duplicates().tolist()
+    if not symbols:
+        return pd.DataFrame(), {"checked": 0, "errors": 0, "matched": 0, "skipped": len(duplicate_symbols)}
+
+    jobs = {symbol: (symbol,) for symbol in symbols}
+    results = _run_parallel_jobs(
+        jobs, lambda symbol: fetch_dex_search(symbol), max_workers=4
+    )
+    market_lookup = base.set_index("Symbol").to_dict("index")
+    rows, errors, matched = [], 0, 0
+
+    for symbol in symbols:
+        pairs = results.get(symbol)
+        if isinstance(pairs, Exception):
+            errors += 1
+            continue
+        if not isinstance(pairs, pd.DataFrame) or pairs.empty:
+            continue
+        pairs = pairs[pairs["Symbol"].astype(str).str.upper().eq(symbol)].copy()
+        if pairs.empty:
+            continue
+        pairs["Liquidity_USD"] = numeric(pairs["Liquidity_USD"])
+        pairs["Volume_1h_USD"] = numeric(pairs.get("Volume_1h_USD", np.nan))
+        pairs["Volume_6h_USD"] = numeric(pairs.get("Volume_6h_USD", np.nan))
+        pairs["Change_1h_Percent"] = numeric(pairs["Change_1h_Percent"])
+        pairs["Buys_1h"] = numeric(pairs.get("Buys_1h", np.nan))
+        pairs["Sells_1h"] = numeric(pairs.get("Sells_1h", np.nan))
+        # Choose the deepest exact-ticker pair. Contract/pair URL remains visible for manual verification.
+        pairs = pairs[pairs["Liquidity_USD"].fillna(0) >= float(min_pair_liquidity)]
+        if pairs.empty:
+            continue
+        pair = pairs.sort_values("Liquidity_USD", ascending=False).iloc[0]
+        ch1 = pair.get("Change_1h_Percent")
+        vol1 = pair.get("Volume_1h_USD")
+        vol6 = pair.get("Volume_6h_USD")
+        buys = pair.get("Buys_1h")
+        sells = pair.get("Sells_1h")
+        liquidity = pair.get("Liquidity_USD")
+        txns = (buys if pd.notna(buys) else 0) + (sells if pd.notna(sells) else 0)
+        buy_share = (float(buys) / txns * 100) if txns > 0 and pd.notna(buys) else np.nan
+        volume_ratio = (
+            float(vol1) / (float(vol6) / 6.0)
+            if pd.notna(vol1) and pd.notna(vol6) and float(vol6) > 0 else np.nan
+        )
+
+        # Scores reward early positive movement + volume expansion + buyer dominance,
+        # while penalizing vertical/late moves and thin pairs.
+        if pd.isna(ch1):
+            momentum_score = np.nan
+        elif 0.2 <= ch1 <= 1.2:
+            momentum_score = 75.0
+        elif 1.2 < ch1 <= 2.5:
+            momentum_score = 100.0
+        elif 2.5 < ch1 <= 4.0:
+            momentum_score = 75.0
+        elif 4.0 < ch1 <= 6.0:
+            momentum_score = 40.0
+        elif ch1 > 6.0:
+            momentum_score = 10.0
+        elif ch1 >= 0:
+            momentum_score = 45.0
+        else:
+            momentum_score = 0.0
+
+        if pd.isna(volume_ratio):
+            volume_score = np.nan
+        elif volume_ratio >= 3.0:
+            volume_score = 100.0
+        elif volume_ratio >= 2.0:
+            volume_score = 85.0
+        elif volume_ratio >= 1.5:
+            volume_score = 70.0
+        elif volume_ratio >= 1.2:
+            volume_score = 55.0
+        else:
+            volume_score = 15.0
+
+        if pd.isna(buy_share):
+            buy_score = np.nan
+        elif buy_share >= 65:
+            buy_score = 100.0
+        elif buy_share >= 58:
+            buy_score = 85.0
+        elif buy_share >= 53:
+            buy_score = 70.0
+        elif buy_share >= 50:
+            buy_score = 50.0
+        else:
+            buy_score = 10.0
+
+        liquidity_score = (
+            100.0 if liquidity >= 1_000_000 else
+            85.0 if liquidity >= 500_000 else
+            70.0 if liquidity >= 200_000 else 30.0
+        )
+        components = [(momentum_score, 0.30), (volume_score, 0.30),
+                     (buy_score, 0.25), (liquidity_score, 0.15)]
+        available = [(v, w) for v, w in components if pd.notna(v)]
+        score = sum(v * w for v, w in available) / sum(w for _, w in available) if available else np.nan
+
+        if pd.notna(ch1) and ch1 > 6:
+            status = "حرکت تند؛ احتمالاً دیرهنگام"
+        elif (pd.notna(score) and score >= 75 and pd.notna(ch1) and 0.2 <= ch1 <= 4.0
+              and pd.notna(volume_ratio) and volume_ratio >= 1.5
+              and pd.notna(buy_share) and buy_share >= 55
+              and liquidity >= 200_000 and txns >= 10):
+            status = "نامزد اولیه؛ حجم و خرید تأیید نسبی"
+        elif (pd.notna(score) and score >= 58 and pd.notna(ch1) and 0 <= ch1 <= 5.0
+              and liquidity >= 100_000 and txns >= 5):
+            status = "زیر نظر؛ تأیید کامل نیست"
+        else:
+            status = "شرایط اولیه کافی نیست"
+
+        market_row = market_lookup.get(symbol, {})
+        rows.append({
+            "Coin": market_row.get("Coin", pair.get("Token", symbol)),
+            "Symbol": symbol,
+            "Change_1h_Percent": ch1,
+            "Volume_1h_USD": vol1,
+            "Volume_1h_vs_6h_Avg": volume_ratio,
+            "Buys_1h": buys,
+            "Sells_1h": sells,
+            "Transactions_1h": txns,
+            "Buy_Count_Share_1h": buy_share,
+            "Liquidity_USD": liquidity,
+            "Change_24h_Percent": market_row.get("Change_24h_Percent", np.nan),
+            "Pump_1h_Score": round(float(score), 1) if pd.notna(score) else np.nan,
+            "Hourly_Status": status,
+            "Chain": pair.get("Chain", ""),
+            "DEX": pair.get("DEX", ""),
+            "Pair_URL": pair.get("Pair_URL", ""),
+        })
+        matched += 1
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        status_order = {
+            "نامزد اولیه؛ حجم و خرید تأیید نسبی": 0,
+            "زیر نظر؛ تأیید کامل نیست": 1,
+            "حرکت تند؛ احتمالاً دیرهنگام": 2,
+            "شرایط اولیه کافی نیست": 3,
+        }
+        result["_status_order"] = result["Hourly_Status"].map(status_order).fillna(9)
+        result = result.sort_values(
+            ["_status_order", "Pump_1h_Score", "Volume_1h_vs_6h_Avg"],
+            ascending=[True, False, False], na_position="last"
+        ).drop(columns="_status_order").reset_index(drop=True)
+    return result, {
+        "checked": len(symbols), "errors": errors, "matched": matched,
+        "skipped": len(duplicate_symbols),
+    }
 
 
 # =========================================================
@@ -2004,6 +2188,87 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
     st.divider()
     st.subheader("🛰️ فرصت‌های احتمالی پیش از رشد")
     st.caption("استیبل‌کوین‌ها حذف شده‌اند. سیگنال معتبر نیازمند خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه، نقدشوندگی مناسب و بازار BTC غیرنزولی است. درصد پوشش نشان می‌دهد چه مقدار از هفت عامل واقعاً داده داشته‌اند.")
+
+    # Dedicated 1-hour early-pump radar. It is on-demand to avoid 30 API calls
+    # on every Streamlit rerun and uses DEX-reported hourly volume/transactions.
+    st.markdown("### ⏱️ رادار شکار پامپ یک‌ساعته")
+    st.caption(
+        "اولویت این جدول تایم‌فریم ۱ ساعته است: تغییر قیمت، حجم معامله‌شده واقعی در همان ساعت، "
+        "شتاب حجم نسبت به میانگین ۶ ساعت، و نسبت تعداد خرید به فروش. "
+        "اسکن حداکثر ۳۰ ارز نقدشونده از فهرست CoinGecko را با جستجوی DEX Screener بررسی می‌کند؛ "
+        "بنابراین پوشش آن فقط جفت‌های DEX پیدا‌شده است و نماینده کل معاملات صرافی‌های متمرکز نیست."
+    )
+    if data_source != "CoinGecko market":
+        st.info("برای ساخت فهرست نمادهای بازار، منبع زنده CoinGecko market را انتخاب کن.")
+    else:
+        if st.button("🚀 اجرای رادار یک‌ساعته (۳۰ ارز نقدشونده)", key="run_hourly_pump_radar", type="primary"):
+            with st.spinner("در حال بررسی داده‌های یک‌ساعته DEX برای حداکثر ۳۰ ارز نقدشونده..."):
+                hourly_result, hourly_meta = scan_hourly_pump_radar(df, max_coins=30)
+            st.session_state["hourly_pump_radar_results"] = hourly_result
+            st.session_state["hourly_pump_radar_meta"] = hourly_meta
+            st.session_state["hourly_pump_radar_time"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        hourly_result = st.session_state.get("hourly_pump_radar_results")
+        if isinstance(hourly_result, pd.DataFrame):
+            meta = st.session_state.get("hourly_pump_radar_meta", {})
+            st.caption(
+                f"آخرین اسکن: {st.session_state.get('hourly_pump_radar_time', '—')} • "
+                f"نمادهای بررسی‌شده: {meta.get('checked', 0)} • جفت‌های منطبق: {meta.get('matched', 0)} • "
+                f"خطاهای دریافت: {meta.get('errors', 0)}"
+            )
+            if hourly_result.empty:
+                st.warning("برای نمادهای بررسی‌شده جفت DEX با نقدشوندگی حداقل ۱۰۰ هزار دلار و داده یک‌ساعته کافی پیدا نشد.")
+            else:
+                confirmed_1h = int(hourly_result["Hourly_Status"].eq("نامزد اولیه؛ حجم و خرید تأیید نسبی").sum())
+                watch_1h = int(hourly_result["Hourly_Status"].eq("زیر نظر؛ تأیید کامل نیست").sum())
+                late_1h = int(hourly_result["Hourly_Status"].eq("حرکت تند؛ احتمالاً دیرهنگام").sum())
+                h1a, h1b, h1c = st.columns(3)
+                h1a.metric("نامزدهای اولیه", confirmed_1h)
+                h1b.metric("زیر نظر", watch_1h)
+                h1c.metric("حرکت‌های احتمالاً دیرهنگام", late_1h)
+                hourly_display = hourly_result.rename(columns={
+                    "Coin": "ارز", "Symbol": "نماد", "Change_1h_Percent": "تغییر ۱ساعته٪",
+                    "Volume_1h_USD": "حجم واقعی ۱ساعته USD",
+                    "Volume_1h_vs_6h_Avg": "حجم ۱ساعته / میانگین ۶ساعته",
+                    "Buys_1h": "تعداد خرید ۱ساعته", "Sells_1h": "تعداد فروش ۱ساعته",
+                    "Transactions_1h": "کل معاملات ۱ساعته",
+                    "Buy_Count_Share_1h": "سهم تعداد خرید٪",
+                    "Liquidity_USD": "نقدشوندگی USD",
+                    "Change_24h_Percent": "تغییر ۲۴ساعته٪",
+                    "Pump_1h_Score": "امتیاز رادار ۱ساعته",
+                    "Hourly_Status": "وضعیت", "Chain": "شبکه", "DEX": "صرافی غیرمتمرکز",
+                    "Pair_URL": "لینک جفت معاملاتی",
+                })
+                hourly_cols = [
+                    "ارز", "نماد", "تغییر ۱ساعته٪", "حجم واقعی ۱ساعته USD",
+                    "حجم ۱ساعته / میانگین ۶ساعته", "تعداد خرید ۱ساعته",
+                    "تعداد فروش ۱ساعته", "سهم تعداد خرید٪", "نقدشوندگی USD",
+                    "تغییر ۲۴ساعته٪", "امتیاز رادار ۱ساعته", "وضعیت",
+                    "شبکه", "صرافی غیرمتمرکز", "لینک جفت معاملاتی",
+                ]
+                hourly_cols = [c for c in hourly_cols if c in hourly_display.columns]
+                st.dataframe(
+                    hourly_display[hourly_cols].head(30),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "لینک جفت معاملاتی": st.column_config.LinkColumn("جفت در DEX Screener"),
+                        "تغییر ۱ساعته٪": st.column_config.NumberColumn(format="%.2f%%"),
+                        "تغییر ۲۴ساعته٪": st.column_config.NumberColumn(format="%.2f%%"),
+                        "حجم واقعی ۱ساعته USD": st.column_config.NumberColumn(format="$%.0f"),
+                        "نقدشوندگی USD": st.column_config.NumberColumn(format="$%.0f"),
+                        "سهم تعداد خرید٪": st.column_config.NumberColumn(format="%.1f%%"),
+                        "امتیاز رادار ۱ساعته": st.column_config.NumberColumn(format="%.1f"),
+                    },
+                )
+                st.caption(
+                    "نامزد اولیه یعنی حرکت ۱ساعته هنوز محدود است و هم‌زمان شتاب حجم، غلبه تعداد خرید، "
+                    "نقدشوندگی و حداقل فعالیت تأیید نسبی دارند. سهم خرید بر اساس تعداد معاملات است، نه دلار؛ "
+                    "حجم ۱ساعته، حجم معامله‌شده گزارش‌شده توسط DEX است و ورود خالص پول یا خرید نهنگ را ثابت نمی‌کند. "
+                    "نمادها ممکن است در چند قرارداد تکرار شوند؛ قبل از هر تصمیم لینک و قرارداد را بررسی کن."
+                )
+        else:
+            st.info("برای شروع، دکمه اجرای رادار یک‌ساعته را بزن. این اسکن خودکار در هر بار تازه‌سازی اجرا نمی‌شود تا درخواست API بی‌دلیل زیاد نشود.")
+
     if not filtered.empty:
         if "Volume_24h_vs_7d_Avg" not in filtered.columns:
             filtered["Volume_24h_vs_7d_Avg"] = np.nan

@@ -1,6 +1,9 @@
 import os
 import time
 import threading
+import re
+import html
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from requests.adapters import HTTPAdapter
@@ -731,34 +734,103 @@ def fetch_history(coin_id, currency, days, api_key):
     return prices.dropna(subset=["price"])
 
 
-@st.cache_data(ttl=180, show_spinner=False)
-def fetch_news(currency_api_key, coin_symbol=None):
-    if not currency_api_key:
-        return pd.DataFrame(), "No CryptoPanic API key configured"
-    params = {"auth_token": currency_api_key, "public": "true", "kind": "news"}
-    if coin_symbol:
-        params["currencies"] = str(coin_symbol).lower()
+@st.cache_data(ttl=86400, show_spinner=False)
+def translate_news_to_persian(text):
+    """Translate one short news item via MyMemory; return empty string on failure."""
+    original = str(text or "").strip()
+    if not original:
+        return ""
+    # Already Persian: avoid spending the free translation quota.
+    if re.search(r"[\u0600-\u06FF]", original):
+        return original
     try:
-        payload = safe_get(NEWS_API, params=params, timeout=20)
-        results = payload.get("results", [])
-        rows = []
-        for item in results:
-            votes = item.get("votes") or {}
-            title = item.get("title", "")
-            rows.append({
-                "Published": item.get("published_at"),
-                "Title": title,
-                "Source": (item.get("source") or {}).get("title", ""),
-                "Currencies": ", ".join(
-                    (c.get("code", "") for c in (item.get("currencies") or []))
-                ),
-                "Positive_Votes": votes.get("positive", 0),
-                "Negative_Votes": votes.get("negative", 0),
-                "URL": item.get("url", ""),
-            })
-        return pd.DataFrame(rows), "ok"
-    except Exception as exc:
-        return pd.DataFrame(), str(exc)
+        response = _http_session().get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": original[:480], "langpair": "en|fa"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        translated = ((payload.get("responseData") or {}).get("translatedText") or "").strip()
+        translated = html.unescape(translated)
+        if translated and not translated.lower().startswith("query length"):
+            return translated
+    except Exception:
+        pass
+    return ""
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_news(currency_api_key="", coin_symbol=None):
+    """Prefer CryptoPanic when keyed; otherwise use public publisher RSS feeds."""
+    rows = []
+    if currency_api_key:
+        try:
+            params = {"auth_token": currency_api_key, "public": "true", "kind": "news"}
+            if coin_symbol and str(coin_symbol).upper() != "ALL":
+                params["currencies"] = str(coin_symbol).lower()
+            payload = safe_get(NEWS_API, params=params, timeout=20)
+            for item in payload.get("results", []) if isinstance(payload, dict) else []:
+                votes = item.get("votes") or {}
+                rows.append({
+                    "Published": item.get("published_at"), "Title": item.get("title", ""),
+                    "Summary": item.get("description", ""),
+                    "Source": (item.get("source") or {}).get("title", "CryptoPanic"),
+                    "Currencies": ", ".join(c.get("code", "") for c in (item.get("currencies") or [])),
+                    "Positive_Votes": votes.get("positive", 0), "Negative_Votes": votes.get("negative", 0),
+                    "URL": item.get("url", ""),
+                })
+            if rows:
+                return pd.DataFrame(rows), "CryptoPanic"
+        except Exception as exc:
+            keyed_error = str(exc)[:160]
+        else:
+            keyed_error = "CryptoPanic returned no articles; using public RSS fallback."
+    else:
+        keyed_error = "No CryptoPanic key; using public RSS sources."
+
+    feeds = [
+        ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+        ("Cointelegraph", "https://cointelegraph.com/rss"),
+        ("Decrypt", "https://decrypt.co/feed"),
+    ]
+    feed_errors = []
+    wanted = str(coin_symbol or "ALL").strip().upper()
+    for source, url in feeds:
+        try:
+            response = _http_session().get(url, timeout=15, headers={"Accept": "application/rss+xml, application/xml, text/xml"})
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            for node in root.iter():
+                if node.tag.split("}")[-1].lower() not in ("item", "entry"):
+                    continue
+                fields = {}
+                for child in list(node):
+                    key = child.tag.split("}")[-1].lower()
+                    value = "".join(child.itertext()).strip()
+                    if key == "link" and not value:
+                        value = child.attrib.get("href", "")
+                    fields[key] = value
+                title = fields.get("title", "").strip()
+                summary = re.sub(r"<[^>]+>", " ", fields.get("description", fields.get("summary", "")))
+                summary = re.sub(r"\s+", " ", summary).strip()
+                if not title:
+                    continue
+                if wanted not in ("", "ALL", "*", "MARKET"):
+                    searchable = f" {title} {summary} ".upper()
+                    if not re.search(rf"(?<![A-Z0-9]){re.escape(wanted)}(?![A-Z0-9])", searchable):
+                        continue
+                rows.append({"Published": fields.get("pubdate", fields.get("published", fields.get("updated", ""))),
+                             "Title": title, "Summary": summary[:500], "Source": source,
+                             "Currencies": wanted if wanted not in ("", "ALL", "*", "MARKET") else "Market",
+                             "Positive_Votes": 0, "Negative_Votes": 0, "URL": fields.get("link", "")})
+        except Exception as exc:
+            feed_errors.append(f"{source}: {str(exc)[:100]}")
+    if rows:
+        frame = pd.DataFrame(rows).drop_duplicates(subset=["Title"]).sort_values("Published", ascending=False, na_position="last")
+        return frame.head(40).reset_index(drop=True), f"Public RSS • {len(rows)} articles • {keyed_error}"
+    detail = " | ".join(feed_errors) if feed_errors else "No matching articles in the latest feed items."
+    return pd.DataFrame(), f"{keyed_error} RSS unavailable: {detail}"
 
 
 @st.cache_data(ttl=90, show_spinner=False)
@@ -1233,10 +1305,10 @@ with st.sidebar:
     st.divider()
     st.subheader("📰 اخبار بازار")
     news_key_input = st.text_input(
-        "کلید API اخبار (اختیاری)",
+        "کلید CryptoPanic (اختیاری)",
         value=secret_or_env("CRYPTOPANIC_API_KEY"),
         type="password",
-        help="Set CRYPTOPANIC_API_KEY in Streamlit secrets or enter it here for this session.",
+        help="بدون کلید هم خبرها از RSS عمومی CoinDesk، Cointelegraph و Decrypt دریافت می‌شوند.",
     )
     st.divider()
     st.subheader("🧪 جست‌وجوی صرافی‌های غیرمتمرکز")
@@ -1561,6 +1633,8 @@ if section == "🏠 نمای کلی":
     st.subheader("🌡️ دماسنج احساسات بازار")
     st.caption("دو شاخص مستقل برای سنجش جو بازار؛ مقدارها از ارائه‌دهنده دریافت می‌شوند و در صورت قطعی API عدد ساختگی نمایش داده نمی‌شود.")
     fg_col, alt_col = st.columns(2, gap="large")
+    fg_value = None
+    alt_value = None
     try:
         fg_history = fetch_fear_greed_history()
         fg_latest = fg_history.iloc[-1]
@@ -1708,6 +1782,37 @@ if section == "🏠 نمای کلی":
             avoid_count = int(df["Risk_Level"].astype(str).str.startswith("High").sum()) if "Risk_Level" in df.columns else 0
             report_parts.append(f"**فرصت‌های زیرنظر:** اسکنر {pre_count} مورد در وضعیت رصد پیش‌پامپ و {avoid_count} مورد با ریسک بالا شناسایی کرده است. رصد به معنی نقطه ورود نیست؛ شکست مقاومت و تثبیت همراه حجم لازم است.")
 
+        st.markdown("### 🧭 خلاصه تصمیم‌گیری بازار")
+        market_change = numeric(df.get("Change_24h_Percent", pd.Series(np.nan, index=df.index)))
+        median_change = market_change.median()
+        btc_rows = df[df.get("Symbol", pd.Series("", index=df.index)).astype(str).str.upper().eq("BTC")]
+        if not btc_rows.empty:
+            btc_row = btc_rows.iloc[0]
+            btc_24 = numeric(pd.Series([btc_row.get("Change_24h_Percent")])).iloc[0]
+            btc_7 = numeric(pd.Series([btc_row.get("Change_7d_Percent")])).iloc[0]
+            btc_text = f"بیت‌کوین: ۲۴ساعته {btc_24:+.2f}٪" if pd.notna(btc_24) else "بیت‌کوین: تغییر ۲۴ساعته ناموجود"
+            btc_text += f" و هفتگی {btc_7:+.2f}٪" if pd.notna(btc_7) else "؛ داده هفتگی ناموجود"
+        else:
+            btc_text = "داده بیت‌کوین در فهرست فعلی موجود نیست."
+        if pd.notna(median_change):
+            breadth_text = f"میانه تغییر ۲۴ساعته کل فهرست {median_change:+.2f}٪ است؛ "
+            breadth_text += "اکثریت بازار تمایل مثبت دارد." if market_valid and market_up / market_valid >= 0.60 else ("اکثریت بازار تمایل منفی دارد." if market_valid and market_up / market_valid <= 0.40 else "بازار جهت یکپارچه‌ای ندارد.")
+        else:
+            breadth_text = "برای محاسبه میانه تغییرات بازار داده کافی نداریم."
+        st.write(f"**وضعیت بیت‌کوین:** {btc_text}")
+        st.write(f"**گستردگی بازار:** {breadth_text}")
+        candidates = df[~df.get("Is_Excluded_Asset", pd.Series(False, index=df.index)).fillna(False)].copy()
+        if "PrePump_Score" in candidates.columns:
+            candidates["PrePump_Score"] = numeric(candidates["PrePump_Score"])
+            candidates = candidates[candidates["PrePump_Score"].notna()].sort_values("PrePump_Score", ascending=False)
+            if not candidates.empty:
+                top = candidates.head(3)
+                top_text = "، ".join(f"{r.get('Symbol','?')} ({float(r['PrePump_Score']):.0f}/100)" for _, r in top.iterrows())
+                st.write(f"**سه گزینه با امتیاز پیش‌پامپ بالاتر:** {top_text}؛ این‌ها فقط برای رصد هستند و بدون تأیید خرید واقعی/حجم، سیگنال ورود محسوب نمی‌شوند.")
+            else:
+                st.write("**فرصت پیش‌پامپ:** هنوز گزینه‌ای با امتیاز معتبر و داده کافی شناسایی نشده است.")
+        else:
+            st.write("**فرصت پیش‌پامپ:** امتیاز پیش‌پامپ در داده فعلی محاسبه نشده است.")
         for report_line in report_parts:
             st.markdown(report_line)
 
@@ -1912,8 +2017,18 @@ if section == "📊 نمودارها و ریزش‌ها":
     st.subheader("🔔 هشدار حرکت‌های غیرعادی بازار")
     alerts = df[(numeric(df["Change_24h_Percent"]).abs() >= 5) | (numeric(df["Change_7d_Percent"]).abs() >= 15)].copy()
     if not alerts.empty:
-        alerts = alerts.sort_values("Change_24h_Percent", ascending=False)
-        st.dataframe(alerts[["Coin", "Symbol", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Pump_Potential_Score", "Risk_Level"]].head(30), use_container_width=True, hide_index=True)
+        # Rank by pump/opportunity score first. When the score is zero or missing,
+        # use the 24h percentage move as the fallback ranking; 7d move breaks ties.
+        alerts["_alert_score"] = numeric(alerts["Pump_Potential_Score"]).fillna(0)
+        alerts["_alert_growth_24h"] = numeric(alerts["Change_24h_Percent"]).fillna(-float("inf"))
+        alerts["_alert_growth_7d"] = numeric(alerts["Change_7d_Percent"]).fillna(-float("inf"))
+        alerts = alerts.sort_values(
+            ["_alert_score", "_alert_growth_24h", "_alert_growth_7d"],
+            ascending=[False, False, False],
+            kind="mergesort",
+        )
+        alert_columns = ["Coin", "Symbol", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Pump_Potential_Score", "Risk_Level"]
+        st.dataframe(alerts[alert_columns].head(30), use_container_width=True, hide_index=True)
     else:
         st.info("No moves crossed the default alert thresholds.")
 
@@ -2049,24 +2164,69 @@ if section == "📰 اخبار و DEX":
     # News panel
     st.divider()
     st.subheader("📰 اخبار و عوامل بنیادی")
-    news_symbol = st.text_input("News currency code (e.g. BTC, ETH, SOL)", value="BTC").strip().upper()
-    if st.button("Fetch latest news"):
-        with st.spinner("Fetching news..."):
-            news_df, news_status = fetch_news(news_key_input, news_symbol or None)
-        if news_df.empty:
-            st.info(f"No news returned. {news_status}")
+    st.caption("خبرها بدون نیاز به کلید API از RSS رسانه‌های عمومی دریافت می‌شوند؛ در صورت واردکردن کلید، CryptoPanic در اولویت است.")
+    news_symbol = st.selectbox("محدوده خبر", ["ALL", "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"], index=0,
+                               format_func=lambda x: "کل بازار" if x == "ALL" else x)
+    fetch_news_clicked = st.button("🔄 دریافت آخرین اخبار و تحلیل بنیادی", type="primary", key="fetch_market_news")
+    if fetch_news_clicked or "news_feed_cache" not in st.session_state or st.session_state.get("news_feed_symbol") != news_symbol:
+        with st.spinner("در حال دریافت خبرهای بازار از منابع خبری..."):
+            loaded_news, loaded_status = fetch_news(news_key_input, news_symbol)
+        st.session_state["news_feed_cache"] = loaded_news
+        st.session_state["news_feed_status"] = loaded_status
+        st.session_state["news_feed_symbol"] = news_symbol
+    news_df = st.session_state.get("news_feed_cache", pd.DataFrame())
+    news_status = st.session_state.get("news_feed_status", "هنوز خبری دریافت نشده است.")
+    st.caption(f"وضعیت منبع: {news_status}")
+    if news_df is None or news_df.empty:
+        st.warning("در حال حاضر خبری از منابع انتخاب‌شده دریافت نشد. وضعیت اتصال و پیام منبع بالا را بررسی کن.")
+    else:
+        # Transparent headline keyword proxy; this is not trained NLP or fact-checking.
+        positive_terms = ("approval", "adoption", "partnership", "launch", "upgrade", "inflow", "bullish", "listing", "گسترش", "همکاری", "تایید", "تصویب", "رشد")
+        negative_terms = ("hack", "exploit", "lawsuit", "ban", "delist", "outflow", "bearish", "scam", "breach", "هک", "حمله", "شکایت", "ممنوع", "حذف", "کلاهبرداری", "ورشکستگی")
+        def headline_score(title):
+            t = str(title).lower()
+            return sum(w in t for w in positive_terms) - sum(w in t for w in negative_terms)
+        news_df = news_df.copy()
+        news_df["Sentiment"] = news_df["Title"].apply(headline_score).map(
+            lambda x: "مثبتِ کلمه‌محور" if x > 0 else ("منفیِ کلمه‌محور" if x < 0 else "خنثی / نامشخص")
+        )
+        scores = news_df["Title"].apply(headline_score)
+        pos_n, neg_n = int((scores > 0).sum()), int((scores < 0).sum())
+        n1, n2, n3 = st.columns(3)
+        n1.metric("تعداد خبرهای دریافتی", len(news_df))
+        n2.metric("تیترهای دارای واژه مثبت", pos_n)
+        n3.metric("تیترهای دارای واژه منفی", neg_n)
+        if pos_n > neg_n:
+            st.success("جمع‌بندی خبری: در تیترهای دریافت‌شده واژه‌های مثبت بیشتر دیده می‌شود؛ این برداشت اولیه است و باید متن خبر و منبع آن بررسی شود.")
+        elif neg_n > pos_n:
+            st.warning("جمع‌بندی خبری: تیترهای دارای واژه منفی بیشترند؛ ریسک خبرهای منفی را قبل از تصمیم بررسی کن.")
         else:
-            # Lightweight headline sentiment proxy; never represented as a trained sentiment model.
-            pos_words = ("approval", "adoption", "partnership", "launch", "upgrade", "inflow", "bullish", "listing")
-            neg_words = ("hack", "exploit", "lawsuit", "ban", "delist", "outflow", "bearish", "scam", "breach")
-            def headline_score(title):
-                t = str(title).lower()
-                return sum(w in t for w in pos_words) - sum(w in t for w in neg_words)
-            news_df["Headline_Sentiment_Proxy"] = news_df["Title"].apply(headline_score).map(
-                lambda x: "Positive keyword" if x > 0 else ("Negative keyword" if x < 0 else "Neutral / unclassified")
-            )
-            st.dataframe(news_df, use_container_width=True, hide_index=True)
-            st.caption("Headline sentiment is a simple keyword proxy, not a trained NLP model or a fact-check.")
+            st.info("جمع‌بندی خبری: تیترها از نظر واژه‌های مثبت و منفی برتری روشنی ندارند یا بخش زیادی از آن‌ها خنثی‌اند.")
+        # Translate the eight newest articles in one request per article; keep original titles visible.
+        news_df = news_df.copy().head(8)
+        translated_titles = []
+        translated_summaries = []
+        with st.spinner("در حال ترجمه تیترها و خلاصه خبرها به فارسی..."):
+            for _, article in news_df.iterrows():
+                title_en = str(article.get("Title", "") or "")
+                summary_en = str(article.get("Summary", "") or "")
+                combined = title_en[:190] + "\n---SUMMARY---\n" + summary_en[:240]
+                translated = translate_news_to_persian(combined)
+                if "---SUMMARY---" in translated:
+                    title_fa, summary_fa = translated.split("---SUMMARY---", 1)
+                    translated_titles.append(title_fa.strip() or title_en)
+                    translated_summaries.append(summary_fa.strip() or summary_en)
+                else:
+                    translated_titles.append(translated or title_en)
+                    translated_summaries.append(summary_en)
+        news_df["عنوان فارسی"] = translated_titles
+        news_df["خلاصه فارسی"] = translated_summaries
+        translated_count = sum(1 for fa, en in zip(translated_titles, news_df["Title"]) if fa and fa != en)
+        st.caption(f"ترجمه فارسی: {translated_count} از {len(news_df)} تیتر ترجمه شد؛ برای کنترل مصرف سرویس رایگان، حداکثر ۸ خبر تازه ترجمه می‌شود. در صورت اختلال، متن اصلی نمایش داده می‌شود.")
+        display_news = news_df.rename(columns={"Published": "زمان انتشار", "Title": "عنوان اصلی (انگلیسی)", "Summary": "خلاصه اصلی (انگلیسی)", "Source": "منبع", "Currencies": "ارز", "Sentiment": "برداشت اولیه", "URL": "لینک"})
+        keep_news = [c for c in ["زمان انتشار", "عنوان فارسی", "خلاصه فارسی", "عنوان اصلی (انگلیسی)", "منبع", "ارز", "برداشت اولیه", "لینک"] if c in display_news.columns]
+        st.dataframe(display_news[keep_news], use_container_width=True, hide_index=True, column_config={"لینک": st.column_config.LinkColumn("لینک خبر")})
+        st.caption("ترجمه با سرویس عمومی MyMemory انجام می‌شود و ممکن است خطا داشته باشد. برداشت مثبت/منفی فقط بر اساس واژه‌های تیتر است، نه تحلیل هوش مصنوعی یا راستی‌آزمایی خبر؛ اثر خبر بر قیمت قطعی نیست.")
 
     # DEX panel
     st.divider()

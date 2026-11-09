@@ -626,6 +626,44 @@ def calculate_pre_pump_score(frame):
     return out
 
 
+def weekly_uptrend_green_days_from_history(history, lookback_days=7):
+    """Find positive weekly price structure with at least one green completed UTC daily candle."""
+    if history is None or history.empty or not {"Time", "price"}.issubset(history.columns):
+        return None
+    frame = history[["Time", "price"]].copy().dropna()
+    frame["Time"] = pd.to_datetime(frame["Time"], utc=True, errors="coerce")
+    frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+    frame = frame.dropna().sort_values("Time").set_index("Time")
+    daily = frame["price"].resample("1D").agg(open="first", close="last").dropna()
+    today_utc = pd.Timestamp.now(tz="UTC").normalize()
+    daily = daily[daily.index < today_utc].tail(int(lookback_days))
+    if len(daily) < int(lookback_days):
+        return None
+
+    daily["green"] = daily["close"] > daily["open"]
+    first_open = float(daily.iloc[0]["open"])
+    last_close = float(daily.iloc[-1]["close"])
+    if first_open <= 0:
+        return None
+    weekly_change = (last_close / first_open - 1.0) * 100.0
+    closes = daily["close"].to_numpy(dtype=float)
+    slope = float(np.polyfit(np.arange(len(closes)), closes, 1)[0])
+    green_count = int(daily["green"].sum())
+
+    # Any strictly positive candle counts, including very small gains.
+    if weekly_change <= 0 or slope <= 0 or green_count < 1:
+        return None
+    return {
+        "Green_Days_7d": green_count,
+        "Weekly_Change_Percent": float(weekly_change),
+        "Trend_Slope_Per_Day": slope,
+        "First_Day": daily.index[0].strftime("%Y-%m-%d"),
+        "Last_Day": daily.index[-1].strftime("%Y-%m-%d"),
+        "Last_Daily_Close": last_close,
+    }
+
+
+
 # =========================================================
 # DATA SOURCES
 # =========================================================
@@ -2146,6 +2184,94 @@ if section == "📊 نمودارها و ریزش‌ها":
             st.info("در ۴۰ ارز نقدشونده بررسی‌شده، موردی با حداقل ۵ کندل سبز متوالی و بازده مثبت پیدا نشد.")
         if st.session_state.get("green_streak_scan_errors", 0):
             st.caption(f"تعداد {st.session_state['green_streak_scan_errors']} درخواست تاریخی با خطا یا محدودیت منبع روبه‌رو شد؛ بنابراین این اسکن پوشش کامل بازار نیست.")
+
+    # Weekly uptrend scan: positive 7-day structure and at least one green daily candle.
+    st.divider()
+    st.subheader("📈 ارزهای با روند صعودی در هفته اخیر و کندل سبز")
+    st.caption("حتی رشدهای بسیار کوچک هم پذیرفته می‌شوند: بازده کل ۷ روز باید مثبت، شیب روند صعودی و حداقل یک کندل روزانه سبز در ۷ روز کامل UTC وجود داشته باشد. فقط ۴۰ ارز نقدشونده‌تر بررسی می‌شوند.")
+    if data_source != "CoinGecko market" or "CoinGecko_ID" not in df.columns:
+        st.info("برای بررسی روند هفتگی، منبع داده CoinGecko market را انتخاب کن.")
+    else:
+        if st.button("🔎 اسکن روند صعودی هفتگی", type="primary", key="scan_weekly_uptrend_green"):
+            weekly_universe = df.copy()
+            if "Is_Excluded_Asset" in weekly_universe.columns:
+                weekly_universe = weekly_universe[~weekly_universe["Is_Excluded_Asset"].fillna(False)]
+            weekly_universe["_scan_volume"] = numeric(weekly_universe["Volume_24h"]).fillna(0)
+            weekly_universe = weekly_universe[
+                weekly_universe["CoinGecko_ID"].notna()
+            ].sort_values("_scan_volume", ascending=False).head(40)
+
+            weekly_found = []
+            weekly_errors = 0
+
+            def _scan_one_weekly_uptrend(row):
+                hist = fetch_history(str(row["CoinGecko_ID"]), currency, 30, cg_key)
+                result = weekly_uptrend_green_days_from_history(hist, lookback_days=7)
+                if result:
+                    return {
+                        "Coin": row.get("Coin", ""),
+                        "Symbol": row.get("Symbol", ""),
+                        **result,
+                        "Change_24h_Percent": row.get("Change_24h_Percent", np.nan),
+                        "Volume_24h": row.get("Volume_24h", np.nan),
+                    }
+                return None
+
+            with st.spinner(f"در حال بررسی روند هفتگی {len(weekly_universe)} ارز نقدشونده..."):
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    futures = [
+                        pool.submit(_scan_one_weekly_uptrend, row)
+                        for _, row in weekly_universe.iterrows()
+                    ]
+                    for future in futures:
+                        try:
+                            item = future.result()
+                            if item:
+                                weekly_found.append(item)
+                        except Exception:
+                            weekly_errors += 1
+
+            weekly_result_df = pd.DataFrame(weekly_found)
+            if not weekly_result_df.empty:
+                weekly_result_df = weekly_result_df.sort_values(
+                    ["Weekly_Change_Percent", "Green_Days_7d"],
+                    ascending=[False, False],
+                    kind="mergesort",
+                )
+            st.session_state["weekly_uptrend_green_results"] = weekly_result_df
+            st.session_state["weekly_uptrend_green_errors"] = weekly_errors
+
+        weekly_results = st.session_state.get("weekly_uptrend_green_results", pd.DataFrame())
+        if isinstance(weekly_results, pd.DataFrame) and not weekly_results.empty:
+            weekly_display = weekly_results.rename(columns={
+                "Coin": "ارز",
+                "Symbol": "نماد",
+                "Green_Days_7d": "تعداد کندل سبز در ۷ روز",
+                "Weekly_Change_Percent": "تغییر کل ۷ روز (%)",
+                "Trend_Slope_Per_Day": "شیب روند روزانه",
+                "First_Day": "اولین روز بررسی",
+                "Last_Day": "آخرین روز بررسی",
+                "Last_Daily_Close": "آخرین بسته‌شدن روزانه",
+                "Change_24h_Percent": "تغییر ۲۴ساعته (%)",
+                "Volume_24h": "حجم ۲۴ساعته",
+            })
+            st.dataframe(
+                weekly_display,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "تغییر کل ۷ روز (%)": st.column_config.NumberColumn(format="%.4f%%"),
+                    "تغییر ۲۴ساعته (%)": st.column_config.NumberColumn(format="%.4f%%"),
+                    "شیب روند روزانه": st.column_config.NumberColumn(format="%.8g"),
+                    "آخرین بسته‌شدن روزانه": st.column_config.NumberColumn(format="%.8g"),
+                    "حجم ۲۴ساعته": st.column_config.NumberColumn(format="$%.2f"),
+                },
+            )
+            st.success(f"{len(weekly_results)} ارز با روند صعودی هفتگی و حداقل یک کندل سبز پیدا شد.")
+        elif "weekly_uptrend_green_results" in st.session_state:
+            st.info("در ۴۰ ارز نقدشونده بررسی‌شده، موردی با شرایط روند صعودی هفتگی پیدا نشد.")
+        if st.session_state.get("weekly_uptrend_green_errors", 0):
+            st.caption(f"{st.session_state['weekly_uptrend_green_errors']} درخواست تاریخی با خطا یا محدودیت منبع روبه‌رو شد؛ پوشش اسکن کامل بازار نیست.")
 
     # Market chart
     chart_source = filtered if not filtered.empty else df.head(50)

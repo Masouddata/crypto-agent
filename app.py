@@ -3139,24 +3139,35 @@ if section == "📊 نمودارها و ریزش‌ها":
     st.subheader("🏔️ رادار فاصله از سقف تاریخی با بررسی پتانسیل برگشت")
     st.caption("این جدول ارزهایی را جدا می‌کند که قیمت فعلی‌شان پایین‌تر از سقف تاریخی است؛ رتبه‌بندی فقط بر اساس فاصله از ATH نیست و فعالیت بازار و مومنتوم اخیر هم بررسی می‌شود. امتیاز، احتمال آماری یا وعده بازگشت به سقف نیست.")
     ath_view = df[~df["Is_Excluded_Asset"].fillna(False)].copy()
-    # Normalize optional ATH fields: different market sources expose different schemas.
+    # Normalize optional ATH fields: market providers do not share one schema.
+    # Create absent columns explicitly so a provider omission never crashes the app.
     for _col in ["Price", "ATH_Price", "ATH_Change_Percent", "ATH_Drawdown_Percent", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Market_Cap", "PrePump_Score"]:
-        if _col in ath_view.columns:
-            ath_view[_col] = numeric(ath_view[_col])
-    if "ATH_Drawdown_Percent" in ath_view.columns:
-        # Prefer an already calculated drawdown supplied by the market-data normalizer.
+        if _col not in ath_view.columns:
+            ath_view[_col] = np.nan
+        ath_view[_col] = numeric(ath_view[_col])
+    if "ATH_Drawdown_Percent" in ath_view.columns and ath_view["ATH_Drawdown_Percent"].notna().any():
+        # Prefer a valid drawdown supplied by the market-data normalizer.
         ath_view["ATH_Drawdown_Percent"] = ath_view["ATH_Drawdown_Percent"].clip(lower=0)
-    elif "ATH_Change_Percent" in ath_view.columns:
-        # CoinGecko's ATH change is negative when price is below its historical high.
+    elif ath_view["ATH_Change_Percent"].notna().any():
+        # CoinGecko ATH change is negative below the historical high.
         ath_view["ATH_Drawdown_Percent"] = (-ath_view["ATH_Change_Percent"]).clip(lower=0)
-    elif {"Price", "ATH_Price"}.issubset(ath_view.columns):
-        # Fallback for sources that provide ATH price but not ATH change percentage.
+    elif ath_view["ATH_Price"].notna().any():
         ath_view["ATH_Drawdown_Percent"] = np.where(
             (ath_view["Price"] > 0) & (ath_view["ATH_Price"] > ath_view["Price"]),
-            (1 - ath_view["Price"] / ath_view["ATH_Price"]) * 100, 0.0
+            (1 - ath_view["Price"] / ath_view["ATH_Price"]) * 100, np.nan
         )
     else:
         ath_view["ATH_Drawdown_Percent"] = np.nan
+    # Reconstruct ATH price only when a valid drawdown/ATH-change value exists.
+    missing_ath_price = ath_view["ATH_Price"].isna() | (ath_view["ATH_Price"] <= 0)
+    valid_price = ath_view["Price"].notna() & (ath_view["Price"] > 0)
+    valid_drawdown = ath_view["ATH_Drawdown_Percent"].notna() & (ath_view["ATH_Drawdown_Percent"] >= 0) & (ath_view["ATH_Drawdown_Percent"] < 100)
+    reconstruct = missing_ath_price & valid_price & valid_drawdown
+    ath_view.loc[reconstruct, "ATH_Price"] = (
+        ath_view.loc[reconstruct, "Price"] / (1 - ath_view.loc[reconstruct, "ATH_Drawdown_Percent"] / 100)
+    )
+    if "ATH_Date" not in ath_view.columns:
+        ath_view["ATH_Date"] = np.nan
     ath_view["Gain_Needed_To_ATH_Percent"] = np.where(
         (ath_view["Price"] > 0) & (ath_view["ATH_Price"] > ath_view["Price"]),
         (ath_view["ATH_Price"] / ath_view["Price"] - 1) * 100, np.nan

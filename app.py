@@ -734,26 +734,86 @@ def fetch_history(coin_id, currency, days, api_key):
     return prices.dropna(subset=["price"])
 
 
+def green_candle_streak_from_history(history, min_days=5):
+    """Aggregate intraday market-chart samples into UTC daily candles and find green runs."""
+    if history is None or history.empty or not {"Time", "price"}.issubset(history.columns):
+        return None
+    frame = history[["Time", "price"]].copy().dropna()
+    if len(frame) < min_days:
+        return None
+    frame["Time"] = pd.to_datetime(frame["Time"], utc=True, errors="coerce")
+    frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+    frame = frame.dropna().sort_values("Time").set_index("Time")
+    daily = frame["price"].resample("1D").agg(open="first", close="last").dropna()
+    # Ignore today's unfinished candle so it cannot create a false green-day signal.
+    today_utc = pd.Timestamp.now(tz="UTC").normalize()
+    daily = daily[daily.index < today_utc]
+    if len(daily) < min_days:
+        return None
+    daily["green"] = daily["close"] > daily["open"]
+    runs = []
+    run_start = None
+    for i, is_green in enumerate(daily["green"].tolist()):
+        if is_green and run_start is None:
+            run_start = i
+        if run_start is not None and (not is_green or i == len(daily) - 1):
+            run_end = i - 1 if not is_green else i
+            run_len = run_end - run_start + 1
+            if run_len >= min_days:
+                first_open = float(daily.iloc[run_start]["open"])
+                last_close = float(daily.iloc[run_end]["close"])
+                run_closes = daily.iloc[run_start:run_end + 1]["close"].to_numpy(dtype=float)
+                trend_slope = float(np.polyfit(np.arange(len(run_closes)), run_closes, 1)[0]) if len(run_closes) >= 2 else 0.0
+                change_pct = (last_close / first_open - 1) * 100 if first_open else 0.0
+                if change_pct > 0 and trend_slope > 0:
+                    runs.append({
+                        "Green_Days": int(run_len),
+                        "Streak_Start": daily.index[run_start].strftime("%Y-%m-%d"),
+                        "Streak_End": daily.index[run_end].strftime("%Y-%m-%d"),
+                        "Streak_Change_Percent": float(change_pct),
+                        "Last_Daily_Close": last_close,
+                    })
+            run_start = None
+    return max(runs, key=lambda x: (x["Green_Days"], x["Streak_Change_Percent"])) if runs else None
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def translate_news_to_persian(text):
-    """Translate one short news item via MyMemory; return empty string on failure."""
+    """Translate short English news text to Persian; try two public services, fail safely."""
     original = str(text or "").strip()
     if not original:
         return ""
-    # Already Persian: avoid spending the free translation quota.
     if re.search(r"[\u0600-\u06FF]", original):
         return original
+
+    # First choice: MyMemory free endpoint.
     try:
         response = _http_session().get(
             "https://api.mymemory.translated.net/get",
             params={"q": original[:480], "langpair": "en|fa"},
-            timeout=10,
+            timeout=8,
         )
         response.raise_for_status()
         payload = response.json()
-        translated = ((payload.get("responseData") or {}).get("translatedText") or "").strip()
-        translated = html.unescape(translated)
-        if translated and not translated.lower().startswith("query length"):
+        translated = html.unescape(str((payload.get("responseData") or {}).get("translatedText") or "")).strip()
+        if re.search(r"[\u0600-\u06FF]", translated):
+            return translated
+    except Exception:
+        pass
+
+    # Fallback: Google Translate's public web endpoint. It is unofficial and may be rate-limited.
+    try:
+        response = _http_session().get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "auto", "tl": "fa", "dt": "t", "q": original[:480]},
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        chunks = payload[0] if isinstance(payload, list) and payload else []
+        translated = "".join(str(chunk[0]) for chunk in chunks if isinstance(chunk, list) and chunk and chunk[0])
+        translated = html.unescape(translated).strip()
+        if re.search(r"[\u0600-\u06FF]", translated):
             return translated
     except Exception:
         pass
@@ -2017,20 +2077,75 @@ if section == "📊 نمودارها و ریزش‌ها":
     st.subheader("🔔 هشدار حرکت‌های غیرعادی بازار")
     alerts = df[(numeric(df["Change_24h_Percent"]).abs() >= 5) | (numeric(df["Change_7d_Percent"]).abs() >= 15)].copy()
     if not alerts.empty:
-        # Rank by pump/opportunity score first. When the score is zero or missing,
-        # use the 24h percentage move as the fallback ranking; 7d move breaks ties.
-        alerts["_alert_score"] = numeric(alerts["Pump_Potential_Score"]).fillna(0)
-        alerts["_alert_growth_24h"] = numeric(alerts["Change_24h_Percent"]).fillna(-float("inf"))
-        alerts["_alert_growth_7d"] = numeric(alerts["Change_7d_Percent"]).fillna(-float("inf"))
+        # Restore the original alert ranking: highest 24h percentage move first.
         alerts = alerts.sort_values(
-            ["_alert_score", "_alert_growth_24h", "_alert_growth_7d"],
-            ascending=[False, False, False],
-            kind="mergesort",
+            "Change_24h_Percent", ascending=False, na_position="last", kind="mergesort"
         )
         alert_columns = ["Coin", "Symbol", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Pump_Potential_Score", "Risk_Level"]
         st.dataframe(alerts[alert_columns].head(30), use_container_width=True, hide_index=True)
     else:
         st.info("No moves crossed the default alert thresholds.")
+
+    # Multi-day consecutive green-candle scan (daily candles built from CoinGecko history).
+    st.divider()
+    st.subheader("🟢 ارزهای دارای حداقل ۵ روز متوالی کندل سبز")
+    st.caption("اسکن حداکثر ۴۰ ارز نقدشونده بر اساس داده تاریخی ۳۰ روزه؛ فقط روزهای کامل UTC شمرده می‌شوند. هر ردیف باید حداقل ۵ کندل روزانه سبزِ پی‌درپی و بازده مثبت در همان بازه داشته باشد.")
+    if data_source != "CoinGecko market" or "CoinGecko_ID" not in df.columns:
+        st.info("برای اسکن کندل‌های روزانه، منبع داده CoinGecko market را انتخاب کن.")
+    else:
+        if st.button("🔍 اسکن ارزهای با کندل سبز متوالی", type="primary", key="scan_green_streaks"):
+            scan_universe = df.copy()
+            if "Is_Excluded_Asset" in scan_universe.columns:
+                scan_universe = scan_universe[~scan_universe["Is_Excluded_Asset"].fillna(False)]
+            scan_universe["_scan_volume"] = numeric(scan_universe["Volume_24h"]).fillna(0)
+            scan_universe = scan_universe[scan_universe["CoinGecko_ID"].notna()].sort_values("_scan_volume", ascending=False).head(40)
+            found = []
+            errors = 0
+            def _scan_one_green(row):
+                hist = fetch_history(str(row["CoinGecko_ID"]), currency, 30, cg_key)
+                streak = green_candle_streak_from_history(hist, min_days=5)
+                if streak:
+                    return {
+                        "Coin": row.get("Coin", ""), "Symbol": row.get("Symbol", ""),
+                        "Green_Days": streak["Green_Days"],
+                        "Streak_Change_Percent": streak["Streak_Change_Percent"],
+                        "Streak_Start": streak["Streak_Start"], "Streak_End": streak["Streak_End"],
+                        "Last_Daily_Close": streak["Last_Daily_Close"],
+                        "Volume_24h": row.get("Volume_24h", np.nan),
+                    }
+                return None
+            with st.spinner(f"در حال بررسی کندل‌های روزانه {len(scan_universe)} ارز نقدشونده... ممکن است کمی زمان ببرد."):
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    futures = [pool.submit(_scan_one_green, row) for _, row in scan_universe.iterrows()]
+                    for future in futures:
+                        try:
+                            item = future.result()
+                            if item:
+                                found.append(item)
+                        except Exception:
+                            errors += 1
+            result_df = pd.DataFrame(found)
+            if not result_df.empty:
+                result_df = result_df.sort_values(["Green_Days", "Streak_Change_Percent"], ascending=[False, False])
+            st.session_state["green_streak_scan_results"] = result_df
+            st.session_state["green_streak_scan_errors"] = errors
+        green_results = st.session_state.get("green_streak_scan_results", pd.DataFrame())
+        if isinstance(green_results, pd.DataFrame) and not green_results.empty:
+            green_display = green_results.rename(columns={
+                "Coin": "ارز", "Symbol": "نماد", "Green_Days": "روز سبز متوالی",
+                "Streak_Change_Percent": "تغییر قیمت در دوره (%)",
+                "Streak_Start": "شروع دوره", "Streak_End": "پایان دوره",
+                "Last_Daily_Close": "آخرین بسته‌شدن روزانه", "Volume_24h": "حجم ۲۴ساعته",
+            })
+            st.dataframe(green_display, use_container_width=True, hide_index=True,
+                         column_config={"تغییر قیمت در دوره (%)": st.column_config.NumberColumn(format="%.2f%%"),
+                                        "آخرین بسته‌شدن روزانه": st.column_config.NumberColumn(format="%.8g"),
+                                        "حجم ۲۴ساعته": st.column_config.NumberColumn(format="$%.2f")})
+            st.success(f"{len(green_results)} ارز با حداقل ۵ کندل سبز متوالی و روند صعودی در همان دوره پیدا شد.")
+        elif "green_streak_scan_results" in st.session_state:
+            st.info("در ۴۰ ارز نقدشونده بررسی‌شده، موردی با حداقل ۵ کندل سبز متوالی و بازده مثبت پیدا نشد.")
+        if st.session_state.get("green_streak_scan_errors", 0):
+            st.caption(f"تعداد {st.session_state['green_streak_scan_errors']} درخواست تاریخی با خطا یا محدودیت منبع روبه‌رو شد؛ بنابراین این اسکن پوشش کامل بازار نیست.")
 
     # Market chart
     chart_source = filtered if not filtered.empty else df.head(50)
@@ -2202,7 +2317,8 @@ if section == "📰 اخبار و DEX":
             st.warning("جمع‌بندی خبری: تیترهای دارای واژه منفی بیشترند؛ ریسک خبرهای منفی را قبل از تصمیم بررسی کن.")
         else:
             st.info("جمع‌بندی خبری: تیترها از نظر واژه‌های مثبت و منفی برتری روشنی ندارند یا بخش زیادی از آن‌ها خنثی‌اند.")
-        # Translate the eight newest articles in one request per article; keep original titles visible.
+        # Translate titles and summaries independently; delimiter-based combined translation
+        # was unreliable because translation services sometimes modify/remove delimiters.
         news_df = news_df.copy().head(8)
         translated_titles = []
         translated_summaries = []
@@ -2210,23 +2326,18 @@ if section == "📰 اخبار و DEX":
             for _, article in news_df.iterrows():
                 title_en = str(article.get("Title", "") or "")
                 summary_en = str(article.get("Summary", "") or "")
-                combined = title_en[:190] + "\n---SUMMARY---\n" + summary_en[:240]
-                translated = translate_news_to_persian(combined)
-                if "---SUMMARY---" in translated:
-                    title_fa, summary_fa = translated.split("---SUMMARY---", 1)
-                    translated_titles.append(title_fa.strip() or title_en)
-                    translated_summaries.append(summary_fa.strip() or summary_en)
-                else:
-                    translated_titles.append(translated or title_en)
-                    translated_summaries.append(summary_en)
+                title_fa = translate_news_to_persian(title_en[:350]) if title_en else ""
+                summary_fa = translate_news_to_persian(summary_en[:350]) if summary_en else ""
+                translated_titles.append(title_fa or title_en)
+                translated_summaries.append(summary_fa or summary_en)
         news_df["عنوان فارسی"] = translated_titles
         news_df["خلاصه فارسی"] = translated_summaries
         translated_count = sum(1 for fa, en in zip(translated_titles, news_df["Title"]) if fa and fa != en)
-        st.caption(f"ترجمه فارسی: {translated_count} از {len(news_df)} تیتر ترجمه شد؛ برای کنترل مصرف سرویس رایگان، حداکثر ۸ خبر تازه ترجمه می‌شود. در صورت اختلال، متن اصلی نمایش داده می‌شود.")
+        st.caption(f"ترجمه فارسی: {translated_count} از {len(news_df)} تیتر ترجمه شد؛ MyMemory و در صورت نیاز Google Translate عمومی امتحان می‌شوند. حداکثر ۸ خبر تازه برای کنترل زمان و محدودیت سرویس ترجمه می‌شود؛ در صورت اختلال متن اصلی باقی می‌ماند.")
         display_news = news_df.rename(columns={"Published": "زمان انتشار", "Title": "عنوان اصلی (انگلیسی)", "Summary": "خلاصه اصلی (انگلیسی)", "Source": "منبع", "Currencies": "ارز", "Sentiment": "برداشت اولیه", "URL": "لینک"})
         keep_news = [c for c in ["زمان انتشار", "عنوان فارسی", "خلاصه فارسی", "عنوان اصلی (انگلیسی)", "منبع", "ارز", "برداشت اولیه", "لینک"] if c in display_news.columns]
         st.dataframe(display_news[keep_news], use_container_width=True, hide_index=True, column_config={"لینک": st.column_config.LinkColumn("لینک خبر")})
-        st.caption("ترجمه با سرویس عمومی MyMemory انجام می‌شود و ممکن است خطا داشته باشد. برداشت مثبت/منفی فقط بر اساس واژه‌های تیتر است، نه تحلیل هوش مصنوعی یا راستی‌آزمایی خبر؛ اثر خبر بر قیمت قطعی نیست.")
+        st.caption("ترجمه از سرویس‌های عمومی رایگان انجام می‌شود و ممکن است محدود یا نادقیق باشد. برداشت مثبت/منفی فقط بر اساس واژه‌های تیتر است، نه تحلیل هوش مصنوعی یا راستی‌آزمایی خبر؛ اثر خبر بر قیمت قطعی نیست.")
 
     # DEX panel
     st.divider()

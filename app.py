@@ -1030,30 +1030,50 @@ def fetch_okx_spot_symbols():
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_okx_hourly_closes(inst_id, limit=721):
-    """Fetch up to 721 completed hourly OKX candles, paging backwards as needed."""
+    """Fetch completed hourly OKX candles: recent endpoint first, then history pages."""
     collected = {}
-    before = None
-    for _ in range(4):
-        params = {"instId": str(inst_id), "bar": "1H", "limit": "300"}
-        if before is not None:
-            params["after"] = str(before)
-        payload = safe_get("https://www.okx.com/api/v5/market/history-candles", params=params, timeout=20)
-        if not isinstance(payload, dict) or payload.get("code") != "0":
-            raise RuntimeError((payload or {}).get("msg", "OKX candle response invalid"))
-        rows = payload.get("data", [])
-        if not rows:
-            break
-        for item in rows:
-            # OKX: ts, open, high, low, close, volume, volCcy, volCcyQuote, confirm
+
+    def add_rows(rows):
+        for item in rows or []:
+            # OKX candle: ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm
             if len(item) >= 9 and str(item[8]) == "1":
                 try:
                     collected[int(item[0])] = float(item[4])
                 except (TypeError, ValueError):
                     continue
-        oldest = min(int(item[0]) for item in rows)
-        if len(collected) >= int(limit) or before == oldest:
+
+    # The regular candles endpoint supplies the most recent candles (including
+    # the latest ~2 days); history-candles is for paging farther back.
+    recent = safe_get(
+        "https://www.okx.com/api/v5/market/candles",
+        params={"instId": str(inst_id), "bar": "1H", "limit": "300"}, timeout=20,
+    )
+    if not isinstance(recent, dict) or recent.get("code") != "0":
+        raise RuntimeError((recent or {}).get("msg", "OKX recent candles response invalid"))
+    add_rows(recent.get("data", []))
+
+    # OKX history-candles has a per-request limit of 100. The `after` cursor
+    # returns records older than the supplied candle timestamp.
+    before_count = -1
+    for _ in range(8):
+        if len(collected) >= int(limit) or not collected:
             break
-        before = oldest - 1
+        oldest = min(collected)
+        if len(collected) == before_count:
+            break
+        before_count = len(collected)
+        payload = safe_get(
+            "https://www.okx.com/api/v5/market/history-candles",
+            params={"instId": str(inst_id), "bar": "1H", "limit": "100", "after": str(oldest)},
+            timeout=20,
+        )
+        if not isinstance(payload, dict) or payload.get("code") != "0":
+            raise RuntimeError((payload or {}).get("msg", "OKX historical candles response invalid"))
+        rows = payload.get("data", [])
+        if not rows:
+            break
+        add_rows(rows)
+
     if not collected:
         return pd.Series(dtype=float)
     ordered = sorted(collected.items())[-int(limit):]
@@ -4223,7 +4243,9 @@ if section == "₿ رابطه ارزها با بیت‌کوین":
     corr_frame = st.session_state.get("btc_corr_result", pd.DataFrame())
     st.caption(st.session_state.get("btc_corr_status", "برای شروع، دریافت داده را اجرا کنید."))
     if corr_frame.empty:
-        st.warning("داده کافی برای نمایش نتیجه وجود ندارد. اتصال API یا جفت‌های معاملاتی Binance را بررسی کنید و دوباره دریافت را بزنید.")
+        st.warning("داده کافی برای نمایش نتیجه وجود ندارد.")
+        st.error(f"جزئیات دریافت داده: {st.session_state.get('btc_corr_status', 'وضعیت منبع داده مشخص نیست')}")
+        st.caption("OKX ابتدا کندل‌های جدید و سپس تاریخچه را دریافت می‌کند؛ در صورت نبود جفت یا خطای منبع، Binance به‌عنوان جایگزین بررسی می‌شود.")
     else:
         corr_view = corr_frame.copy()
         for col in ["همبستگی ۱ساعت*", "همبستگی ۷روز", "همبستگی ۳۰روز"]:

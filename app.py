@@ -1129,33 +1129,55 @@ def _fetch_corr_pair(pair, okx_symbols, binance_symbols):
 
 
 def build_btc_correlation_frame(market_df, currency, universe_limit=60):
-    """Align completed hourly returns; OKX is primary and Binance is fallback."""
-    if market_df is None or market_df.empty or "symbol" not in market_df.columns:
-        return pd.DataFrame(), "فهرست بازار برای تحلیل در دسترس نیست."
-    base = market_df.copy()
-    base["symbol"] = base["symbol"].astype(str).str.upper()
-    base = base[~base["symbol"].isin(["USDT", "USDC", "BUSD", "DAI", "FDUSD", "TUSD", "USDE", "USDS", "USDD", "EURC"])]
-    base = base.drop_duplicates("symbol")
-    if "market_cap" in base.columns:
-        base = base.sort_values("market_cap", ascending=False, na_position="last")
-    base = base.head(int(universe_limit))
-    jobs = [(str(row.get("symbol", "")).upper() + "USDT", row) for _, row in base.iterrows()]
+    """Build the correlation universe from market data, then fall back to exchange listings."""
+    # Load exchange symbol lists first. This page must still work when the main
+    # CoinGecko/CMC market dataframe is empty or temporarily unavailable.
     try:
         okx_symbols = fetch_okx_spot_symbols()
         okx_status = f"OKX: {len(okx_symbols)} جفت فعال"
     except Exception as exc:
         okx_symbols = set()
-        okx_status = f"OKX در دسترس نیست ({str(exc)[:100]})"
-    # Binance is contacted only if OKX cannot cover BTC or at least some candidate pairs.
-    binance_symbols = set()
+        okx_status = f"OKX در دسترس نیست ({str(exc)[:140]})"
     try:
-        if "BTC-USDT" not in okx_symbols or not any(pair.removesuffix("USDT") + "-USDT" in okx_symbols for pair, _ in jobs):
-            binance_symbols = fetch_binance_spot_symbols()
-        else:
-            # Load the fallback symbol list once; individual candles still prefer OKX.
-            binance_symbols = fetch_binance_spot_symbols()
-    except Exception:
+        binance_symbols = fetch_binance_spot_symbols()
+        binance_status = f"Binance: {len(binance_symbols)} جفت فعال"
+    except Exception as exc:
         binance_symbols = set()
+        binance_status = f"Binance در دسترس نیست ({str(exc)[:140]})"
+
+    excluded = {"USDT", "USDC", "BUSD", "DAI", "FDUSD", "TUSD", "USDE", "USDS", "USDD", "EURC", "UST", "USTC"}
+    market_rows = []
+    if market_df is not None and not market_df.empty and "symbol" in market_df.columns:
+        base = market_df.copy()
+        base["symbol"] = base["symbol"].astype(str).str.upper().str.strip()
+        base = base[~base["symbol"].isin(excluded)].drop_duplicates("symbol")
+        if "market_cap" in base.columns:
+            base = base.sort_values("market_cap", ascending=False, na_position="last")
+        market_rows = base.to_dict("records")
+
+    # Append symbols directly from OKX/Binance so an outage in the market-list
+    # provider does not make the entire correlation page unusable.
+    known = {str(r.get("symbol", "")).upper() for r in market_rows}
+    exchange_symbols = set()
+    for inst_id in okx_symbols:
+        if isinstance(inst_id, str) and inst_id.endswith("-USDT"):
+            exchange_symbols.add(inst_id[:-5].upper())
+    for pair in binance_symbols:
+        if isinstance(pair, str) and pair.endswith("USDT"):
+            exchange_symbols.add(pair[:-4].upper())
+    for symbol in sorted(exchange_symbols - known - excluded):
+        market_rows.append({"symbol": symbol, "name": symbol, "current_price": np.nan, "market_cap": np.nan})
+
+    if not market_rows:
+        return pd.DataFrame(), f"فهرست بازار از منبع اصلی و فهرست جفت‌های OKX/Binance دریافت نشد. {okx_status}; {binance_status}"
+
+    base = pd.DataFrame(market_rows)
+    base["symbol"] = base["symbol"].astype(str).str.upper()
+    base = base[~base["symbol"].isin(excluded)].drop_duplicates("symbol")
+    if "market_cap" in base.columns:
+        base = base.sort_values("market_cap", ascending=False, na_position="last")
+    base = base.head(int(universe_limit))
+    jobs = [(str(row.get("symbol", "")).upper() + "USDT", row) for _, row in base.iterrows()]
     from concurrent.futures import as_completed
     all_jobs = [("BTCUSDT", {"symbol": "BTC", "name": "Bitcoin", "current_price": np.nan})]
     all_jobs.extend([(pair, row) for pair, row in jobs if pair != "BTCUSDT"])
@@ -1174,7 +1196,7 @@ def build_btc_correlation_frame(market_df, currency, universe_limit=60):
                 source_map[pair] = "unavailable"
     btc = series_map.get("BTCUSDT", pd.Series(dtype=float))
     if len(btc) < 170:
-        return pd.DataFrame(), f"داده ساعتی BTC کافی نیست (حداقل ۱۷۰ کندل بسته‌شده لازم است؛ فعلی: {len(btc)}). {okx_status}; جفت‌های Binance جایگزین: {len(binance_symbols)}"
+        return pd.DataFrame(), f"داده ساعتی BTC کافی نیست (حداقل ۱۷۰ کندل بسته‌شده لازم است؛ فعلی: {len(btc)}). {okx_status}; {binance_status}"
     btc_ret = btc.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
     output = []
     for pair, row in all_jobs:
@@ -1214,7 +1236,7 @@ def build_btc_correlation_frame(market_df, currency, universe_limit=60):
         })
     result = pd.DataFrame(output)
     if result.empty:
-        return result, f"هیچ جفتی تاریخچه ساعتی مشترک کافی نداشت. {okx_status}; جفت‌های جایگزین Binance: {len(binance_symbols)}; خطاها: {errors}"
+        return result, f"هیچ جفتی تاریخچه ساعتی مشترک کافی نداشت. {okx_status}; {binance_status}; تعداد خطا/جفت بدون داده: {errors}"
     sources = result["منبع داده"].value_counts().to_dict()
     source_text = "، ".join(f"{k}: {v}" for k, v in sources.items())
     return result, f"منبع اصلی OKX؛ جایگزین Binance در صورت نیاز • ارزهای دارای تاریخچه کافی: {len(result)} • منابع استفاده‌شده: {source_text} • {okx_status}"

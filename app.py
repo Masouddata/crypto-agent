@@ -1019,72 +1019,148 @@ def run_cmc_pre_pump_scan(limit, api_key, min_volume_usd=100_000, min_market_cap
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_binance_spot_symbols():
-    """Return active Binance spot symbols; public endpoint, no API key."""
+    """Fallback: active Binance spot symbols; public endpoint, no API key."""
     payload = safe_get("https://api.binance.com/api/v3/exchangeInfo", timeout=20)
     rows = payload.get("symbols", []) if isinstance(payload, dict) else []
     return {r.get("symbol") for r in rows if r.get("status") == "TRADING" and r.get("isSpotTradingAllowed", True)}
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def fetch_okx_spot_symbols():
+    """Primary venue: active OKX USDT spot instruments."""
+    payload = safe_get("https://www.okx.com/api/v5/public/instruments", params={"instType": "SPOT"}, timeout=20)
+    if not isinstance(payload, dict) or str(payload.get("code", "0")) != "0":
+        raise ValueError(f"OKX instruments error: {payload.get('msg', 'invalid response') if isinstance(payload, dict) else 'invalid response'}")
+    return {x.get("instId") for x in payload.get("data", [])
+            if x.get("state") == "live" and str(x.get("instId", "")).endswith("-USDT")}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_binance_hourly_closes(symbol, limit=721):
-    """Fetch completed hourly closes; the last in-progress candle is discarded."""
-    payload = safe_get(
-        "https://api.binance.com/api/v3/klines",
-        params={"symbol": str(symbol), "interval": "1h", "limit": int(limit)},
-        timeout=20,
-    )
+    """Fetch completed Binance hourly closes; discard the in-progress candle."""
+    payload = safe_get("https://api.binance.com/api/v3/klines",
+                       params={"symbol": str(symbol), "interval": "1h", "limit": min(int(limit), 1000)}, timeout=20)
     if not isinstance(payload, list) or not payload:
         return pd.Series(dtype=float)
     frame = pd.DataFrame(payload, columns=["open_time", "open", "high", "low", "close", "volume", "close_time", "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"])
     frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
     frame["time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
-    # Only fully closed candles are used, preventing a moving last candle from distorting correlation.
     now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
     frame = frame[pd.to_numeric(frame["close_time"], errors="coerce") < now_ms]
     return pd.Series(frame["close"].to_numpy(), index=frame["time"], dtype=float).dropna()
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_okx_hourly_closes(inst_id, limit=721):
+    """Fetch up to 721 completed hourly closes from OKX (latest + paginated history)."""
+    rows_by_ts = {}
+    # Latest candles endpoint (max 100 per request).
+    latest = safe_get("https://www.okx.com/api/v5/market/candles",
+                      params={"instId": str(inst_id), "bar": "1H", "limit": "100"}, timeout=20)
+    if not isinstance(latest, dict) or str(latest.get("code", "0")) != "0":
+        raise ValueError(f"OKX candles error: {latest.get('msg', 'invalid response') if isinstance(latest, dict) else 'invalid response'}")
+    for row in latest.get("data", []):
+        if len(row) >= 9 and str(row[8]) == "1":
+            rows_by_ts[int(row[0])] = float(row[4])
+    # History endpoint pages backward using the oldest timestamp as cursor.
+    while len(rows_by_ts) < int(limit):
+        if not rows_by_ts:
+            break
+        oldest = min(rows_by_ts)
+        page = safe_get("https://www.okx.com/api/v5/market/history-candles",
+                        params={"instId": str(inst_id), "bar": "1H", "after": str(oldest), "limit": "100"}, timeout=20)
+        if not isinstance(page, dict) or str(page.get("code", "0")) != "0":
+            raise ValueError(f"OKX history candles error: {page.get('msg', 'invalid response') if isinstance(page, dict) else 'invalid response'}")
+        batch = page.get("data", [])
+        added = 0
+        for row in batch:
+            if len(row) >= 9 and str(row[8]) == "1":
+                ts = int(row[0])
+                if ts not in rows_by_ts:
+                    rows_by_ts[ts] = float(row[4]); added += 1
+        if not batch or added == 0:
+            break
+        time.sleep(0.08)
+    items = sorted(rows_by_ts.items())[-int(limit):]
+    if not items:
+        return pd.Series(dtype=float)
+    index = pd.to_datetime([x[0] for x in items], unit="ms", utc=True)
+    return pd.Series([x[1] for x in items], index=index, dtype=float).dropna()
+
+
 def build_btc_correlation_frame(market_df, currency, universe_limit=60):
-    """Align hourly returns against BTC. 1h column uses a 24-return rolling window."""
+    """Align completed hourly returns; OKX is primary and Binance is fallback."""
     if market_df is None or market_df.empty or "symbol" not in market_df.columns:
         return pd.DataFrame(), "فهرست بازار برای تحلیل در دسترس نیست."
+    venue_errors = []
+    okx_symbols = set()
+    binance_symbols = set()
     try:
-        symbols = fetch_binance_spot_symbols()
+        okx_symbols = fetch_okx_spot_symbols()
     except Exception as exc:
-        return pd.DataFrame(), f"دریافت فهرست جفت‌های Binance ناموفق بود: {exc}"
-    btc_symbol = "BTCUSDT"
-    if btc_symbol not in symbols:
-        return pd.DataFrame(), "جفت BTCUSDT در بازار اسپات Binance در دسترس نیست."
+        venue_errors.append(f"OKX: {str(exc)[:130]}")
+    try:
+        binance_symbols = fetch_binance_spot_symbols()
+    except Exception as exc:
+        venue_errors.append(f"Binance: {str(exc)[:130]}")
+    if not okx_symbols and not binance_symbols:
+        return pd.DataFrame(), "دریافت فهرست جفت‌ها از هر دو صرافی ناموفق بود. " + " | ".join(venue_errors)
+
     base = market_df.copy()
     base["symbol"] = base["symbol"].astype(str).str.upper()
-    base = base[~base["symbol"].isin(["USDT", "USDC", "BUSD", "DAI", "FDUSD", "TUSD", "USDE", "USDS", "USDD", "EURC"]) ]
-    base = base.drop_duplicates("symbol")
+    excluded = ["USDT", "USDC", "BUSD", "DAI", "FDUSD", "TUSD", "USDE", "USDS", "USDD", "EURC"]
+    base = base[~base["symbol"].isin(excluded)].drop_duplicates("symbol")
     if "market_cap" in base.columns:
         base = base.sort_values("market_cap", ascending=False, na_position="last")
     base = base.head(int(universe_limit))
-    jobs = [(str(row.get("symbol", "")).upper() + "USDT", row) for _, row in base.iterrows()]
-    jobs = [(pair, row) for pair, row in jobs if pair in symbols]
-    if not any(pair == btc_symbol for pair, _ in jobs):
-        jobs.insert(0, (btc_symbol, {"symbol": "BTC", "name": "Bitcoin", "current_price": np.nan}))
-    # BTC is the benchmark; fetch it first, then limit concurrent public requests.
+    jobs = []
+    for _, row in base.iterrows():
+        symbol = str(row.get("symbol", "")).upper()
+        okx_pair, binance_pair = f"{symbol}-USDT", f"{symbol}USDT"
+        if okx_pair in okx_symbols:
+            jobs.append(("OKX", okx_pair, row))
+        elif binance_pair in binance_symbols:
+            jobs.append(("Binance", binance_pair, row))
+    btc_row = {"symbol": "BTC", "name": "Bitcoin", "current_price": np.nan}
+    if not any(str(x[2].get("symbol", "")).upper() == "BTC" for x in jobs):
+        if "BTC-USDT" in okx_symbols:
+            jobs.insert(0, ("OKX", "BTC-USDT", btc_row))
+        elif "BTCUSDT" in binance_symbols:
+            jobs.insert(0, ("Binance", "BTCUSDT", btc_row))
+    if not jobs:
+        return pd.DataFrame(), "هیچ جفت USDT مشترکی میان فهرست بازار و OKX/Binance پیدا نشد."
+
     from concurrent.futures import as_completed
-    series_map = {}
-    errors = 0
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = {pool.submit(fetch_binance_hourly_closes, pair, 721): pair for pair, _ in jobs}
-        for future in as_completed(futures):
-            pair = futures[future]
+    series_map, errors = {}, []
+    def fetch_one(venue, pair):
+        if venue == "OKX":
             try:
-                series_map[pair] = future.result()
-            except Exception:
-                errors += 1
-    btc = series_map.get(btc_symbol, pd.Series(dtype=float))
+                return fetch_okx_hourly_closes(pair, 721), "OKX"
+            except Exception as first:
+                # A per-instrument OKX failure may still be served by Binance.
+                fallback = pair.replace("-", "")
+                if fallback in binance_symbols:
+                    return fetch_binance_hourly_closes(fallback, 721), "Binance fallback"
+                raise first
+        return fetch_binance_hourly_closes(pair, 721), "Binance"
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(fetch_one, venue, pair): (venue, pair) for venue, pair, _ in jobs}
+        for future in as_completed(futures):
+            venue, pair = futures[future]
+            try:
+                series_map[pair] = future.result()[0]
+            except Exception as exc:
+                errors.append(f"{pair}: {str(exc)[:100]}")
+
+    btc_pair = "BTC-USDT" if "BTC-USDT" in series_map else "BTCUSDT"
+    btc = series_map.get(btc_pair, pd.Series(dtype=float))
     if len(btc) < 170:
-        return pd.DataFrame(), f"تاریخچه ساعتی BTC کافی نیست (حداقل ۱۷۰ کندل بسته‌شده لازم است؛ فعلی: {len(btc)})."
+        detail = "؛ ".join(venue_errors + errors[:3])
+        return pd.DataFrame(), f"تاریخچه ساعتی BTC کافی نیست (حداقل ۱۷۰ کندل بسته‌شده؛ فعلی: {len(btc)}). {detail}"
     btc_ret = btc.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-    btc_name = "Bitcoin"
     output = []
-    for pair, row in jobs:
+    for venue, pair, row in jobs:
         coin = series_map.get(pair, pd.Series(dtype=float))
         if len(coin) < 170:
             continue
@@ -1095,33 +1171,34 @@ def build_btc_correlation_frame(market_df, currency, universe_limit=60):
         corr_1h = aligned.tail(24)["coin"].corr(aligned.tail(24)["btc"]) if len(aligned.tail(24)) >= 18 else np.nan
         corr_7d = aligned.tail(168)["coin"].corr(aligned.tail(168)["btc"]) if len(aligned) >= 168 else np.nan
         corr_30d = aligned.tail(720)["coin"].corr(aligned.tail(720)["btc"]) if len(aligned) >= 720 else np.nan
-        ret_1h = float(aligned["coin"].iloc[-1] * 100)
-        coin_7d = float((coin.iloc[-1] / coin.iloc[-min(len(coin), 169)] - 1) * 100) if len(coin) >= 169 else np.nan
+        coin_7d = float((coin.iloc[-1] / coin.iloc[-169] - 1) * 100) if len(coin) >= 169 else np.nan
         btc_7d = float((btc.iloc[-1] / btc.iloc[-169] - 1) * 100) if len(btc) >= 169 else np.nan
         coin_30d = float((coin.iloc[-1] / coin.iloc[-721] - 1) * 100) if len(coin) >= 721 else np.nan
         btc_30d = float((btc.iloc[-1] / btc.iloc[-721] - 1) * 100) if len(btc) >= 721 else np.nan
         rel_7d = coin_7d - btc_7d if pd.notna(coin_7d) and pd.notna(btc_7d) else np.nan
         rel_30d = coin_30d - btc_30d if pd.notna(coin_30d) and pd.notna(btc_30d) else np.nan
         down_mask = aligned["btc"] < 0
-        down_share = float(((aligned.loc[down_mask, "coin"] > 0).mean() * 100)) if down_mask.sum() >= 8 else np.nan
-        opposite_share = float(((aligned["coin"] * aligned["btc"] < 0).mean() * 100))
-        divergence_strength = (max(0.0, rel_7d) * 0.55 + (down_share if pd.notna(down_share) else 0) * 0.30 + opposite_share * 0.15) if pd.notna(rel_7d) else np.nan
-        name = str(row.get("name", row.get("symbol", pair[:-4])))
-        price = row.get("current_price", np.nan)
+        down_share = float((aligned.loc[down_mask, "coin"] > 0).mean() * 100) if down_mask.sum() >= 8 else np.nan
+        opposite_share = float((aligned["coin"] * aligned["btc"] < 0).mean() * 100)
+        # No score unless relative performance and downside-resilience evidence exist.
+        divergence_strength = (max(0.0, rel_7d) * 0.55 + down_share * 0.30 + opposite_share * 0.15) if pd.notna(rel_7d) and pd.notna(down_share) else np.nan
+        name = str(row.get("name", row.get("symbol", pair.split("-")[0].replace("USDT", ""))))
         output.append({
-            "ارز": name, "نماد": pair[:-4], "قیمت فعلی": price,
-            "همبستگی ۱ساعت*": corr_1h, "همبستگی ۷روز": corr_7d, "همبستگی ۳۰روز": corr_30d,
-            "تغییر آخرین ساعت٪": ret_1h, "تغییر ۷روز ارز٪": coin_7d, "تغییر ۷روز BTC٪": btc_7d,
-            "قدرت واگرایی": divergence_strength, "عملکرد بهتر از BTC در ۷روز٪": rel_7d,
-            "سبز بودن ارز هنگام افت BTC٪": down_share, "درصد ساعات خلاف‌جهت": opposite_share,
-            "تغییر ۳۰روز ارز٪": coin_30d, "تغییر ۳۰روز BTC٪": btc_30d,
+            "ارز": name, "نماد": pair.split("-")[0].replace("USDT", ""), "قیمت فعلی": row.get("current_price", np.nan),
+            "منبع کندل": venue, "همبستگی ۱ساعت*": corr_1h, "همبستگی ۷روز": corr_7d, "همبستگی ۳۰روز": corr_30d,
+            "تغییر ۷روز ارز٪": coin_7d, "تغییر ۷روز BTC٪": btc_7d, "عملکرد بهتر از BTC در ۷روز٪": rel_7d,
+            "تغییر ۳۰روز ارز٪": coin_30d, "تغییر ۳۰روز BTC٪": btc_30d, "عملکرد بهتر از BTC در ۳۰روز٪": rel_30d,
+            "قدرت واگرایی": divergence_strength, "سبز بودن ارز هنگام افت BTC٪": down_share,
+            "درصد ساعات خلاف‌جهت": opposite_share,
             "وضعیت": ("مقاومت نسبی در افت BTC" if pd.notna(btc_7d) and btc_7d < 0 and pd.notna(rel_7d) and rel_7d > 0 and pd.notna(down_share) and down_share >= 50 else ("عملکرد بهتر از BTC" if pd.notna(rel_7d) and rel_7d > 0 else "هم‌جهت/ضعیف‌تر")),
             "تعداد کندل مشترک": len(aligned),
         })
     result = pd.DataFrame(output)
     if result.empty:
-        return result, "برای ارزهای منتخب، تاریخچه ساعتی مشترک کافی دریافت نشد."
-    return result, f"جفت‌های بررسی‌شده: {len(jobs)} • دارای تاریخچه کافی: {len(result)} • خطاهای دریافت: {errors}"
+        detail = "؛ ".join(venue_errors + errors[:4])
+        return result, f"برای ارزهای منتخب، تاریخچه ساعتی مشترک کافی دریافت نشد. {detail}"
+    venues = ", ".join(sorted(set(result["منبع کندل"])))
+    return result, f"جفت‌های بررسی‌شده: {len(jobs)} • دارای تاریخچه کافی: {len(result)} • منبع: {venues} • خطاها: {len(errors)}"
 
 
 def fetch_history(coin_id, currency, days, api_key):
@@ -2711,8 +2788,8 @@ if section == "🏠 نمای کلی":
     # Live sentiment meters — these are market context indicators, not entry signals.
     st.divider()
     st.subheader("🌡️ دماسنج احساسات بازار")
-    st.caption("دو شاخص مستقل برای سنجش جو بازار؛ مقدارها از ارائه‌دهنده دریافت می‌شوند و در صورت قطعی API عدد ساختگی نمایش داده نمی‌شود.")
-    fg_col, alt_col = st.columns(2, gap="large")
+    st.caption("سه شاخص مستقل برای سنجش احساسات و رفتار نسبی بازار؛ اگر داده واگرایی محاسبه نشده باشد، آمپر سوم عدد ساختگی نشان نمی‌دهد.")
+    fg_col, alt_col, div_gauge_col = st.columns(3, gap="medium")
     fg_value = None
     alt_value = None
     try:
@@ -2787,6 +2864,33 @@ if section == "🏠 نمای کلی":
             st.session_state["cmc_altcoin_retry_until"] = time.time() + cooldown
         with alt_col:
             st.warning(f"شاخص فصل آلت‌کوین‌ها فعلاً دریافت نشد: {str(exc)[:240]}")
+
+    # Third homepage gauge reuses real results from the dedicated BTC page.
+    cached_div = st.session_state.get("btc_corr_result", pd.DataFrame())
+    if isinstance(cached_div, pd.DataFrame) and not cached_div.empty and "قدرت واگرایی" in cached_div.columns:
+        valid_div = cached_div.dropna(subset=["قدرت واگرایی", "عملکرد بهتر از BTC در ۷روز٪"]).copy()
+        valid_div = valid_div[valid_div["عملکرد بهتر از BTC در ۷روز٪"] > 0]
+        if not valid_div.empty:
+            # Breadth + median relative strength + resilience; only positively outperforming coins count.
+            breadth = len(valid_div) / max(1, len(cached_div)) * 100
+            median_strength = float(pd.to_numeric(valid_div["قدرت واگرایی"], errors="coerce").median())
+            div_value = float(np.clip(0.55 * breadth + 0.45 * min(100, median_strength), 0, 100))
+            if div_value < 20: div_label = "واگرایی محدود"
+            elif div_value < 40: div_label = "واگرایی ضعیف"
+            elif div_value < 60: div_label = "واگرایی متوسط"
+            elif div_value < 80: div_label = "واگرایی قوی"
+            else: div_label = "واگرایی بسیار گسترده"
+            with div_gauge_col:
+                st.plotly_chart(render_semi_gauge(div_value, "واگرایی آلت‌کوین‌ها از BTC", div_label, "#7b61c9"),
+                                use_container_width=True, config={"displayModeBar": False})
+                st.metric("سهم ارزهای بهتر از BTC", f"{breadth:.1f}%", f"{len(valid_div)} از {len(cached_div)} ارز")
+                st.caption("محاسبه بر پایه نتایج آخرین اجرای صفحه همبستگی؛ عملکرد بهتر ۷روزه + مقاومت هنگام افت BTC. برای تازه‌سازی، صفحه رابطه با بیت‌کوین را اجرا کنید.")
+        else:
+            with div_gauge_col:
+                st.info("در آخرین بررسی، شواهد کافی برای واگرایی مثبت بازار ثبت نشده است.")
+    else:
+        with div_gauge_col:
+            st.info("برای فعال‌شدن آمپر، یک‌بار صفحه «رابطه ارزها با بیت‌کوین» را اجرا کنید.")
 
     st.divider()
 
@@ -4183,7 +4287,7 @@ if section == "📁 داده‌ها":
 # =========================================================
 if section == "₿ رابطه ارزها با بیت‌کوین":
     st.title("₿ رابطه ارزها با بیت‌کوین؛ همبستگی و واگرایی")
-    st.caption("تحلیل بر پایه بازده کندل‌های یک‌ساعته بسته‌شده و هم‌زمان؛ منبع کندل: Binance Spot عمومی")
+    st.caption("تحلیل بر پایه بازده کندل‌های یک‌ساعته بسته‌شده و هم‌زمان؛ اولویت دریافت با OKX Spot و جایگزین Binance Spot است")
     st.info("همبستگی ۱ساعت* با پنجره متحرک ۲۴ بازده ساعتی محاسبه می‌شود؛ یک کندل به‌تنهایی برای محاسبه همبستگی کافی نیست. بازه‌های ۷ و ۳۰ روز به‌ترتیب از ۱۶۸ و ۷۲۰ بازده ساعتی هم‌زمان استفاده می‌کنند. واگرایی با عملکرد بهتر از BTC، سهم ساعات مثبت ارز هنگام افت BTC و ساعات خلاف‌جهت سنجیده می‌شود؛ همبستگی پایین به‌تنهایی واگرایی نیست.")
     corr_a, corr_b = st.columns([1, 1])
     with corr_a:
@@ -4192,7 +4296,7 @@ if section == "₿ رابطه ارزها با بیت‌کوین":
         st.metric("واحد قیمت", currency.upper())
     run_corr = st.button("🔄 دریافت و محاسبه همبستگی و واگرایی", type="primary", key="run_btc_corr")
     if run_corr or "btc_corr_result" not in st.session_state:
-        with st.spinner("در حال دریافت کندل‌های یک‌ساعته BTC و ارزهای منتخب از Binance؛ ممکن است کمی زمان ببرد..."):
+        with st.spinner("در حال دریافت کندل‌های یک‌ساعته BTC و ارزهای منتخب از OKX (جایگزین: Binance)؛ ممکن است کمی زمان ببرد..."):
             corr_frame, corr_status = build_btc_correlation_frame(df, currency, corr_universe)
         st.session_state["btc_corr_result"] = corr_frame
         st.session_state["btc_corr_status"] = corr_status
@@ -4211,7 +4315,7 @@ if section == "₿ رابطه ارزها با بیت‌کوین":
             fig_corr = px.bar(strongest.sort_values("همبستگی ۷روز"), x="همبستگی ۷روز", y="نماد", orientation="h", color="همبستگی ۷روز", color_continuous_scale="RdYlGn", range_color=[-1, 1], hover_data=["ارز", "همبستگی ۱ساعت*", "همبستگی ۳۰روز"])
             fig_corr.update_layout(height=max(380, 25 * len(strongest)), margin=dict(l=10, r=10, t=25, b=15), coloraxis_colorbar_title="Correlation")
             st.plotly_chart(fig_corr, use_container_width=True, config={"displayModeBar": False})
-            corr_cols = ["ارز", "نماد", "قیمت فعلی", "همبستگی ۱ساعت*", "همبستگی ۷روز", "همبستگی ۳۰روز", "تعداد کندل مشترک"]
+            corr_cols = ["ارز", "نماد", "قیمت فعلی", "منبع کندل", "همبستگی ۱ساعت*", "همبستگی ۷روز", "همبستگی ۳۰روز", "تعداد کندل مشترک"]
             st.dataframe(strongest[corr_cols].style.format({"قیمت فعلی": "{:,.8g}", "همبستگی ۱ساعت*": "{:+.3f}", "همبستگی ۷روز": "{:+.3f}", "همبستگی ۳۰روز": "{:+.3f}"}, na_rep="—"), use_container_width=True, hide_index=True)
         else:
             st.info("برای این بازه، داده همبستگی کافی وجود ندارد.")
@@ -4223,11 +4327,11 @@ if section == "₿ رابطه ارزها با بیت‌کوین":
             fig_div = px.bar(divergence.sort_values("عملکرد بهتر از BTC در ۷روز٪"), x="عملکرد بهتر از BTC در ۷روز٪", y="نماد", orientation="h", color="عملکرد بهتر از BTC در ۷روز٪", color_continuous_scale="RdYlGn", hover_data=["ارز", "قدرت واگرایی", "سبز بودن ارز هنگام افت BTC٪", "درصد ساعات خلاف‌جهت", "وضعیت"])
             fig_div.update_layout(height=max(380, 25 * len(divergence)), margin=dict(l=10, r=10, t=25, b=15), xaxis_title="عملکرد بهتر از BTC در ۷ روز (واحد درصد)")
             st.plotly_chart(fig_div, use_container_width=True, config={"displayModeBar": False})
-            div_cols = ["ارز", "نماد", "قیمت فعلی", "تغییر ۷روز ارز٪", "تغییر ۷روز BTC٪", "عملکرد بهتر از BTC در ۷روز٪", "قدرت واگرایی", "سبز بودن ارز هنگام افت BTC٪", "درصد ساعات خلاف‌جهت", "وضعیت"]
+            div_cols = ["ارز", "نماد", "قیمت فعلی", "منبع کندل", "تغییر ۷روز ارز٪", "تغییر ۷روز BTC٪", "عملکرد بهتر از BTC در ۷روز٪", "تغییر ۳۰روز ارز٪", "تغییر ۳۰روز BTC٪", "عملکرد بهتر از BTC در ۳۰روز٪", "قدرت واگرایی", "سبز بودن ارز هنگام افت BTC٪", "درصد ساعات خلاف‌جهت", "وضعیت"]
             st.dataframe(divergence[div_cols].style.format({c: "{:+.2f}%" for c in ["تغییر ۷روز ارز٪", "تغییر ۷روز BTC٪", "عملکرد بهتر از BTC در ۷روز٪"]} | {"قیمت فعلی": "{:,.8g}", "قدرت واگرایی": "{:.2f}", "سبز بودن ارز هنگام افت BTC٪": "{:.1f}%", "درصد ساعات خلاف‌جهت": "{:.1f}%"}, na_rep="—"), use_container_width=True, hide_index=True)
         else:
             st.info("در داده‌های موجود، واگرایی قابل رتبه‌بندی با تاریخچه کافی پیدا نشد.")
         with st.expander("همه ارزهای بررسی‌شده"):
             st.dataframe(corr_view, use_container_width=True, hide_index=True)
         st.download_button("⬇️ دریافت CSV همبستگی و واگرایی", data=corr_view.to_csv(index=False).encode("utf-8-sig"), file_name="btc_correlation_divergence.csv", mime="text/csv", key="download_btc_corr")
-    st.caption("محدودیت: این نسخه فقط ارزهایی را وارد می‌کند که جفت اسپات USDT فعال در Binance و تاریخچه ساعتی کافی دارند. این تحلیل پیش‌بینی قیمت یا توصیه خرید نیست.")
+    st.caption("محدودیت: فقط ارزهای دارای جفت اسپات USDT فعال و تاریخچه ساعتی کافی در OKX یا Binance بررسی می‌شوند. کندل‌های ناتمام حذف می‌شوند؛ داده ناکافی امتیاز مثبت نمی‌گیرد. این تحلیل پیش‌بینی قیمت یا توصیه خرید نیست.")

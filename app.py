@@ -1,6 +1,9 @@
 import os
 import time
 import threading
+import re
+import html
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from requests.adapters import HTTPAdapter
@@ -11,7 +14,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
- 
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -21,7 +24,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
- 
+
 st.markdown("""
 <style>
 :root {
@@ -106,7 +109,7 @@ small, .stMarkdown small { color: #465b75 !important; font-size: .86rem !importa
 @media (max-width: 768px) {
   /* CryptoMeter touch-submit sizing */
   div[data-testid="stFormSubmitButton"] button { width: 100% !important; min-height: 3.2rem !important; touch-action: manipulation; }
- 
+
   .block-container { padding: .85rem .65rem 1.8rem; }
   h1 { font-size: 1.45rem !important; }
   h2 { font-size: 1.2rem !important; }
@@ -128,11 +131,12 @@ small, .stMarkdown small { color: #465b75 !important; font-size: .86rem !importa
 }
 </style>
 """, unsafe_allow_html=True)
- 
+
 CG_API = "https://api.coingecko.com/api/v3"
+CMC_API = "https://pro-api.coinmarketcap.com"
 DEX_API = "https://api.dexscreener.com"
 NEWS_API = "https://cryptopanic.com/api/v1/posts/"
- 
+
 # =========================================================
 # HELPERS / KEYS
 # =========================================================
@@ -144,18 +148,18 @@ def secret_or_env(name: str) -> str:
     except Exception:
         pass
     return os.getenv(name, "").strip()
- 
- 
+
+
 def cg_headers(api_key: str):
     return {"x-cg-demo-api-key": api_key} if api_key else {}
- 
- 
+
+
 # Reuse HTTP connections per worker thread. Thread-local sessions avoid sharing
 # mutable requests.Session state between concurrent Streamlit fetch workers.
 _HTTP_LOCAL = threading.local()
 _HTTP_RETRY_STATUSES = {429, 500, 502, 503, 504}
- 
- 
+
+
 def _http_session():
     session = getattr(_HTTP_LOCAL, "session", None)
     if session is None:
@@ -166,8 +170,8 @@ def _http_session():
         session.headers.update({"User-Agent": "CryptoIntelligenceScanner/2026.11"})
         _HTTP_LOCAL.session = session
     return session
- 
- 
+
+
 def _retry_delay(response, attempt):
     retry_after = response.headers.get("Retry-After") if response is not None else None
     if retry_after:
@@ -176,8 +180,8 @@ def _retry_delay(response, attempt):
         except (TypeError, ValueError):
             pass
     return min(4.0, 0.35 * (2 ** attempt))
- 
- 
+
+
 def safe_get(url, *, params=None, headers=None, timeout=20):
     """GET with connection reuse and bounded retry for transient/rate-limit errors."""
     last_error = None
@@ -203,12 +207,12 @@ def safe_get(url, *, params=None, headers=None, timeout=20):
     if last_error:
         raise last_error
     raise RuntimeError("HTTP request failed without a response")
- 
- 
+
+
 def numeric(series):
     return pd.to_numeric(series, errors="coerce")
- 
- 
+
+
 def fmt_num(value, digits=2):
     try:
         if pd.isna(value):
@@ -216,8 +220,8 @@ def fmt_num(value, digits=2):
         return f"{float(value):,.{digits}f}"
     except (TypeError, ValueError):
         return "N/A"
- 
- 
+
+
 def fmt_money(value, currency):
     try:
         if pd.isna(value):
@@ -226,8 +230,8 @@ def fmt_money(value, currency):
         return f"{currency.upper()} {value:,.8f}" if abs(value) < 1 else f"{currency.upper()} {value:,.2f}"
     except (TypeError, ValueError):
         return "N/A"
- 
- 
+
+
 def rsi(series, period=14):
     s = pd.Series(series, dtype="float64")
     delta = s.diff()
@@ -238,8 +242,8 @@ def rsi(series, period=14):
     out = out.where(~((loss == 0) & (gain > 0)), 100)
     out = out.where(~((gain == 0) & (loss > 0)), 0)
     return out
- 
- 
+
+
 def technical_summary(prices, volumes=None):
     """Price structure plus rolling 24h-volume expansion; not a trading guarantee."""
     p = pd.Series(prices, dtype="float64").dropna()
@@ -290,7 +294,7 @@ def technical_summary(prices, volumes=None):
             baseline_volume = v.iloc[:-24].median()
             if pd.notna(baseline_volume) and baseline_volume > 0:
                 volume_ratio = float(recent_volume / baseline_volume)
- 
+
     # Accumulation structure proxy: compare the latest ~24 samples with the
     # preceding ~24 samples. It is not wallet-level accumulation evidence.
     range_7d_pct = range_24h_pct = compression_ratio = higher_low_pct = np.nan
@@ -317,7 +321,7 @@ def technical_summary(prices, volumes=None):
                                 80 if higher_low_pct >= 0.3 else
                                 60 if higher_low_pct >= 0 else
                                 30 if higher_low_pct >= -0.5 else 0)
- 
+
     rsi_structure_score = np.nan
     if pd.notna(latest_rsi):
         rsi_structure_score = (100 if 45 <= latest_rsi <= 60 else
@@ -327,7 +331,7 @@ def technical_summary(prices, volumes=None):
     price_weight = sum(weight for value, weight in price_parts if pd.notna(value))
     accumulation_price_score = (sum(value * weight for value, weight in price_parts if pd.notna(value)) / price_weight
                                 if price_weight > 0 else np.nan)
- 
+
     return {
         "RSI_14": round(float(latest_rsi), 2) if pd.notna(latest_rsi) else np.nan,
         "MACD": round(float(macd.iloc[-1]), 8),
@@ -342,8 +346,8 @@ def technical_summary(prices, volumes=None):
         "Higher_Low_24h_Percent": round(higher_low_pct, 3) if pd.notna(higher_low_pct) else np.nan,
         "Accumulation_Price_Score": round(accumulation_price_score, 1) if pd.notna(accumulation_price_score) else np.nan,
     }
- 
- 
+
+
 STABLECOIN_SYMBOLS = {
     "USDT", "USDC", "USDE", "USDS", "DAI", "FDUSD", "TUSD", "USDP",
     "USDD", "PYUSD", "USD1", "USDX", "USDSC", "GUSD", "FRAX",
@@ -354,9 +358,9 @@ STABLECOIN_NAME_HINTS = (
     "tether", "usd coin", "usdc", "usdt", "first digital usd",
     "paypal usd", "trueusd", "pax dollar", "dai stablecoin",
     "frax", "liquity usd", "staked usde", "ethena usde", "euro coinvertible", "eur coinvertible",
-    "stablecoin", "usd1", "usdd", "gemini dollar",
+    "stablecoin", "united stables", "usd1", "usdd", "gemini dollar",
 )
- 
+
 def mark_stablecoins(frame):
     out = frame.copy()
     symbols = out.get("Symbol", pd.Series("", index=out.index)).astype(str).str.upper().str.strip()
@@ -366,7 +370,7 @@ def mark_stablecoins(frame):
     name_match = names.apply(lambda value: any(hint in value for hint in STABLECOIN_NAME_HINTS))
     id_match = ids.str.contains(r"tether|usd-coin|first-digital-usd|paypal-usd|true-usd|pax-dollar|dai$|frax|ethena-usde|usd1", regex=True, na=False)
     out["Is_Stablecoin"] = symbol_match | name_match | id_match
- 
+
     # Tokenized equities are not cryptocurrencies and should not compete in this ranking.
     equity_hints = ("tokenized stock", "tokenised stock", "bstocks", "xstocks", "tracker certificate")
     equity_name_match = names.apply(lambda value: any(hint in value for hint in equity_hints))
@@ -374,9 +378,9 @@ def mark_stablecoins(frame):
     out["Is_Tokenized_Equity"] = equity_name_match | equity_symbol_match
     out["Is_Excluded_Asset"] = out["Is_Stablecoin"] | out["Is_Tokenized_Equity"]
     return out
- 
- 
- 
+
+
+
 def attach_actual_buy_sell_flow(frame):
     """Attach only provider-reported buy/sell USD volumes; never infer USD flow from txn counts."""
     out = frame.copy()
@@ -384,6 +388,11 @@ def attach_actual_buy_sell_flow(frame):
     out["Sell_Volume_USD"] = np.nan
     out["Net_Buy_USD"] = np.nan
     out["Buy_Share_Percent"] = np.nan
+    # A ticker alone is not a unique asset identifier. Mark collisions so a
+    # provider's symbol-only flow cannot be assigned to the wrong token.
+    symbols = out.get("Symbol", pd.Series("", index=out.index)).astype(str).str.upper().str.strip()
+    collision_counts = symbols[symbols.ne("")].value_counts()
+    out["Symbol_Ambiguous"] = symbols.map(collision_counts).fillna(0).gt(1)
     rows = st.session_state.get("cm_actual_buy_sell_rows", [])
     if not rows:
         return out
@@ -408,10 +417,15 @@ def attach_actual_buy_sell_flow(frame):
         "Sell volume (USDT)": "Sell_Volume_USD",
     })
     out = out.drop(columns=["Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent"], errors="ignore")
-    return out.merge(flow[["Symbol", "Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent"]],
-                     on="Symbol", how="left")
- 
- 
+    out = out.merge(flow[["Symbol", "Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent"]],
+                    on="Symbol", how="left")
+    # Never present symbol-only flow as confirmed for colliding tickers.
+    ambiguous = out["Symbol_Ambiguous"].fillna(False)
+    flow_columns = ["Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent"]
+    out.loc[ambiguous, flow_columns] = np.nan
+    return out
+
+
 def _btc_market_context(frame):
     """A small market-regime adjustment derived from the loaded BTC market row."""
     btc = frame[frame["Symbol"].astype(str).str.upper().eq("BTC")]
@@ -429,7 +443,7 @@ def _btc_market_context(frame):
     if d24 < 0 and d7 < 0:
         return -5.0, "BTC mildly weak"
     return 0.0, "BTC neutral / mixed"
- 
+
 def calculate_pre_pump_score(frame):
     """Conservative seven-factor early-activity score; missing evidence is not bullish."""
     out = mark_stablecoins(frame)
@@ -441,7 +455,13 @@ def calculate_pre_pump_score(frame):
     turnover = (volume / market_cap.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
     out["Volume_to_Market_Cap"] = turnover
     eligible = ~out["Is_Excluded_Asset"]
- 
+    symbol_ambiguous = out.get("Symbol_Ambiguous", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+    out["Data_Quality_Status"] = np.where(
+        symbol_ambiguous,
+        "نماد تکراری است؛ تطبیق قرارداد لازم است",
+        "تطبیق نماد بدون برخورد تکراری"
+    )
+
     # 1) REAL reported buy/sell traded volume (30%). Never infer it from trade counts.
     buy_share = numeric(out.get("Buy_Share_Percent", pd.Series(np.nan, index=out.index)))
     net_buy = numeric(out.get("Net_Buy_USD", pd.Series(np.nan, index=out.index)))
@@ -454,7 +474,7 @@ def calculate_pre_pump_score(frame):
         ["حجم خرید/فروش واقعی دریافت نشده", "غلبه خرید واقعی", "خرید کمی بیشتر از فروش", "غلبه فروش واقعی"],
         default="خرید و فروش تقریباً متعادل"
     )
- 
+
     # 2) Volume acceleration vs the coin's own 7-day baseline (20%).
     surge = numeric(out.get("Volume_24h_vs_7d_Avg", pd.Series(np.nan, index=out.index)))
     surge_score = pd.Series(np.select(
@@ -462,7 +482,7 @@ def calculate_pre_pump_score(frame):
         [100, 85, 75, 60, 45], default=15
     ), index=out.index, dtype=float).where(surge.notna(), np.nan)
     out["Volume_Acceleration_Score"] = surge_score
- 
+
     # Independent accumulation screen. This is kept separate from PrePump_Score
     # so the existing seven-factor ranking remains comparable across versions.
     price_structure = numeric(out.get("Accumulation_Price_Score", pd.Series(np.nan, index=out.index)))
@@ -503,11 +523,11 @@ def calculate_pre_pump_score(frame):
          "تراکم قیمت دیده می‌شود؛ خرید واقعی تأیید نشده"],
         default="شواهد انباشت هنوز کافی نیست"
     )
- 
+
     # 3) Price momentum (15%): modest positive momentum is preferred over an already vertical move.
     momentum_score = (50 + 3.0 * ch24.clip(-10, 8) + 1.0 * ch7.clip(-20, 15)).clip(0, 100)
     out["Momentum_Factor_Score"] = momentum_score.where(ch24.notna() & ch7.notna(), np.nan)
- 
+
     # 4) Liquidity / market quality (15%).
     cap_score = pd.Series(np.select(
         [market_cap >= 250_000_000, market_cap >= 75_000_000, market_cap >= 20_000_000, market_cap >= 10_000_000],
@@ -520,7 +540,7 @@ def calculate_pre_pump_score(frame):
     liquidity_score = (0.55 * cap_score + 0.45 * vol_score)
     out["Liquidity_Quality_Score"] = liquidity_score
     out["Volume_Activity_Score"] = (turnover.rank(pct=True) * 100).where(turnover.notna(), np.nan)
- 
+
     # 5) Technical analysis (10%). RSI/MACD are not fabricated when history is missing.
     tech = numeric(out.get("Technical_Score", pd.Series(np.nan, index=out.index)))
     rsi_value = numeric(out.get("RSI_14", pd.Series(np.nan, index=out.index)))
@@ -531,17 +551,17 @@ def calculate_pre_pump_score(frame):
     derived_tech = pd.Series(derived_tech, index=out.index).clip(0, 100)
     tech = tech.where(tech.notna(), derived_tech.where(rsi_value.notna() | (macd.notna() & macd_signal.notna())))
     out["Technical_PrePump_Score"] = tech
- 
+
     # 6) BTC regime (5%): market-wide risk filter, not an altcoin-specific catalyst.
     btc_adjustment, btc_context = _btc_market_context(out)
     out["BTC_Market_Context"] = btc_context
     btc_score_value = 55.0 + btc_adjustment * 3.0
     out["BTC_Regime_Score"] = btc_score_value
- 
+
     # 7) News / fundamentals (5%): only use a supplied/API-computed 0-100 score.
     news_score = numeric(out.get("News_Score", pd.Series(np.nan, index=out.index))).clip(0, 100)
     out["News_Factor_Score"] = news_score
- 
+
     weights = {
         "Buy_Flow_Score": 30.0,
         "Volume_Acceleration_Score": 20.0,
@@ -562,12 +582,12 @@ def calculate_pre_pump_score(frame):
     # cannot be mistaken for a fully researched 90. Missing factors are never treated as positive.
     out["Evidence_Coverage_Percent"] = available_weight.round(1)
     raw_score = (weighted_sum / available_weight.replace(0, np.nan)).clip(0, 100)
- 
+
     abs24, abs7 = ch24.abs(), ch7.abs()
     quiet24 = pd.Series(np.select([abs24 <= 2, abs24 <= 4, abs24 <= 7], [100, 75, 35], default=0), index=out.index, dtype=float).where(ch24.notna(), np.nan)
     quiet7 = pd.Series(np.select([abs7 <= 5, abs7 <= 12, abs7 <= 20], [100, 75, 35], default=0), index=out.index, dtype=float).where(ch7.notna(), np.nan)
     out["Price_Still_Quiet_Score"] = (0.45 * quiet24 + 0.55 * quiet7)
- 
+
     overheated = (ch24 >= 8) | (ch7 >= 20) | (ch24 <= -18) | (ch7 <= -35)
     thin = (market_cap.fillna(0) < 10_000_000) | (volume.fillna(0) < 300_000)
     missing_market = market_cap.isna() | volume.isna() | ch24.isna() | ch7.isna()
@@ -580,33 +600,33 @@ def calculate_pre_pump_score(frame):
     score = (raw_score - penalty).clip(0, 100).where(eligible, 0)
     out["PrePump_Score"] = score.round(1)
     out["Pump_Potential_Score"] = out["PrePump_Score"]
- 
+
     positive_flow = flow_available & (net_buy > 0) & (buy_share >= 52)
     strong_coverage = available_weight >= 75
     btc_not_bearish = btc_context not in ("BTC weak — risk-off", "BTC mildly weak")
-    valid_setup = (eligible & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
+    valid_setup = (eligible & ~symbol_ambiguous & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
                    ch24.abs().le(5) & ch7.abs().le(12) & surge.ge(1.5) &
                    turnover.between(0.001, 0.15) & score.ge(70) & positive_flow &
                    rsi_value.between(40, 68) & strong_coverage & btc_not_bearish)
-    watch_setup = (eligible & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
+    watch_setup = (eligible & ~symbol_ambiguous & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
                    ch24.abs().le(7) & ch7.abs().le(18) & turnover.between(0.001, 0.15) & score.ge(55))
     out["Signal"] = np.select(
-        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], overheated, valid_setup,
+        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], symbol_ambiguous, overheated, valid_setup,
          watch_setup & ~flow_available, watch_setup & flow_available & ~positive_flow,
          watch_setup & ~surge.notna(), watch_setup],
-        ["Excluded — stablecoin", "Excluded — tokenized equity", "Already moving / abnormal volatility — caution",
-         "Pre-pump watch — real buying + volume confirmed",
+        ["Excluded — stablecoin", "Excluded — tokenized equity", "Hold — ambiguous ticker; verify contract",
+         "Already moving / abnormal volatility — caution", "Pre-pump watch — real buying + volume confirmed",
          "Early activity — real buy/sell data missing",
          "Early activity — buy pressure not confirmed",
          "Early activity — volume history missing",
          "Early activity — monitor"], default="Watch — not enough evidence")
     out["Risk_Level"] = np.select(
-        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], thin, overheated, extreme_turnover, missing_market],
-        ["Excluded — stablecoin", "Excluded — tokenized equity", "High / thin market", "High / volatile", "High / abnormal turnover", "Incomplete market data"],
+        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], symbol_ambiguous, thin, overheated, extreme_turnover, missing_market],
+        ["Excluded — stablecoin", "Excluded — tokenized equity", "Unverified ticker / contract", "High / thin market", "High / volatile", "High / abnormal turnover", "Incomplete market data"],
         default="Medium / review")
     return out
- 
- 
+
+
 # =========================================================
 # DATA SOURCES
 # =========================================================
@@ -624,33 +644,88 @@ def _fetch_market_page(currency, page, api_key):
         headers=cg_headers(api_key),
         timeout=25,
     )
- 
- 
-@st.cache_data(ttl=150, show_spinner=False)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_pages(currency, pages, api_key):
-    """Fetch market pages concurrently (max 3 workers); cache the assembled result."""
+    """Fetch CoinGecko market pages sequentially to avoid HTTP 429 bursts.
+
+    Successful earlier pages are retained if a later page is rate-limited.
+    The result is cached for five minutes to avoid repeating the same requests
+    on Streamlit reruns. A warning is stored in DataFrame.attrs when coverage
+    is partial.
+    """
     page_numbers = list(range(1, int(pages) + 1))
-    rows_by_page = {}
-    # Three concurrent requests improve multi-page scans without creating a large
-    # burst against CoinGecko. Results are reassembled in page/rank order.
-    with ThreadPoolExecutor(max_workers=min(3, len(page_numbers) or 1)) as pool:
-        futures = {
-            page: pool.submit(_fetch_market_page, currency, page, api_key)
-            for page in page_numbers
-        }
-        for page in page_numbers:
-            data = futures[page].result()
-            rows_by_page[page] = data if isinstance(data, list) else []
- 
     rows = []
+    warning = ""
+
     for page in page_numbers:
-        data = rows_by_page[page]
-        if not data:
-            break
-        rows.extend(data)
-        if len(data) < 250:
-            break
- 
+        # A small gap between pages reduces burst pressure on the public API.
+        if page > 1:
+            time.sleep(2.0)
+        response = None
+        last_error = None
+        data = None
+        # Longer, rate-limit-aware retries specifically for CoinGecko.
+        for attempt in range(5):
+            try:
+                response = _http_session().get(
+                    f"{CG_API}/coins/markets",
+                    params={
+                        "vs_currency": currency,
+                        "order": "market_cap_desc",
+                        "per_page": 250,
+                        "page": int(page),
+                        "sparkline": "false",
+                        "price_change_percentage": "24h,7d",
+                    },
+                    headers=cg_headers(api_key),
+                    timeout=30,
+                )
+                if response.status_code == 429:
+                    last_error = requests.HTTPError(
+                        f"CoinGecko rate limit (429) on page {page}", response=response
+                    )
+                    if attempt < 4:
+                        retry_after = response.headers.get("Retry-After")
+                        try:
+                            delay = max(3.0, float(retry_after)) if retry_after else min(30.0, 3.0 * (2 ** attempt))
+                        except (TypeError, ValueError):
+                            delay = min(30.0, 3.0 * (2 ** attempt))
+                        time.sleep(delay)
+                        continue
+                    break
+                response.raise_for_status()
+                data = response.json()
+                break
+            except requests.RequestException as exc:
+                last_error = exc
+                if response is not None and response.status_code not in _HTTP_RETRY_STATUSES:
+                    break
+                if attempt < 4:
+                    time.sleep(min(20.0, 2.0 * (2 ** attempt)))
+            except ValueError as exc:
+                last_error = exc
+                break
+
+        if isinstance(data, list) and data:
+            rows.extend(data)
+            if len(data) < 250:
+                break
+        else:
+            detail = str(last_error or "empty response")
+            if rows:
+                warning = (
+                    f"CoinGecko page {page} was unavailable ({detail}). "
+                    f"Showing the {len(rows)} coins fetched from earlier pages; "
+                    "increase coverage later when the API rate limit clears."
+                )
+                break
+            raise RuntimeError(
+                f"CoinGecko could not provide market page {page}: {detail}. "
+                "Wait a few minutes, use a CoinGecko Demo API key, or temporarily reduce coverage to 250 coins."
+            )
+
     if not rows:
         raise ValueError("CoinGecko returned no market rows.")
     raw = pd.DataFrame(rows)
@@ -668,32 +743,387 @@ def fetch_market_pages(currency, pages, api_key):
         "Market_Cap_Rank": col("market_cap_rank"),
         "Circulating_Supply": col("circulating_supply"),
         "Total_Supply": col("total_supply"),
-        "ATH_Change_Percent": col("ath_change_percentage"),
-        "Last_Updated": col("last_updated"),
     })
-    for c in ["Price", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h",
-              "Market_Cap", "Market_Cap_Rank", "Circulating_Supply", "Total_Supply",
-              "ATH_Change_Percent"]:
-        df[c] = numeric(df[c])
-    # Market-only preliminary score. It is explicitly not a calibrated probability.
-    ch24 = df["Change_24h_Percent"].fillna(0)
-    ch7 = df["Change_7d_Percent"].fillna(0)
-    df["Market_Momentum_Score"] = (50 + 1.4 * ch24 + 0.8 * ch7).clip(0, 100).round(2)
-    df["Technical_Score"] = np.nan
-    df["RSI_14"] = np.nan
-    df["MACD"] = np.nan
-    df["MACD_Signal"] = np.nan
-    df["Trend_7d_Percent"] = np.nan
-    df["Technical_Signal"] = "Not calculated"
-    df["News_Score"] = np.nan
-    df["News_Summary"] = "News API not configured"
-    df["Pump_Potential_Score"] = df["Market_Momentum_Score"]
-    df["Risk_Level"] = "Unassessed"
-    df["Signal"] = "Watch"
+    df.attrs["market_fetch_warning"] = warning
     return df
- 
- 
-@st.cache_data(ttl=300, show_spinner=False)
+
+
+# =========================================================
+# COINMARKETCAP BROAD-MARKET EARLY-MOVE RADAR
+# =========================================================
+def cmc_api_get(path, params, api_key):
+    if not api_key:
+        raise ValueError("کلید CoinMarketCap وارد نشده است. آن را در تنظیمات اسکنر وارد کن.")
+    response = _http_session().get(
+        f"{CMC_API}{path}", params=params,
+        headers={"X-CMC_PRO_API_KEY": api_key, "Accept": "application/json"},
+        timeout=30,
+    )
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After", "60")
+        raise requests.HTTPError(
+            f"CoinMarketCap محدودیت درخواست (429) اعمال کرده؛ Retry-After={retry_after}. "
+            "درخواست را پشت سر هم تکرار نکن.", response=response
+        )
+    response.raise_for_status()
+    payload = response.json()
+    status = payload.get("status", {}) if isinstance(payload, dict) else {}
+    code = str(status.get("error_code", "0"))
+    if code not in ("0", "None", ""):
+        message = status.get("error_message") or f"CMC error {code}"
+        raise ValueError(f"CoinMarketCap: {message}")
+    return payload.get("data")
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_cmc_market_universe(limit, api_key):
+    """CMC active listings, normalized to the scanner's common market schema."""
+    raw = cmc_api_get(
+        "/v3/cryptocurrency/listings/latest",
+        {"start": 1, "limit": int(limit), "convert": "USD",
+         "sort": "market_cap", "sort_dir": "desc",
+         "aux": "num_market_pairs,cmc_rank,date_added,tags,platform,max_supply,circulating_supply,total_supply"},
+        api_key,
+    )
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("CoinMarketCap فهرست فعالی برنگرداند.")
+    rows = []
+    for item in raw:
+        quote_container = item.get("quote") or []
+        if isinstance(quote_container, list):
+            quote = next((x for x in quote_container if str(x.get("symbol", "")).upper() == "USD"), {})
+        elif isinstance(quote_container, dict):
+            quote = quote_container.get("USD", {})
+        else:
+            quote = {}
+        tags = item.get("tags") or []
+        if isinstance(tags, list):
+            tag_text = " ".join(str(x.get("slug", x) if isinstance(x, dict) else x) for x in tags).lower()
+        else:
+            tag_text = str(tags).lower()
+        rows.append({
+            "Coin": item.get("name"), "Symbol": str(item.get("symbol", "")).upper(),
+            "CMC_ID": int(item.get("id")) if item.get("id") is not None else np.nan,
+            "CMC_Slug": item.get("slug"), "CMC_Tags": tag_text,
+            "Price": quote.get("price"), "Change_1h_Percent": quote.get("percent_change_1h"),
+            "Change_24h_Percent": quote.get("percent_change_24h"),
+            "Change_7d_Percent": quote.get("percent_change_7d"),
+            "Volume_24h": quote.get("volume_24h"), "Market_Cap": quote.get("market_cap"),
+            "Market_Cap_Rank": item.get("cmc_rank"),
+            "Circulating_Supply": item.get("circulating_supply"),
+            "Total_Supply": item.get("total_supply"),
+            "Num_Market_Pairs": item.get("num_market_pairs"),
+            "Last_Updated": item.get("last_updated"),
+        })
+    frame = pd.DataFrame(rows)
+    for col in ["Price", "Change_1h_Percent", "Change_24h_Percent", "Change_7d_Percent",
+                "Volume_24h", "Market_Cap", "Market_Cap_Rank", "Num_Market_Pairs"]:
+        frame[col] = numeric(frame[col])
+    # CMC's own stablecoin tag supplements symbol/name heuristics.
+    frame = mark_stablecoins(frame)
+    frame["Is_Stablecoin"] = frame["Is_Stablecoin"] | frame["CMC_Tags"].str.contains(r"stablecoin|stable-coin", case=False, na=False)
+    frame["Is_Excluded_Asset"] = frame["Is_Stablecoin"] | frame["Is_Tokenized_Equity"]
+    return frame
+
+
+def _cmc_data_map(data):
+    if isinstance(data, dict) and "quotes" in data:
+        return {str(data.get("id", "")): data}
+    if isinstance(data, dict):
+        return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+    if isinstance(data, list):
+        return {str(x.get("id", i)): x for i, x in enumerate(data) if isinstance(x, dict)}
+    return {}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_cmc_ohlcv_batch(ids, period, count, api_key):
+    """Fetch CMC OHLCV for multiple CMC IDs in one request."""
+    ids = tuple(int(x) for x in ids if pd.notna(x))
+    if not ids:
+        return {}
+    data = cmc_api_get(
+        "/v2/cryptocurrency/ohlcv/historical",
+        {"id": ",".join(map(str, ids)), "time_period": period,
+         "interval": "daily" if period == "daily" else "hourly",
+         "count": int(count), "convert": "USD", "skip_invalid": "true"},
+        api_key,
+    )
+    result = {}
+    for key, coin in _cmc_data_map(data).items():
+        candles = []
+        for q in coin.get("quotes", []) or []:
+            usd = ((q.get("quote") or {}).get("USD") or {})
+            try:
+                open_time = pd.to_datetime(q.get("time_open"), utc=True, errors="coerce")
+                close_time = pd.to_datetime(q.get("time_close"), utc=True, errors="coerce")
+                opn, close = float(usd.get("open")), float(usd.get("close"))
+                volume = float(usd.get("volume") or 0)
+                if pd.isna(open_time) or pd.isna(close_time) or opn <= 0 or close <= 0:
+                    continue
+                candles.append({"open_time": open_time, "close_time": close_time,
+                                "open": opn, "high": float(usd.get("high") or np.nan),
+                                "low": float(usd.get("low") or np.nan), "close": close,
+                                "volume": volume,
+                                "green": bool(close > opn)})
+            except (TypeError, ValueError):
+                continue
+        result[str(key)] = sorted(candles, key=lambda x: x["open_time"])
+    return result
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_cmc_ath_stats(ids, api_key):
+    ids = tuple(int(x) for x in ids if pd.notna(x))
+    if not ids:
+        return {}
+    data = cmc_api_get(
+        "/v2/cryptocurrency/price-performance-stats/latest",
+        {"id": ",".join(map(str, ids)), "time_period": "all_time", "convert": "USD", "skip_invalid": "true"},
+        api_key,
+    )
+    result = {}
+    for key, item in _cmc_data_map(data).items():
+        try:
+            usd = (((item.get("periods") or {}).get("USD") or {}).get("quote") or {}).get("USD") or {}
+            high = float(usd.get("high"))
+            high_time = usd.get("high_timestamp")
+            if high > 0:
+                result[str(key)] = {"ATH_Price": high, "ATH_Date": high_time}
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def run_cmc_pre_pump_scan(limit, api_key, min_volume_usd=100_000, min_market_cap_usd=1_000_000):
+    """Two-lane CMC scan: strict three-green/volume candidates and relative-strength watchlist."""
+    market = fetch_cmc_market_universe(limit, api_key)
+    btc_row = market[market["Symbol"].eq("BTC")]
+    btc_7d = float(btc_row.iloc[0]["Change_7d_Percent"]) if not btc_row.empty and pd.notna(btc_row.iloc[0]["Change_7d_Percent"]) else 0.0
+    base = market[
+        (~market["Is_Excluded_Asset"].fillna(False))
+        & market["CMC_ID"].notna()
+        & (market["Volume_24h"].fillna(0) >= float(min_volume_usd))
+        & (market["Market_Cap"].fillna(0) >= float(min_market_cap_usd))
+        & (market["Num_Market_Pairs"].fillna(0) >= 3)
+    ].copy()
+    if base.empty:
+        return pd.DataFrame(), pd.DataFrame(), {"universe": len(market), "eligible": 0, "daily_checked": 0, "hourly_checked": 0, "btc_7d": btc_7d}
+
+    ids = base["CMC_ID"].astype(int).tolist()
+    daily_map = {}
+    errors = 0
+    # Chunked batches keep URL length and API request size under control.
+    for start in range(0, len(ids), 75):
+        batch = ids[start:start + 75]
+        try:
+            daily_map.update(fetch_cmc_ohlcv_batch(tuple(batch), "daily", 10, api_key))
+        except Exception:
+            errors += 1
+    today_utc = pd.Timestamp.now(tz="UTC").normalize()
+    analyzed = []
+    for _, coin in base.iterrows():
+        key = str(int(coin["CMC_ID"]))
+        candles = daily_map.get(key, [])
+        completed = [c for c in candles if c["close_time"] < today_utc]
+        if len(completed) < 3:
+            continue
+        last3 = completed[-3:]
+        green_count = sum(1 for c in last3 if c["green"])
+        vols = [float(c["volume"]) for c in last3]
+        vol_increasing = bool(vols[0] < vols[1] < vols[2] and vols[2] > 0)
+        prior_vols = [float(c["volume"]) for c in completed[:-3][-7:] if c["volume"] > 0]
+        vol_vs_prior = (vols[-1] / (sum(prior_vols) / len(prior_vols))) if prior_vols and vols[-1] > 0 else np.nan
+        daily_return = (last3[-1]["close"] / last3[0]["open"] - 1) * 100 if last3[0]["open"] else np.nan
+        analyzed.append({
+            **coin.to_dict(), "Green_Days_Last_3": green_count,
+            "Daily_Volume_1": vols[0], "Daily_Volume_2": vols[1], "Daily_Volume_3": vols[2],
+            "Volume_Increasing_3d": vol_increasing, "Volume_vs_Previous_7d_Avg": vol_vs_prior,
+            "Recent_3d_Return_Percent": daily_return,
+            "Last_Completed_Day": last3[-1]["close_time"].strftime("%Y-%m-%d"),
+            "Daily_Candles_Available": len(completed),
+        })
+    if not analyzed:
+        return pd.DataFrame(), pd.DataFrame(), {"universe": len(market), "eligible": len(base), "daily_checked": 0, "hourly_checked": 0, "errors": errors, "btc_7d": btc_7d}
+    frame = pd.DataFrame(analyzed)
+    # Only assets with a valid three-day trend/volume profile need the ATH stats request.
+    stats_candidates = frame[(frame["Green_Days_Last_3"] == 3) & frame["Volume_Increasing_3d"]]
+    stats_ids = stats_candidates["CMC_ID"].dropna().astype(int).tolist()[:250]
+    ath_map = {}
+    stats_error = None
+    if stats_ids:
+        try:
+            ath_map = fetch_cmc_ath_stats(tuple(stats_ids), api_key)
+        except Exception as exc:
+            stats_error = str(exc)[:220]
+    frame["ATH_Price"] = frame["CMC_ID"].apply(lambda x: (ath_map.get(str(int(x)), {}) or {}).get("ATH_Price") if pd.notna(x) else np.nan)
+    frame["ATH_Date"] = frame["CMC_ID"].apply(lambda x: (ath_map.get(str(int(x)), {}) or {}).get("ATH_Date") if pd.notna(x) else None)
+    frame["ATH_Drawdown_Percent"] = np.where(
+        (frame["ATH_Price"].notna()) & (frame["ATH_Price"] > frame["Price"]),
+        (1 - frame["Price"] / frame["ATH_Price"]) * 100, 0.0
+    )
+    frame["Relative_Strength_vs_BTC_7d"] = frame["Change_7d_Percent"].fillna(0) - btc_7d
+
+    # Candidates require all five explicit filters, including verified CMC ATH below current price.
+    candidates = frame[
+        (frame["Green_Days_Last_3"] == 3)
+        & frame["Volume_Increasing_3d"]
+        & frame["ATH_Price"].notna()
+        & (frame["Price"] < frame["ATH_Price"])
+        & (frame["Market_Cap"].fillna(0) >= min_market_cap_usd)
+        & (frame["Volume_24h"].fillna(0) >= min_volume_usd)
+    ].copy()
+    candidates["Signal"] = "کاندید آماده؛ ۳ کندل سبز + حجم افزایشی + زیر ATH"
+
+    # Watchlist: relative strength vs BTC and volume expansion, even if three green candles are absent.
+    watch = frame[
+        (frame["Relative_Strength_vs_BTC_7d"] > 0)
+        & (frame["Volume_vs_Previous_7d_Avg"].fillna(0) >= 1.20)
+        & (~frame["CMC_ID"].isin(candidates["CMC_ID"]))
+    ].copy()
+    watch["Signal"] = "زیرنظر؛ قدرت نسبی در برابر BTC + افزایش حجم"
+
+    # Confirm the latest completed 1h candle for the strongest 50 candidates/watchlist entries.
+    hourly_targets = pd.concat([candidates, watch]).drop_duplicates("CMC_ID").sort_values(
+        ["Relative_Strength_vs_BTC_7d", "Volume_24h"], ascending=False
+    ).head(50)
+    hourly_ids = hourly_targets["CMC_ID"].dropna().astype(int).tolist()
+    hourly_map = {}
+    if hourly_ids:
+        try:
+            hourly_map = fetch_cmc_ohlcv_batch(tuple(hourly_ids), "hourly", 5, api_key)
+        except Exception as exc:
+            errors += 1
+            hourly_map = {}
+    def hourly_fields(row):
+        candles = hourly_map.get(str(int(row["CMC_ID"])), []) if pd.notna(row["CMC_ID"]) else []
+        now = pd.Timestamp.now(tz="UTC")
+        closed = [c for c in candles if c["close_time"] <= now]
+        last = closed[-1] if closed else None
+        return pd.Series({
+            "Last_Closed_1h_Candle": ("سبز" if last["green"] else ("قرمز" if last["close"] < last["open"] else "خنثی")) if last else "داده موجود نیست",
+            "Last_Closed_1h_Time_UTC": last["close_time"].strftime("%Y-%m-%d %H:%M UTC") if last else None,
+        })
+    for result in (candidates, watch):
+        if not result.empty:
+            h = result.apply(hourly_fields, axis=1)
+            result["Last_Closed_1h_Candle"] = h["Last_Closed_1h_Candle"]
+            result["Last_Closed_1h_Time_UTC"] = h["Last_Closed_1h_Time_UTC"]
+    meta = {"universe": len(market), "eligible": len(base), "daily_checked": len(frame),
+            "hourly_checked": len(hourly_ids), "errors": errors, "btc_7d": btc_7d,
+            "ath_stats_error": stats_error}
+    return candidates.sort_values(["Relative_Strength_vs_BTC_7d", "Volume_24h"], ascending=False), \
+           watch.sort_values(["Relative_Strength_vs_BTC_7d", "Volume_24h"], ascending=False), meta
+
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_binance_spot_symbols():
+    """Return active Binance spot symbols; public endpoint, no API key."""
+    payload = safe_get("https://api.binance.com/api/v3/exchangeInfo", timeout=20)
+    rows = payload.get("symbols", []) if isinstance(payload, dict) else []
+    return {r.get("symbol") for r in rows if r.get("status") == "TRADING" and r.get("isSpotTradingAllowed", True)}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_binance_hourly_closes(symbol, limit=721):
+    """Fetch completed hourly closes; the last in-progress candle is discarded."""
+    payload = safe_get(
+        "https://api.binance.com/api/v3/klines",
+        params={"symbol": str(symbol), "interval": "1h", "limit": int(limit)},
+        timeout=20,
+    )
+    if not isinstance(payload, list) or not payload:
+        return pd.Series(dtype=float)
+    frame = pd.DataFrame(payload, columns=["open_time", "open", "high", "low", "close", "volume", "close_time", "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"])
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame["time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
+    # Only fully closed candles are used, preventing a moving last candle from distorting correlation.
+    now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+    frame = frame[pd.to_numeric(frame["close_time"], errors="coerce") < now_ms]
+    return pd.Series(frame["close"].to_numpy(), index=frame["time"], dtype=float).dropna()
+
+
+def build_btc_correlation_frame(market_df, currency, universe_limit=60):
+    """Align hourly returns against BTC. 1h column uses a 24-return rolling window."""
+    if market_df is None or market_df.empty or "symbol" not in market_df.columns:
+        return pd.DataFrame(), "فهرست بازار برای تحلیل در دسترس نیست."
+    try:
+        symbols = fetch_binance_spot_symbols()
+    except Exception as exc:
+        return pd.DataFrame(), f"دریافت فهرست جفت‌های Binance ناموفق بود: {exc}"
+    btc_symbol = "BTCUSDT"
+    if btc_symbol not in symbols:
+        return pd.DataFrame(), "جفت BTCUSDT در بازار اسپات Binance در دسترس نیست."
+    base = market_df.copy()
+    base["symbol"] = base["symbol"].astype(str).str.upper()
+    base = base[~base["symbol"].isin(["USDT", "USDC", "BUSD", "DAI", "FDUSD", "TUSD", "USDE", "USDS", "USDD", "EURC"]) ]
+    base = base.drop_duplicates("symbol")
+    if "market_cap" in base.columns:
+        base = base.sort_values("market_cap", ascending=False, na_position="last")
+    base = base.head(int(universe_limit))
+    jobs = [(str(row.get("symbol", "")).upper() + "USDT", row) for _, row in base.iterrows()]
+    jobs = [(pair, row) for pair, row in jobs if pair in symbols]
+    if not any(pair == btc_symbol for pair, _ in jobs):
+        jobs.insert(0, (btc_symbol, {"symbol": "BTC", "name": "Bitcoin", "current_price": np.nan}))
+    # BTC is the benchmark; fetch it first, then limit concurrent public requests.
+    from concurrent.futures import as_completed
+    series_map = {}
+    errors = 0
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(fetch_binance_hourly_closes, pair, 721): pair for pair, _ in jobs}
+        for future in as_completed(futures):
+            pair = futures[future]
+            try:
+                series_map[pair] = future.result()
+            except Exception:
+                errors += 1
+    btc = series_map.get(btc_symbol, pd.Series(dtype=float))
+    if len(btc) < 170:
+        return pd.DataFrame(), f"تاریخچه ساعتی BTC کافی نیست (حداقل ۱۷۰ کندل بسته‌شده لازم است؛ فعلی: {len(btc)})."
+    btc_ret = btc.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    btc_name = "Bitcoin"
+    output = []
+    for pair, row in jobs:
+        coin = series_map.get(pair, pd.Series(dtype=float))
+        if len(coin) < 170:
+            continue
+        coin_ret = coin.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+        aligned = pd.concat([coin_ret.rename("coin"), btc_ret.rename("btc")], axis=1).dropna()
+        if len(aligned) < 170:
+            continue
+        corr_1h = aligned.tail(24)["coin"].corr(aligned.tail(24)["btc"]) if len(aligned.tail(24)) >= 18 else np.nan
+        corr_7d = aligned.tail(168)["coin"].corr(aligned.tail(168)["btc"]) if len(aligned) >= 168 else np.nan
+        corr_30d = aligned.tail(720)["coin"].corr(aligned.tail(720)["btc"]) if len(aligned) >= 720 else np.nan
+        ret_1h = float(aligned["coin"].iloc[-1] * 100)
+        coin_7d = float((coin.iloc[-1] / coin.iloc[-min(len(coin), 169)] - 1) * 100) if len(coin) >= 169 else np.nan
+        btc_7d = float((btc.iloc[-1] / btc.iloc[-169] - 1) * 100) if len(btc) >= 169 else np.nan
+        coin_30d = float((coin.iloc[-1] / coin.iloc[-721] - 1) * 100) if len(coin) >= 721 else np.nan
+        btc_30d = float((btc.iloc[-1] / btc.iloc[-721] - 1) * 100) if len(btc) >= 721 else np.nan
+        rel_7d = coin_7d - btc_7d if pd.notna(coin_7d) and pd.notna(btc_7d) else np.nan
+        rel_30d = coin_30d - btc_30d if pd.notna(coin_30d) and pd.notna(btc_30d) else np.nan
+        down_mask = aligned["btc"] < 0
+        down_share = float(((aligned.loc[down_mask, "coin"] > 0).mean() * 100)) if down_mask.sum() >= 8 else np.nan
+        opposite_share = float(((aligned["coin"] * aligned["btc"] < 0).mean() * 100))
+        divergence_strength = (max(0.0, rel_7d) * 0.55 + (down_share if pd.notna(down_share) else 0) * 0.30 + opposite_share * 0.15) if pd.notna(rel_7d) else np.nan
+        name = str(row.get("name", row.get("symbol", pair[:-4])))
+        price = row.get("current_price", np.nan)
+        output.append({
+            "ارز": name, "نماد": pair[:-4], "قیمت فعلی": price,
+            "همبستگی ۱ساعت*": corr_1h, "همبستگی ۷روز": corr_7d, "همبستگی ۳۰روز": corr_30d,
+            "تغییر آخرین ساعت٪": ret_1h, "تغییر ۷روز ارز٪": coin_7d, "تغییر ۷روز BTC٪": btc_7d,
+            "قدرت واگرایی": divergence_strength, "عملکرد بهتر از BTC در ۷روز٪": rel_7d,
+            "سبز بودن ارز هنگام افت BTC٪": down_share, "درصد ساعات خلاف‌جهت": opposite_share,
+            "تغییر ۳۰روز ارز٪": coin_30d, "تغییر ۳۰روز BTC٪": btc_30d,
+            "وضعیت": ("مقاومت نسبی در افت BTC" if pd.notna(btc_7d) and btc_7d < 0 and pd.notna(rel_7d) and rel_7d > 0 and pd.notna(down_share) and down_share >= 50 else ("عملکرد بهتر از BTC" if pd.notna(rel_7d) and rel_7d > 0 else "هم‌جهت/ضعیف‌تر")),
+            "تعداد کندل مشترک": len(aligned),
+        })
+    result = pd.DataFrame(output)
+    if result.empty:
+        return result, "برای ارزهای منتخب، تاریخچه ساعتی مشترک کافی دریافت نشد."
+    return result, f"جفت‌های بررسی‌شده: {len(jobs)} • دارای تاریخچه کافی: {len(result)} • خطاهای دریافت: {errors}"
+
+
 def fetch_history(coin_id, currency, days, api_key):
     payload = safe_get(
         f"{CG_API}/coins/{coin_id}/market_chart",
@@ -713,38 +1143,228 @@ def fetch_history(coin_id, currency, days, api_key):
     prices["price"] = numeric(prices["price"])
     prices["volume_24h"] = numeric(prices["volume_24h"])
     return prices.dropna(subset=["price"])
- 
- 
-@st.cache_data(ttl=180, show_spinner=False)
-def fetch_news(currency_api_key, coin_symbol=None):
-    if not currency_api_key:
-        return pd.DataFrame(), "No CryptoPanic API key configured"
-    params = {"auth_token": currency_api_key, "public": "true", "kind": "news"}
-    if coin_symbol:
-        params["currencies"] = str(coin_symbol).lower()
+
+
+def analyze_recent_recovery_trend(history, lookback_days=7):
+    """Require a non-falling short-term trend using completed UTC daily closes."""
+    if history is None or history.empty or not {"Time", "price"}.issubset(history.columns):
+        return None
+    frame = history[["Time", "price"]].copy().dropna()
+    frame["Time"] = pd.to_datetime(frame["Time"], utc=True, errors="coerce")
+    frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+    frame = frame.dropna().sort_values("Time").set_index("Time")
+    daily = frame["price"].resample("1D").agg(open="first", close="last").dropna()
+    today_utc = pd.Timestamp.now(tz="UTC").normalize()
+    daily = daily[daily.index < today_utc]
+    if len(daily) < max(lookback_days, 5):
+        return None
+    recent = daily.tail(lookback_days)
+    closes = recent["close"].to_numpy(dtype=float)
+    if len(closes) < 5 or closes[0] <= 0:
+        return None
+    recent_3d_change = (closes[-1] / closes[-4] - 1) * 100 if closes[-4] else np.nan
+    previous_3d_change = (closes[-4] / closes[-7] - 1) * 100 if len(closes) >= 7 and closes[-7] else np.nan
+    last3 = closes[-3:]
+    slope = float(np.polyfit(np.arange(len(last3)), last3, 1)[0])
+    slope_pct = (slope / float(np.mean(last3))) * 100 if np.mean(last3) else 0.0
+    weekly_change = (closes[-1] / closes[0] - 1) * 100
+
+    # Stronger confirmation: positive 3-day return + positive close slope,
+    # latest close must rise vs the prior day, and >=2 of the last 3 candles
+    # must be green. A positive regression alone can hide a fresh last-day drop.
+    last3_candles = recent.tail(3)
+    green_days_3d = int((last3_candles["close"] > last3_candles["open"]).sum())
+    latest_day_up = bool(closes[-1] > closes[-2])
+    eligible = bool(
+        recent_3d_change > 0
+        and slope > 0
+        and latest_day_up
+        and green_days_3d >= 2
+    )
+    if eligible:
+        status = "برگشت صعودی؛ تأیید اولیه قوی‌تر"
+    else:
+        status = "برگشت صعودی تأیید نشده"
+    return {
+        "Recent_3d_Change_Percent": float(recent_3d_change),
+        "Previous_3d_Change_Percent": float(previous_3d_change) if pd.notna(previous_3d_change) else np.nan,
+        "Recent_7d_Change_Percent": float(weekly_change),
+        "Recent_3d_Slope_Percent": float(slope_pct),
+        "Green_Days_Last_3": green_days_3d,
+        "Latest_Day_Up": latest_day_up,
+        "Recovery_Trend_Status": status,
+        "Recovery_Trend_Eligible": eligible,
+        "Trend_Last_Date": recent.index[-1].strftime("%Y-%m-%d"),
+    }
+
+
+def last_three_green_daily_candles(history):
+    """Return the latest three fully completed UTC daily candles only when all are green."""
+    if history is None or history.empty or not {"Time", "price"}.issubset(history.columns):
+        return None
+    frame = history[["Time", "price"]].copy().dropna()
+    frame["Time"] = pd.to_datetime(frame["Time"], utc=True, errors="coerce")
+    frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+    frame = frame.dropna().sort_values("Time").set_index("Time")
+    if frame.empty:
+        return None
+
+    # Exclude the current, still-forming UTC day.
+    today_utc = pd.Timestamp.now(tz="UTC").normalize()
+    completed = frame[frame.index < today_utc]
+    daily = completed["price"].resample("1D").agg(open="first", close="last").dropna()
+    if len(daily) < 3:
+        return None
+
+    last_three = daily.tail(3).copy()
+    expected_days = pd.date_range(end=today_utc - pd.Timedelta(days=1), periods=3, freq="1D", tz="UTC")
+    if not last_three.index.equals(expected_days):
+        return None
+
+    # Require reasonably complete intraday coverage so sparse/stale history is not
+    # mistaken for a real daily candle.
+    for day in expected_days:
+        day_samples = completed.loc[(completed.index >= day) & (completed.index < day + pd.Timedelta(days=1))]
+        if day_samples.empty:
+            return None
+        if day_samples.index.min() > day + pd.Timedelta(hours=3):
+            return None
+        if day_samples.index.max() < day + pd.Timedelta(hours=21):
+            return None
+
+    last_three["green"] = last_three["close"] > last_three["open"]
+    if not bool(last_three["green"].all()):
+        return None
+    first_open = float(last_three.iloc[0]["open"])
+    last_close = float(last_three.iloc[-1]["close"])
+    if first_open <= 0:
+        return None
+    change_pct = (last_close / first_open - 1.0) * 100.0
+    return {
+        "Green_Days": 3,
+        "Three_Day_Change_Percent": float(change_pct),
+        "Streak_Start": last_three.index[0].strftime("%Y-%m-%d"),
+        "Streak_End": last_three.index[-1].strftime("%Y-%m-%d"),
+        "Last_Daily_Close": last_close,
+    }
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def translate_news_to_persian(text):
+    """Translate short English news text to Persian; try two public services, fail safely."""
+    original = str(text or "").strip()
+    if not original:
+        return ""
+    if re.search(r"[\u0600-\u06FF]", original):
+        return original
+
+    # First choice: MyMemory free endpoint.
     try:
-        payload = safe_get(NEWS_API, params=params, timeout=20)
-        results = payload.get("results", [])
-        rows = []
-        for item in results:
-            votes = item.get("votes") or {}
-            title = item.get("title", "")
-            rows.append({
-                "Published": item.get("published_at"),
-                "Title": title,
-                "Source": (item.get("source") or {}).get("title", ""),
-                "Currencies": ", ".join(
-                    (c.get("code", "") for c in (item.get("currencies") or []))
-                ),
-                "Positive_Votes": votes.get("positive", 0),
-                "Negative_Votes": votes.get("negative", 0),
-                "URL": item.get("url", ""),
-            })
-        return pd.DataFrame(rows), "ok"
-    except Exception as exc:
-        return pd.DataFrame(), str(exc)
- 
- 
+        response = _http_session().get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": original[:480], "langpair": "en|fa"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        translated = html.unescape(str((payload.get("responseData") or {}).get("translatedText") or "")).strip()
+        if re.search(r"[\u0600-\u06FF]", translated):
+            return translated
+    except Exception:
+        pass
+
+    # Fallback: Google Translate's public web endpoint. It is unofficial and may be rate-limited.
+    try:
+        response = _http_session().get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "auto", "tl": "fa", "dt": "t", "q": original[:480]},
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        chunks = payload[0] if isinstance(payload, list) and payload else []
+        translated = "".join(str(chunk[0]) for chunk in chunks if isinstance(chunk, list) and chunk and chunk[0])
+        translated = html.unescape(translated).strip()
+        if re.search(r"[\u0600-\u06FF]", translated):
+            return translated
+    except Exception:
+        pass
+    return ""
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_news(currency_api_key="", coin_symbol=None):
+    """Prefer CryptoPanic when keyed; otherwise use public publisher RSS feeds."""
+    rows = []
+    if currency_api_key:
+        try:
+            params = {"auth_token": currency_api_key, "public": "true", "kind": "news"}
+            if coin_symbol and str(coin_symbol).upper() != "ALL":
+                params["currencies"] = str(coin_symbol).lower()
+            payload = safe_get(NEWS_API, params=params, timeout=20)
+            for item in payload.get("results", []) if isinstance(payload, dict) else []:
+                votes = item.get("votes") or {}
+                rows.append({
+                    "Published": item.get("published_at"), "Title": item.get("title", ""),
+                    "Summary": item.get("description", ""),
+                    "Source": (item.get("source") or {}).get("title", "CryptoPanic"),
+                    "Currencies": ", ".join(c.get("code", "") for c in (item.get("currencies") or [])),
+                    "Positive_Votes": votes.get("positive", 0), "Negative_Votes": votes.get("negative", 0),
+                    "URL": item.get("url", ""),
+                })
+            if rows:
+                return pd.DataFrame(rows), "CryptoPanic"
+        except Exception as exc:
+            keyed_error = str(exc)[:160]
+        else:
+            keyed_error = "CryptoPanic returned no articles; using public RSS fallback."
+    else:
+        keyed_error = "No CryptoPanic key; using public RSS sources."
+
+    feeds = [
+        ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+        ("Cointelegraph", "https://cointelegraph.com/rss"),
+        ("Decrypt", "https://decrypt.co/feed"),
+    ]
+    feed_errors = []
+    wanted = str(coin_symbol or "ALL").strip().upper()
+    for source, url in feeds:
+        try:
+            response = _http_session().get(url, timeout=15, headers={"Accept": "application/rss+xml, application/xml, text/xml"})
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            for node in root.iter():
+                if node.tag.split("}")[-1].lower() not in ("item", "entry"):
+                    continue
+                fields = {}
+                for child in list(node):
+                    key = child.tag.split("}")[-1].lower()
+                    value = "".join(child.itertext()).strip()
+                    if key == "link" and not value:
+                        value = child.attrib.get("href", "")
+                    fields[key] = value
+                title = fields.get("title", "").strip()
+                summary = re.sub(r"<[^>]+>", " ", fields.get("description", fields.get("summary", "")))
+                summary = re.sub(r"\s+", " ", summary).strip()
+                if not title:
+                    continue
+                if wanted not in ("", "ALL", "*", "MARKET"):
+                    searchable = f" {title} {summary} ".upper()
+                    if not re.search(rf"(?<![A-Z0-9]){re.escape(wanted)}(?![A-Z0-9])", searchable):
+                        continue
+                rows.append({"Published": fields.get("pubdate", fields.get("published", fields.get("updated", ""))),
+                             "Title": title, "Summary": summary[:500], "Source": source,
+                             "Currencies": wanted if wanted not in ("", "ALL", "*", "MARKET") else "Market",
+                             "Positive_Votes": 0, "Negative_Votes": 0, "URL": fields.get("link", "")})
+        except Exception as exc:
+            feed_errors.append(f"{source}: {str(exc)[:100]}")
+    if rows:
+        frame = pd.DataFrame(rows).drop_duplicates(subset=["Title"]).sort_values("Published", ascending=False, na_position="last")
+        return frame.head(40).reset_index(drop=True), f"Public RSS • {len(rows)} articles • {keyed_error}"
+    detail = " | ".join(feed_errors) if feed_errors else "No matching articles in the latest feed items."
+    return pd.DataFrame(), f"{keyed_error} RSS unavailable: {detail}"
+
+
 @st.cache_data(ttl=90, show_spinner=False)
 def fetch_dex_search(query):
     """Searches DEX Screener by query; it does not enumerate every token on every chain."""
@@ -756,6 +1376,8 @@ def fetch_dex_search(query):
         quote = p.get("quoteToken") or {}
         txns = p.get("txns") or {}
         h24 = txns.get("h24") or {}
+        h6 = txns.get("h6") or {}
+        h1 = txns.get("h1") or {}
         vol = p.get("volume") or {}
         liq = p.get("liquidity") or {}
         price_change = p.get("priceChange") or {}
@@ -765,13 +1387,21 @@ def fetch_dex_search(query):
             "Pair": p.get("pairAddress", ""),
             "Token": base.get("name", ""),
             "Symbol": str(base.get("symbol", "")).upper(),
+            "Base_Token_Address": base.get("address", ""),
+            "Quote_Token_Address": quote.get("address", ""),
             "Price_USD": p.get("priceUsd"),
             "Change_5m_Percent": price_change.get("m5"),
             "Change_1h_Percent": price_change.get("h1"),
             "Change_6h_Percent": price_change.get("h6"),
             "Change_24h_Percent": price_change.get("h24"),
+            "Volume_1h_USD": vol.get("h1"),
+            "Volume_6h_USD": vol.get("h6"),
             "Volume_24h_USD": vol.get("h24"),
             "Liquidity_USD": liq.get("usd"),
+            "Buys_1h": h1.get("buys"),
+            "Sells_1h": h1.get("sells"),
+            "Buys_6h": h6.get("buys"),
+            "Sells_6h": h6.get("sells"),
             "Buys_24h": h24.get("buys"),
             "Sells_24h": h24.get("sells"),
             "Pair_URL": p.get("url", ""),
@@ -780,7 +1410,9 @@ def fetch_dex_search(query):
     df = pd.DataFrame(rows)
     if not df.empty:
         for c in ["Price_USD", "Change_5m_Percent", "Change_1h_Percent", "Change_6h_Percent",
-                  "Change_24h_Percent", "Volume_24h_USD", "Liquidity_USD", "Buys_24h", "Sells_24h"]:
+                  "Change_24h_Percent", "Volume_1h_USD", "Volume_6h_USD", "Volume_24h_USD",
+                  "Liquidity_USD", "Buys_1h", "Sells_1h", "Buys_6h", "Sells_6h",
+                  "Buys_24h", "Sells_24h"]:
             df[c] = numeric(df[c])
         # Simple DEX screening score, deliberately penalizes low liquidity.
         ch = df["Change_24h_Percent"].fillna(0).clip(-50, 100)
@@ -813,14 +1445,495 @@ def fetch_dex_search(query):
                            np.where(liq < 200000, "Medium: check liquidity", "Review contract / market"))
         df = df.sort_values(["DEX_Screen_Score", "Liquidity_USD"], ascending=False, na_position="last")
     return df
- 
- 
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_gecko_hourly_candles(chain, pair_address):
+    """Return the two most recent CLOSED 1h candles for a DEX pool.
+
+    GeckoTerminal timestamps are candle-open UTC timestamps. The still-forming
+    current hour is deliberately excluded so a red/green live candle cannot
+    prematurely change the signal.
+    """
+    network_map = {
+        "ethereum": "eth", "eth": "eth",
+        "bsc": "bsc", "bnb": "bsc",
+        "solana": "solana",
+        "base": "base",
+        "arbitrum": "arbitrum", "optimism": "optimism",
+        "polygon": "polygon_pos", "polygon-pos": "polygon_pos",
+        "avalanche": "avax", "avax": "avax",
+        "fantom": "ftm", "cronos": "cro",
+        "linea": "linea", "zksync": "zksync",
+    }
+    network = network_map.get(str(chain or "").lower().strip())
+    if not network or not pair_address:
+        return None
+    url = f"https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pair_address}/ohlcv/hour"
+    payload = safe_get(
+        url, params={"aggregate": 1, "limit": 8, "currency": "usd", "token": "base"},
+        headers={"Accept": "application/json;version=20230203"}, timeout=15
+    )
+    candles = (((payload or {}).get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []
+    now_ts = int(time.time())
+    closed = []
+    for item in candles:
+        try:
+            ts, opn, high, low, close, volume = item[:6]
+            ts, opn, close = int(ts), float(opn), float(close)
+            if ts + 3600 <= now_ts and opn > 0 and close > 0:
+                closed.append({"timestamp": ts, "open": opn, "close": close,
+                               "volume": float(volume or 0),
+                               "color": "سبز" if close > opn else ("قرمز" if close < opn else "خنثی")})
+        except (TypeError, ValueError, IndexError):
+            continue
+    closed.sort(key=lambda x: x["timestamp"], reverse=True)
+    return closed[:2] if closed else None
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_public_exchange_hourly_market(symbol):
+    """Free public CEX fallback: return closed 1h OHLCV and taker-buy share.
+
+    Binance Spot is tried first, then OKX Spot. No API key is required. This
+    fallback is used when DEX Screener has no qualifying liquid pool, so
+    exchange-listed assets are not silently omitted from the hourly radar.
+    """
+    symbol = str(symbol or "").upper().strip()
+    if not re.fullmatch(r"[A-Z0-9]{2,15}", symbol):
+        return None
+    now_ms = int(time.time() * 1000)
+
+    # Binance public spot klines. Quote volume and taker-buy quote volume are
+    # provider-reported values; no transaction-count split is fabricated.
+    try:
+        raw = safe_get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": f"{symbol}USDT", "interval": "1h", "limit": 12},
+            timeout=12,
+        )
+        if isinstance(raw, list) and raw:
+            closed = [k for k in raw if len(k) > 10 and int(k[6]) <= now_ms]
+            closed.sort(key=lambda k: int(k[0]), reverse=True)
+            if closed:
+                last = closed[0]
+                quote_vol = float(last[7] or 0)
+                taker_buy_quote = float(last[10] or 0)
+                previous_vols = [float(k[7] or 0) for k in closed[1:7]]
+                avg_prev = sum(previous_vols) / len(previous_vols) if previous_vols else 0
+                opn, close = float(last[1]), float(last[4])
+                if opn > 0 and close > 0:
+                    return {
+                        "source": "Binance Spot",
+                        "change_1h": (close / opn - 1) * 100,
+                        "volume_1h": quote_vol,
+                        "volume_ratio": quote_vol / avg_prev if avg_prev > 0 else np.nan,
+                        "buys": np.nan,
+                        "sells": np.nan,
+                        "transactions": float(last[8] or 0),
+                        "buy_share": (taker_buy_quote / quote_vol * 100) if quote_vol > 0 else np.nan,
+                        "liquidity": np.nan,
+                        "candle": "سبز" if close > opn else ("قرمز" if close < opn else "خنثی"),
+                        "open": opn, "close": close, "timestamp": int(last[0] // 1000),
+                        "pair_url": f"https://www.binance.com/en/trade/{symbol}_USDT?type=spot",
+                        "chain": "CEX", "dex": "Binance Spot",
+                        "pair_address": f"{symbol}USDT", "token_address": "",
+                        "buy_pressure_type": "سهم حجم خرید تیکر (Binance)",
+                    }
+    except Exception:
+        pass
+
+    # OKX public spot candles as a second no-key source. OKX does not expose
+    # taker-side split in this endpoint, so buy pressure remains unavailable.
+    try:
+        raw = safe_get(
+            "https://www.okx.com/api/v5/market/candles",
+            params={"instId": f"{symbol}-USDT", "bar": "1H", "limit": "12"},
+            timeout=12,
+        )
+        rows = (raw or {}).get("data") or []
+        closed = [k for k in rows if len(k) >= 9 and str(k[8]) == "1"]
+        closed.sort(key=lambda k: int(k[0]), reverse=True)
+        if closed:
+            last = closed[0]
+            opn, close = float(last[1]), float(last[4])
+            quote_vol = float(last[7] or 0)
+            prev_vols = [float(k[7] or 0) for k in closed[1:7]]
+            avg_prev = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+            if opn > 0 and close > 0:
+                return {
+                    "source": "OKX Spot",
+                    "change_1h": (close / opn - 1) * 100,
+                    "volume_1h": quote_vol,
+                    "volume_ratio": quote_vol / avg_prev if avg_prev > 0 else np.nan,
+                    "buys": np.nan, "sells": np.nan, "transactions": np.nan,
+                    "buy_share": np.nan, "liquidity": np.nan,
+                    "candle": "سبز" if close > opn else ("قرمز" if close < opn else "خنثی"),
+                    "open": opn, "close": close, "timestamp": int(int(last[0]) // 1000),
+                    "pair_url": f"https://www.okx.com/trade-spot/{symbol.lower()}-usdt",
+                    "chain": "CEX", "dex": "OKX Spot",
+                    "pair_address": f"{symbol}-USDT", "token_address": "",
+                    "buy_pressure_type": "داده سهم خرید در دسترس نیست",
+                }
+    except Exception:
+        pass
+
+    # Kraken public OHLC fallback (no key). Its OHLC feed has no taker-side
+    # split; volume is converted to an approximate quote value using close.
+    try:
+        raw = safe_get(
+            "https://api.kraken.com/0/public/OHLC",
+            params={"pair": f"{symbol}USD", "interval": 60}, timeout=12,
+        )
+        result = (raw or {}).get("result") or {}
+        pair_key = next((k for k in result.keys() if k != "last"), None)
+        candles = result.get(pair_key) if pair_key else None
+        now_sec = int(time.time())
+        closed = [k for k in (candles or []) if len(k) >= 8 and int(float(k[0])) + 3600 <= now_sec]
+        closed.sort(key=lambda k: int(float(k[0])), reverse=True)
+        if closed:
+            last = closed[0]
+            opn, close = float(last[1]), float(last[4])
+            quote_vol = float(last[6] or 0) * close
+            prev_vols = [float(k[6] or 0) * float(k[4] or 0) for k in closed[1:7]]
+            avg_prev = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+            if opn > 0 and close > 0:
+                return {
+                    "source": "Kraken Spot", "change_1h": (close / opn - 1) * 100,
+                    "volume_1h": quote_vol,
+                    "volume_ratio": quote_vol / avg_prev if avg_prev > 0 else np.nan,
+                    "buys": np.nan, "sells": np.nan, "transactions": float(last[7] or 0),
+                    "buy_share": np.nan, "liquidity": np.nan,
+                    "candle": "سبز" if close > opn else ("قرمز" if close < opn else "خنثی"),
+                    "open": opn, "close": close, "timestamp": int(float(last[0])),
+                    "pair_url": f"https://pro.kraken.com/app/trade/{symbol.lower()}-usd",
+                    "chain": "CEX", "dex": "Kraken Spot", "pair_address": f"{symbol}USD",
+                    "token_address": "", "buy_pressure_type": "داده سهم خرید در دسترس نیست",
+                }
+    except Exception:
+        pass
+    return None
+
+
+def scan_hourly_pump_radar(market_frame, max_coins=100, min_pair_liquidity=100_000):
+    """
+    Scan a broad CoinGecko market universe. Prefer qualifying DEX pairs, then
+    fall back to free public Binance/OKX spot OHLCV for CEX-listed assets.
+    Stablecoins and ambiguous duplicate tickers remain excluded.
+    """
+    if market_frame is None or market_frame.empty or "Symbol" not in market_frame.columns:
+        return pd.DataFrame(), {"checked": 0, "errors": 0, "matched": 0, "skipped": 0}
+
+    base = mark_stablecoins(market_frame)
+    base = base[~base["Is_Excluded_Asset"].fillna(False)].copy()
+    for col in ["Volume_24h", "Market_Cap"]:
+        if col in base.columns:
+            base[col] = numeric(base[col])
+    base = base[base["Symbol"].notna()].copy()
+    base["Symbol"] = base["Symbol"].astype(str).str.upper().str.strip()
+    base = base[base["Symbol"].str.fullmatch(r"[A-Z0-9]{2,15}", na=False)]
+    # Avoid ambiguous ticker mappings: one symbol must identify only one market row.
+    duplicate_symbols = set(base.loc[base["Symbol"].duplicated(keep=False), "Symbol"])
+    base = base[~base["Symbol"].isin(duplicate_symbols)]
+    base = base.sort_values("Volume_24h", ascending=False, na_position="last").copy()
+    # Explicit priority symbols ensure major assets are not lost just below the
+    # volume cutoff. Only symbols present in the public market feed are appended.
+    priority_symbols = {"XMR", "ZEC"}
+    top_rows = base.head(int(max_coins))
+    priority_rows = base.loc[base["Symbol"].isin(priority_symbols)]
+    base = pd.concat([top_rows, priority_rows]).drop_duplicates(subset=["Symbol"], keep="first")
+    symbols = base["Symbol"].drop_duplicates().tolist()
+    if not symbols:
+        return pd.DataFrame(), {"checked": 0, "errors": 0, "matched": 0, "skipped": len(duplicate_symbols)}
+
+    jobs = {symbol: (symbol,) for symbol in symbols}
+    results = _run_parallel_jobs(
+        jobs, lambda symbol: fetch_dex_search(symbol), max_workers=4
+    )
+    market_lookup = base.set_index("Symbol").to_dict("index")
+    rows, errors, matched = [], 0, 0
+    used_pair_keys = set()
+    duplicate_pair_skipped = 0
+    cex_checked = 0
+
+    def append_cex_row(symbol):
+        nonlocal matched, cex_checked
+        # Keep public exchange fallback bounded; XMR/ZEC are always prioritized.
+        if cex_checked >= 40 and symbol not in priority_symbols:
+            return False
+        cex_checked += 1
+        cex = fetch_public_exchange_hourly_market(symbol)
+        if not cex:
+            return False
+        market_row = market_lookup.get(symbol, {})
+        ch1, vol1, volume_ratio = cex["change_1h"], cex["volume_1h"], cex["volume_ratio"]
+        if cex["candle"] == "قرمز":
+            cex_status = "در انتظار تأیید؛ آخرین کندل قرمز"
+        elif cex["candle"] == "خنثی":
+            cex_status = "در انتظار تأیید؛ کندل خنثی"
+        elif pd.notna(ch1) and ch1 > 6:
+            cex_status = "حرکت تند؛ احتمالاً دیرهنگام"
+        elif pd.notna(ch1) and ch1 >= 0 and pd.notna(volume_ratio) and volume_ratio >= 1.5:
+            cex_status = "زیر نظر؛ کندل سبز، شروط ناقص"
+        else:
+            cex_status = "شرایط اولیه کافی نیست"
+        volume_component = min(max(float(volume_ratio) * 25, 0), 100) if pd.notna(volume_ratio) else 50
+        momentum_component = min(max(50 + float(ch1) * 10, 0), 100) if pd.notna(ch1) else 50
+        rows.append({
+            "Coin": market_row.get("Coin", symbol), "Symbol": symbol,
+            "Change_1h_Percent": ch1, "Volume_1h_USD": vol1,
+            "Volume_1h_vs_6h_Avg": volume_ratio,
+            "Buys_1h": cex["buys"], "Sells_1h": cex["sells"],
+            "Transactions_1h": cex["transactions"], "Buy_Count_Share_1h": cex["buy_share"],
+            "Liquidity_USD": cex["liquidity"],
+            "Change_24h_Percent": market_row.get("Change_24h_Percent", np.nan),
+            "Pump_1h_Score": round((50 + volume_component + momentum_component) / 3, 1),
+            "Hourly_Status": cex_status, "Chain": cex["chain"], "DEX": cex["dex"],
+            "Pair_Address": cex["pair_address"], "Base_Token_Address": cex["token_address"],
+            "Pair_URL": cex["pair_url"], "Market_Data_Source": cex["source"],
+            "Buy_Pressure_Type": cex["buy_pressure_type"],
+            "Last_Closed_1h_Candle": cex["candle"],
+            "Last_Closed_1h_Open": cex["open"], "Last_Closed_1h_Close": cex["close"],
+            "Last_Closed_1h_Time_UTC": pd.to_datetime(cex["timestamp"], unit="s", utc=True).strftime("%Y-%m-%d %H:%M"),
+            "Previous_1h_Candle": "—",
+        })
+        matched += 1
+        return True
+
+    for symbol in symbols:
+        pairs = results.get(symbol)
+        if isinstance(pairs, Exception):
+            errors += 1
+            pairs = pd.DataFrame()
+        if not isinstance(pairs, pd.DataFrame) or pairs.empty:
+            pairs = pd.DataFrame()
+        else:
+            pairs = pairs[pairs["Symbol"].astype(str).str.upper().eq(symbol)].copy()
+        if pairs.empty:
+            append_cex_row(symbol)
+            continue
+        pairs["Liquidity_USD"] = numeric(pairs["Liquidity_USD"])
+        pairs["Volume_1h_USD"] = numeric(pairs.get("Volume_1h_USD", np.nan))
+        pairs["Volume_6h_USD"] = numeric(pairs.get("Volume_6h_USD", np.nan))
+        pairs["Change_1h_Percent"] = numeric(pairs["Change_1h_Percent"])
+        pairs["Buys_1h"] = numeric(pairs.get("Buys_1h", np.nan))
+        pairs["Sells_1h"] = numeric(pairs.get("Sells_1h", np.nan))
+        # Choose the deepest exact-ticker pair. Contract/pair URL remains visible for manual verification.
+        pairs = pairs[pairs["Liquidity_USD"].fillna(0) >= float(min_pair_liquidity)]
+        if pairs.empty:
+            append_cex_row(symbol)
+            continue
+        pairs = pairs.sort_values("Liquidity_USD", ascending=False)
+        pair = None
+        for _, candidate_pair in pairs.iterrows():
+            pair_key = (
+                str(candidate_pair.get("Chain", "")).lower().strip(),
+                str(candidate_pair.get("Pair", "")).lower().strip(),
+            )
+            if pair_key[1] and pair_key not in used_pair_keys:
+                pair = candidate_pair
+                used_pair_keys.add(pair_key)
+                break
+        if pair is None:
+            # A provider response must never reuse the same pool for another ticker.
+            duplicate_pair_skipped += 1
+            append_cex_row(symbol)
+            continue
+        ch1 = pair.get("Change_1h_Percent")
+        vol1 = pair.get("Volume_1h_USD")
+        vol6 = pair.get("Volume_6h_USD")
+        buys = pair.get("Buys_1h")
+        sells = pair.get("Sells_1h")
+        liquidity = pair.get("Liquidity_USD")
+        txns = (buys if pd.notna(buys) else 0) + (sells if pd.notna(sells) else 0)
+        buy_share = (float(buys) / txns * 100) if txns > 0 and pd.notna(buys) else np.nan
+        volume_ratio = (
+            float(vol1) / (float(vol6) / 6.0)
+            if pd.notna(vol1) and pd.notna(vol6) and float(vol6) > 0 else np.nan
+        )
+
+        # Scores reward early positive movement + volume expansion + buyer dominance,
+        # while penalizing vertical/late moves and thin pairs.
+        if pd.isna(ch1):
+            momentum_score = np.nan
+        elif 0.2 <= ch1 <= 1.2:
+            momentum_score = 75.0
+        elif 1.2 < ch1 <= 2.5:
+            momentum_score = 100.0
+        elif 2.5 < ch1 <= 4.0:
+            momentum_score = 75.0
+        elif 4.0 < ch1 <= 6.0:
+            momentum_score = 40.0
+        elif ch1 > 6.0:
+            momentum_score = 10.0
+        elif ch1 >= 0:
+            momentum_score = 45.0
+        else:
+            momentum_score = 0.0
+
+        if pd.isna(volume_ratio):
+            volume_score = np.nan
+        elif volume_ratio >= 3.0:
+            volume_score = 100.0
+        elif volume_ratio >= 2.0:
+            volume_score = 85.0
+        elif volume_ratio >= 1.5:
+            volume_score = 70.0
+        elif volume_ratio >= 1.2:
+            volume_score = 55.0
+        else:
+            volume_score = 15.0
+
+        if pd.isna(buy_share):
+            buy_score = np.nan
+        elif buy_share >= 65:
+            buy_score = 100.0
+        elif buy_share >= 58:
+            buy_score = 85.0
+        elif buy_share >= 53:
+            buy_score = 70.0
+        elif buy_share >= 50:
+            buy_score = 50.0
+        else:
+            buy_score = 10.0
+
+        liquidity_score = (
+            100.0 if liquidity >= 1_000_000 else
+            85.0 if liquidity >= 500_000 else
+            70.0 if liquidity >= 200_000 else 30.0
+        )
+        components = [(momentum_score, 0.30), (volume_score, 0.30),
+                     (buy_score, 0.25), (liquidity_score, 0.15)]
+        available = [(v, w) for v, w in components if pd.notna(v)]
+        score = sum(v * w for v, w in available) / sum(w for _, w in available) if available else np.nan
+
+        if pd.notna(ch1) and ch1 > 6:
+            status = "حرکت تند؛ احتمالاً دیرهنگام"
+        elif (pd.notna(score) and score >= 75 and pd.notna(ch1) and 0.2 <= ch1 <= 4.0
+              and pd.notna(volume_ratio) and volume_ratio >= 1.5
+              and pd.notna(buy_share) and buy_share >= 55
+              and liquidity >= 200_000 and txns >= 10):
+            status = "نامزد اولیه؛ حجم و خرید تأیید نسبی"
+        elif (pd.notna(score) and score >= 58 and pd.notna(ch1) and 0 <= ch1 <= 5.0
+              and liquidity >= 100_000 and txns >= 5):
+            status = "زیر نظر؛ تأیید کامل نیست"
+        else:
+            status = "شرایط اولیه کافی نیست"
+
+        market_row = market_lookup.get(symbol, {})
+        rows.append({
+            "Coin": market_row.get("Coin", pair.get("Token", symbol)),
+            "Symbol": symbol,
+            "Change_1h_Percent": ch1,
+            "Volume_1h_USD": vol1,
+            "Volume_1h_vs_6h_Avg": volume_ratio,
+            "Buys_1h": buys,
+            "Sells_1h": sells,
+            "Transactions_1h": txns,
+            "Buy_Count_Share_1h": buy_share,
+            "Liquidity_USD": liquidity,
+            "Change_24h_Percent": market_row.get("Change_24h_Percent", np.nan),
+            "Pump_1h_Score": round(float(score), 1) if pd.notna(score) else np.nan,
+            "Hourly_Status": status,
+            "Chain": pair.get("Chain", ""),
+            "DEX": pair.get("DEX", ""),
+            "Pair_Address": pair.get("Pair", ""),
+            "Base_Token_Address": pair.get("Base_Token_Address", ""),
+            "Pair_URL": pair.get("Pair_URL", ""),
+            "Market_Data_Source": "DEX Screener / GeckoTerminal",
+            "Buy_Pressure_Type": "سهم تعداد معاملات خرید (DEX)",
+            "Last_Closed_1h_Candle": "بررسی نشده",
+            "Last_Closed_1h_Open": np.nan,
+            "Last_Closed_1h_Close": np.nan,
+            "Last_Closed_1h_Time_UTC": "",
+            "Previous_1h_Candle": "—",
+        })
+        matched += 1
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        # GeckoTerminal's free public tier is rate-limited (~10 calls/min).
+        # Fetch candles only for the ten strongest preliminary candidates;
+        # all other rows are explicitly prevented from becoming candidates.
+        candle_eligible = result[result["Hourly_Status"].isin([
+            "نامزد اولیه؛ حجم و خرید تأیید نسبی", "زیر نظر؛ تأیید کامل نیست"
+        ])]
+        # CEX fallback rows already contain a completed exchange OHLCV candle.
+        cex_indices = result.index[result.get("Market_Data_Source", pd.Series("", index=result.index)).isin(["Binance Spot", "OKX Spot", "Kraken Spot"])].tolist()
+        candle_check_idx = candle_eligible.index.difference(cex_indices).tolist()
+        candle_check_idx = result.loc[candle_check_idx].sort_values(
+            ["Pump_1h_Score", "Volume_1h_vs_6h_Avg"], ascending=[False, False], na_position="last"
+        ).head(10).index.tolist()
+        candle_checked_count = len(cex_indices)
+        # No row may retain a candidate label until its closed candle is verified.
+        unchecked_candidate_mask = (
+            ~result.index.isin(candle_check_idx)
+            & result["Hourly_Status"].eq("نامزد اولیه؛ حجم و خرید تأیید نسبی")
+        )
+        result.loc[unchecked_candidate_mask, "Hourly_Status"] = "کندل بررسی نشد؛ کاندید نیست"
+        for idx in candle_check_idx:
+            row = result.loc[idx]
+            try:
+                candles = fetch_gecko_hourly_candles(row.get("Chain"), row.get("Pair_Address", ""))
+            except Exception:
+                candles = None
+            if not candles:
+                result.at[idx, "Hourly_Status"] = "کندل بررسی نشد؛ کاندید نیست"
+                result.at[idx, "Last_Closed_1h_Candle"] = "داده کندل در دسترس نیست"
+                continue
+            latest = candles[0]
+            candle_checked_count += 1
+            result.at[idx, "Last_Closed_1h_Candle"] = latest["color"]
+            result.at[idx, "Last_Closed_1h_Open"] = latest["open"]
+            result.at[idx, "Last_Closed_1h_Close"] = latest["close"]
+            result.at[idx, "Last_Closed_1h_Time_UTC"] = pd.to_datetime(latest["timestamp"], unit="s", utc=True).strftime("%Y-%m-%d %H:%M")
+            if len(candles) > 1:
+                result.at[idx, "Previous_1h_Candle"] = candles[1]["color"]
+            if latest["color"] != "سبز":
+                result.at[idx, "Hourly_Status"] = (
+                    "در انتظار تأیید؛ آخرین کندل قرمز" if latest["color"] == "قرمز"
+                    else "در انتظار تأیید؛ کندل خنثی"
+                )
+            elif row.get("Hourly_Status") == "نامزد اولیه؛ حجم و خرید تأیید نسبی":
+                result.at[idx, "Hourly_Status"] = "نامزد اولیه؛ کندل سبز تأیید شد"
+            elif row.get("Hourly_Status") == "زیر نظر؛ تأیید کامل نیست":
+                result.at[idx, "Hourly_Status"] = "زیر نظر؛ کندل سبز، شروط ناقص"
+
+        # Final safety invariant: the internal preliminary label must never reach the UI.
+        result.loc[
+            result["Hourly_Status"].eq("نامزد اولیه؛ حجم و خرید تأیید نسبی"),
+            "Hourly_Status"
+        ] = "کندل بررسی نشد؛ کاندید نیست"
+        status_order = {
+            "نامزد اولیه؛ کندل سبز تأیید شد": 0,
+            "زیر نظر؛ کندل سبز، شروط ناقص": 1,
+            "در انتظار تأیید؛ آخرین کندل قرمز": 2,
+            "در انتظار تأیید؛ کندل خنثی": 3,
+            "کندل بررسی نشد؛ کاندید نیست": 4,
+            "حرکت تند؛ احتمالاً دیرهنگام": 5,
+            "شرایط اولیه کافی نیست": 6,
+        }
+        result["_status_order"] = result["Hourly_Status"].map(status_order).fillna(9)
+        result = result.sort_values(
+            ["_status_order", "Pump_1h_Score", "Volume_1h_vs_6h_Avg"],
+            ascending=[True, False, False], na_position="last"
+        ).drop(columns="_status_order").reset_index(drop=True)
+    return result, {
+        "checked": len(symbols), "errors": errors, "matched": matched,
+        "candle_checked": candle_checked_count if not result.empty else 0,
+        "cex_fallback_checked": cex_checked,
+        "cex_rows": int(result.get("Market_Data_Source", pd.Series(dtype=str)).isin(["Binance Spot", "OKX Spot", "Kraken Spot"]).sum()) if not result.empty else 0,
+        "skipped": len(duplicate_symbols),
+        "duplicate_pair_skipped": duplicate_pair_skipped,
+    }
+
+
 # =========================================================
 # BYBIT PUBLIC DERIVATIVES SNAPSHOT (NO API KEY REQUIRED)
 # =========================================================
 BYBIT_API = "https://api.bybit.com"
- 
- 
+
+
 @st.cache_data(ttl=90, show_spinner=False)
 def fetch_bybit_derivatives():
     """Try Bybit, then OKX public SWAP data, then Gate.io public USDT futures."""
@@ -850,7 +1963,7 @@ def fetch_bybit_derivatives():
         errors.append("Bybit returned no USDT perpetual tickers")
     except Exception as exc:
         errors.append(f"Bybit: {str(exc)[:100]}")
- 
+
     # 2) OKX public market endpoints. Tickers + open interest are bulk requests;
     # funding is requested only for the 60 most active USDT perpetuals to respect rate limits.
     try:
@@ -895,7 +2008,7 @@ def fetch_bybit_derivatives():
         errors.append("OKX returned no usable USDT perpetuals")
     except Exception as exc:
         errors.append(f"OKX: {str(exc)[:100]}")
- 
+
     # 3) Gate.io public fallback
     try:
         gate_rows = safe_get("https://api.gateio.ws/api/v4/futures/usdt/tickers", timeout=18)
@@ -927,9 +2040,9 @@ def fetch_bybit_derivatives():
     except Exception as exc:
         errors.append(f"Gate.io: {str(exc)[:100]}")
         raise RuntimeError("All public derivatives feeds failed. " + " | ".join(errors))
- 
- 
- 
+
+
+
 def add_derivatives_score(frame):
     """Add a small positioning context weight; never treat OI as cash inflow."""
     out = frame.copy()
@@ -948,8 +2061,8 @@ def add_derivatives_score(frame):
     # agreed seven-factor score and must not overwrite its fixed weights.
     out["Derivatives_Data_Available"] = has_derivatives
     return out
- 
- 
+
+
 def _run_parallel_jobs(jobs, worker, max_workers=3):
     """Run independent API jobs concurrently and preserve input key order."""
     if not jobs:
@@ -963,14 +2076,14 @@ def _run_parallel_jobs(jobs, worker, max_workers=3):
             except Exception as exc:
                 results[key] = exc
     return results
- 
- 
+
+
 # =========================================================
 # CRYPTOMETER API
 # =========================================================
 CRYPTOMETER_API = "https://api.cryptometer.io"
- 
- 
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_cryptometer(endpoint: str, params: dict, api_key: str):
     """Fetch one CryptoMeter endpoint. The API key is never included in UI errors."""
@@ -990,7 +2103,7 @@ def fetch_cryptometer(endpoint: str, params: dict, api_key: str):
             break
     except requests.RequestException as exc:
         raise RuntimeError(f"Network error while calling CryptoMeter: {exc.__class__.__name__}") from None
- 
+
     if response.status_code in (401, 403):
         raise RuntimeError("CryptoMeter rejected the key or this endpoint is not enabled for your plan (HTTP 401/403).")
     if response.status_code == 429:
@@ -999,12 +2112,12 @@ def fetch_cryptometer(endpoint: str, params: dict, api_key: str):
         raise RuntimeError(f"CryptoMeter server error (HTTP {response.status_code}). Try again later.")
     if not response.ok:
         raise RuntimeError(f"CryptoMeter request failed (HTTP {response.status_code}). Check endpoint access and parameters.")
- 
+
     try:
         payload = response.json()
     except ValueError:
         raise RuntimeError("CryptoMeter returned a response that was not valid JSON.") from None
- 
+
     if isinstance(payload, dict):
         success = payload.get("success")
         error_flag = payload.get("error")
@@ -1012,12 +2125,12 @@ def fetch_cryptometer(endpoint: str, params: dict, api_key: str):
             message = payload.get("message") or payload.get("msg") or payload.get("error_message")
             raise RuntimeError(str(message or "CryptoMeter reported an API error.")[:240])
     return payload
- 
- 
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_cryptometer_buy_sell_volume(symbol: str, exchange: str, api_key: str):
     """Fetch provider-reported 24h buy/sell traded volume for one exchange pair.
- 
+
     The endpoint reports buy/sell volume for a specified market pair; this is
     not wallet-level whale flow and is not inferred from transaction counts.
     """
@@ -1048,15 +2161,15 @@ def fetch_cryptometer_buy_sell_volume(symbol: str, exchange: str, api_key: str):
             "Net buy (USDT)": float(buy) - float(sell),
             "Buy share (%)": (float(buy) / total * 100) if total > 0 else np.nan,
             "Data status": "Provider buy/sell volume"}
- 
- 
+
+
 def cryptometer_data(payload):
     """Return the endpoint's `data` value without assuming a single response shape."""
     if isinstance(payload, dict):
         return payload.get("data", payload)
     return payload
- 
- 
+
+
 def cryptometer_frame(payload):
     data = cryptometer_data(payload)
     if isinstance(data, list):
@@ -1065,20 +2178,20 @@ def cryptometer_frame(payload):
         # Some endpoints return a single record rather than a list of records.
         return pd.DataFrame([data])
     return pd.DataFrame()
- 
- 
+
+
 def _cm_number(value):
     try:
         value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
         return float(value) if pd.notna(value) else 0.0
     except Exception:
         return 0.0
- 
- 
+
+
 def cryptometer_watchlist(results):
     """Build a transparent evidence score only from symbol-level returned evidence."""
     evidence = {}
- 
+
     def slot(symbol):
         symbol = str(symbol or "").strip().upper()
         if not symbol:
@@ -1088,7 +2201,7 @@ def cryptometer_watchlist(results):
             "Whale buys USD": 0.0, "Whale sells USD": 0.0,
             "Netflow USD": np.nan,
         })
- 
+
     rapid_result = results.get("rapid") or {}
     if rapid_result.get("payload"):
         rapid = cryptometer_frame(rapid_result["payload"])
@@ -1105,7 +2218,7 @@ def cryptometer_watchlist(results):
             elif side in ("DUMP", "SELL", "DOWN"):
                 item["Rapid bias"] -= 1
             item["Rapid events"] += 1
- 
+
     whale_result = results.get("whales") or {}
     if whale_result.get("payload"):
         whales = cryptometer_frame(whale_result["payload"])
@@ -1120,7 +2233,7 @@ def cryptometer_watchlist(results):
                 item["Whale buys USD"] += usd
             elif side == "SELL":
                 item["Whale sells USD"] += usd
- 
+
     flow_result = results.get("liquidity") or {}
     if flow_result.get("payload"):
         flow_data = cryptometer_data(flow_result["payload"])
@@ -1130,7 +2243,7 @@ def cryptometer_watchlist(results):
                     item = slot(symbol)
                     if item is not None:
                         item["Netflow USD"] = _cm_number(values.get("netflow"))
- 
+
     rows = []
     for item in evidence.values():
         score = 50.0
@@ -1165,15 +2278,15 @@ def cryptometer_watchlist(results):
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).sort_values(["Activity score", "Evidence sources"], ascending=False)
- 
- 
+
+
 # =========================================================
 # HEADER
 # =========================================================
 st.title("📡 اسکنر هوشمند بازار ارزهای دیجیتال")
 st.caption("پایش گسترده بازار • شناسایی فرصت‌های پیش از رشد • رادار انباشت • افزایش حجم • کنترل ریسک")
-st.caption("Build 2026-11-08.2 • Parallel fetch + pooled HTTP + smart cache • Analysis engine preserved")
-st.caption("سرعت دریافت بهینه شده: صفحات بازار و درخواست‌های مستقل هم‌زمان اجرا می‌شوند؛ پاسخ‌ها کش می‌شوند و خطاهای موقت/محدودیت API با تلاش مجدد کنترل‌شده مدیریت می‌شوند.")
+st.caption("Build 2026-11-09.3 • Rate-limit-aware market fetch + pooled HTTP + smart cache • Analysis engine preserved")
+st.caption("دریافت بازار با فاصله‌گذاری بین صفحات و تلاش مجدد هوشمند انجام می‌شود؛ پاسخ‌ها ۵ دقیقه کش می‌شوند و در صورت محدودیت صفحه بعد، داده صفحات موفق حفظ می‌شود.")
 st.warning(
     "امتیازها ابزار غربالگری‌اند، نه احتمال قطعی پامپ یا توصیه مالی. داده‌های ناقص به‌عنوان سیگنال مثبت فرض نمی‌شوند؛ درصد پوشش شواهد را کنار امتیاز ببین."
 )
@@ -1182,7 +2295,7 @@ with st.expander("📘 راهنمای سریع استفاده از اسکنر", 
     guide_a.markdown("**۱. امتیاز هفت‌عاملی**\n\nخرید واقعی ۳۰٪، شتاب حجم ۲۰٪، مومنتوم ۱۵٪، نقدشوندگی ۱۵٪، تکنیکال ۱۰٪، وضعیت BTC پنج درصد و خبر پنج درصد. عواملِ بدون داده از محاسبه کنار می‌روند و پوشش شواهد نمایش داده می‌شود.")
     guide_b.markdown("**۲. ورود ترکیبی و محافظه‌کارانه**\n\nورود اولیه حداکثر ۲۵٪ حجم موقعیت؛ ۷۵٪ باقی‌مانده فقط پس از شکست مقاومت و تثبیت با حجم مناسب. سیگنال Watch به معنی ورود نیست.")
     guide_c.markdown("**۳. مدیریت ریسک**\n\nریسک پیشنهادی هر معامله حداکثر ۰٫۵٪ سرمایه؛ حداقل نسبت سود به زیان ۲ به ۱. اگر داده کافی یا حدضرر ساختاری نداریم، ورود صادر نمی‌شود.")
- 
+
 # =========================================================
 # SIDEBAR
 # =========================================================
@@ -1199,6 +2312,13 @@ with st.sidebar:
             help="Starts with up to 1,000 market coins. Reduce to 250 or 500 if CoinGecko rate limits occur.",
         )
         refresh_seconds = st.selectbox("فاصله به‌روزرسانی", [60, 120, 300, 600], index=1)
+    cmc_key_input = st.text_input(
+        "کلید API کوین‌مارکت‌کپ (CMC)",
+        value=secret_or_env("COINMARKETCAP_API_KEY") or secret_or_env("CMC_PRO_API_KEY"),
+        type="password",
+        help="برای فهرست بازار و داده‌های OHLCV تاریخی. دسترسی OHLCV و ATH در API رسمی CMC به پلن Startup یا بالاتر نیاز دارد.",
+        key="cmc_api_key_input",
+    )
     uploaded = st.file_uploader("انتخاب فایل داده CSV", type=["csv"])
     st.divider()
     st.subheader("🔬 تحلیل تکنیکال")
@@ -1217,10 +2337,10 @@ with st.sidebar:
     st.divider()
     st.subheader("📰 اخبار بازار")
     news_key_input = st.text_input(
-        "کلید API اخبار (اختیاری)",
+        "کلید CryptoPanic (اختیاری)",
         value=secret_or_env("CRYPTOPANIC_API_KEY"),
         type="password",
-        help="Set CRYPTOPANIC_API_KEY in Streamlit secrets or enter it here for this session.",
+        help="بدون کلید هم خبرها از RSS عمومی CoinDesk، Cointelegraph و Decrypt دریافت می‌شوند.",
     )
     st.divider()
     st.subheader("🧪 جست‌وجوی صرافی‌های غیرمتمرکز")
@@ -1230,19 +2350,22 @@ with st.sidebar:
     min_score = st.slider("حداقل امتیاز پیش از رشد", 0, 100, 70)
     min_liquidity = st.number_input("حداقل نقدشوندگی DEX (دلار)", min_value=0, value=50000, step=10000)
     show_all = st.checkbox("نمایش همه ردیف‌های جدول داده", value=True)
- 
+
 cg_key = secret_or_env("COINGECKO_API_KEY")
 # =========================================================
 # LOAD MARKET
 # =========================================================
 df = pd.DataFrame()
 dataset_name = ""
- 
+
 if data_source == "CoinGecko market":
     try:
         with st.spinner("Fetching CoinGecko market pages..."):
             df = fetch_market_pages(currency, pages, cg_key)
         dataset_name = "CoinGecko market API"
+        market_warning = df.attrs.get("market_fetch_warning", "")
+        if market_warning:
+            st.warning(market_warning)
     except Exception as exc:
         st.error(f"Could not fetch CoinGecko market data: {exc}")
         st.info("Check internet/API limits. You can reduce market coverage or upload a CSV instead.")
@@ -1257,11 +2380,11 @@ else:
     except Exception as exc:
         st.error(f"Could not read CSV: {exc}")
         st.stop()
- 
+
 if df.empty:
     st.warning("No records returned.")
     st.stop()
- 
+
 # Normalize uploaded CSV common columns and preserve any original values.
 rename_candidates = {
     "name": "Coin", "coin": "Coin",
@@ -1281,7 +2404,7 @@ for col in df.columns:
     if key in rename_candidates and rename_candidates[key] not in df.columns:
         rename[key] = rename_candidates[key]
 df = df.rename(columns=rename)
- 
+
 for col in ["Change_24h_Percent", "Change_7d_Percent", "Price", "Volume_24h", "Market_Cap"]:
     if col in df.columns:
         df[col] = numeric(df[col])
@@ -1291,7 +2414,7 @@ if "Coin" not in df.columns:
     df["Coin"] = df.get("Symbol", pd.Series(["Unknown"] * len(df), index=df.index))
 if "Symbol" not in df.columns:
     df["Symbol"] = df["Coin"].astype(str).str.upper()
- 
+
 if "Change_24h_Percent" not in df.columns:
     df["Change_24h_Percent"] = np.nan
 if "Change_7d_Percent" not in df.columns:
@@ -1304,7 +2427,7 @@ if "Price" not in df.columns:
     df["Price"] = np.nan
 if "CoinGecko_ID" not in df.columns:
     df["CoinGecko_ID"] = np.nan
- 
+
 if "Market_Momentum_Score" not in df.columns:
     df["Market_Momentum_Score"] = (
         50 + 1.4 * df["Change_24h_Percent"].fillna(0) +
@@ -1316,7 +2439,7 @@ if "News_Score" not in df.columns:
     df["News_Score"] = np.nan
 if "Pump_Potential_Score" not in df.columns:
     df["Pump_Potential_Score"] = df["Market_Momentum_Score"]
- 
+
 # Live derivatives context: one public exchange request, cached for 90 seconds.
 bybit_status = "not requested"
 if data_source == "CoinGecko market" and use_bybit_derivatives:
@@ -1330,7 +2453,7 @@ if data_source == "CoinGecko market" and use_bybit_derivatives:
         bybit_status = f"unavailable: {str(exc)[:180]}"
         for col in ["Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange", "Derivatives_Change_24h_Percent", "Derivatives_Pair"]:
             df[col] = np.nan
- 
+
 # =========================================================
 # TECHNICAL INDICATORS FOR TOP-VOLUME CANDIDATES
 # =========================================================
@@ -1388,19 +2511,19 @@ elif (data_source == "CoinGecko market" and technical_limit > 0
             df["Pump_Potential_Score"] = np.where(
                 tech_score.notna(), 0.60 * market + 0.40 * tech_score, market
             ).clip(0, 100).round(2)
- 
+
 # The primary ranking is now Pre-Pump: unusual turnover + quiet price + liquidity + optional history.
 df = calculate_pre_pump_score(df)
 if data_source == "CoinGecko market" and use_bybit_derivatives:
     df = add_derivatives_score(df)
- 
+
 # Always create this optional history column. It is absent when technical
 # history has not been fetched (or when the API returns no history).
 if "Volume_24h_vs_7d_Avg" not in df.columns:
     df["Volume_24h_vs_7d_Avg"] = np.nan
 else:
     df["Volume_24h_vs_7d_Avg"] = numeric(df["Volume_24h_vs_7d_Avg"])
- 
+
 # =========================================================
 # MARKET SENTIMENT INDICES — Fear & Greed + Altcoin Season
 # =========================================================
@@ -1429,15 +2552,40 @@ def fetch_fear_greed_history():
     if not records:
         raise ValueError("Fear & Greed provider returned no valid observations")
     return pd.DataFrame(records).sort_values("Timestamp").reset_index(drop=True)
- 
- 
+
+
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_altcoin_season_index():
-    """CoinMarketCap public/keyless Altcoin Season Index endpoint."""
-    payload = safe_get(
-        "https://pro-api.coinmarketcap.com/public-api/v1/altcoin-season-index/latest",
-        timeout=15,
-    )
+def fetch_altcoin_season_index(key_override=""):
+    """Fetch CMC Altcoin Season Index; prefer a personal API-key rate pool."""
+    cmc_key = (key_override or secret_or_env("COINMARKETCAP_API_KEY") or secret_or_env("CMC_PRO_API_KEY")).strip()
+    if cmc_key:
+        # Authenticated requests use the user's own CMC rate limit instead of
+        # the shared keyless IP pool that commonly returns HTTP 429.
+        url = "https://pro-api.coinmarketcap.com/v1/altcoin-season-index/latest"
+        headers = {"X-CMC_PRO_API_KEY": cmc_key, "Accept": "application/json"}
+    else:
+        # This endpoint is also available without a key, but its IP pool is shared.
+        url = "https://pro-api.coinmarketcap.com/public-api/v1/altcoin-season-index/latest"
+        headers = {"Accept": "application/json"}
+
+    # Do not rapidly retry 429s: CMC's public endpoint is IP-throttled.
+    response = _http_session().get(url, headers=headers, timeout=15)
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After", "60")
+        try:
+            retry_seconds = max(1, int(float(retry_after)))
+        except (TypeError, ValueError):
+            retry_seconds = 60
+        raise requests.HTTPError(
+            f"CoinMarketCap محدودیت درخواست (429) اعمال کرده؛ {retry_seconds} ثانیه بعد دوباره تلاش کنید. "
+            "اگر کلید CMC دارید، آن را با نام COINMARKETCAP_API_KEY در Secrets قرار دهید.",
+            response=response,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    status = payload.get("status", {}) if isinstance(payload, dict) else {}
+    if status and str(status.get("error_code", "0")) not in ("0", "None", ""):
+        raise ValueError(f"CMC API: {status.get('error_message') or status.get('error_code')}")
     data = payload.get("data", {}) if isinstance(payload, dict) else {}
     value = data.get("altcoin_index")
     if value is None:
@@ -1451,8 +2599,8 @@ def fetch_altcoin_season_index():
         "yearly_high": data.get("yearly_high"),
         "yearly_low": data.get("yearly_low"),
     }
- 
- 
+
+
 def sentiment_label(value):
     if value < 25:
         return "ترس شدید"
@@ -1463,8 +2611,8 @@ def sentiment_label(value):
     if value <= 75:
         return "طمع"
     return "طمع شدید"
- 
- 
+
+
 def render_semi_gauge(value, title, subtitle, marker_color="#1769d2"):
     """Compact semicircular Plotly gauge with explicit 0–100 scale."""
     fig = go.Figure(go.Indicator(
@@ -1494,15 +2642,15 @@ def render_semi_gauge(value, title, subtitle, marker_color="#1769d2"):
     fig.update_layout(height=265, margin={"l": 22, "r": 22, "t": 65, "b": 12},
                       paper_bgcolor="rgba(0,0,0,0)", font={"family": "Arial"})
     return fig
- 
- 
+
+
 # =========================================================
 # منوی اصلی بخش‌های اسکنر
 # =========================================================
 filtered = df[(numeric(df["PrePump_Score"]).fillna(0) >= min_score) & (~df["Is_Excluded_Asset"])].copy()  # پیش‌فرض برای بخش‌های دیگر
 section = st.radio(
     "انتخاب بخش اسکنر",
-    ["🏠 نمای کلی", "🧲 رادار انباشت و پیش‌پامپ", "📈 همگرایی و واگرایی با بیت‌کوین", "📊 نمودارها و ریزش‌ها", "📰 اخبار و DEX", "🐋 جریان پول و مشتقات", "📁 داده‌ها"],
+    ["🏠 نمای کلی", "🧲 رادار انباشت و پیش‌پامپ", "₿ رابطه ارزها با بیت‌کوین", "📊 نمودارها و ریزش‌ها", "📰 اخبار و DEX", "🐋 جریان پول و مشتقات", "📁 داده‌ها"],
     horizontal=True,
     label_visibility="collapsed",
     key="scanner_section_navigation",
@@ -1514,14 +2662,14 @@ if section != "🐋 جریان پول و مشتقات" and data_source == "CoinG
 st.caption({
     "🏠 نمای کلی": "خلاصه وضعیت بازار و شاخص‌های اصلی اسکنر",
     "🧲 رادار انباشت و پیش‌پامپ": "ارزهایی که نشانه‌های اولیه انباشت یا فعالیت پیش از رشد دارند",
-    "📈 همگرایی و واگرایی با بیت‌کوین": "مقایسه جهت حرکت و قدرت نسبی آلت‌کوین‌ها در برابر بیت‌کوین",
+    "₿ رابطه ارزها با بیت‌کوین": "همبستگی ساعتی و واگرایی عملکرد ارزها نسبت به BTC",
     "📊 نمودارها و ریزش‌ها": "بررسی ساختار قیمت، شاخص‌های تکنیکال و ارزهای با افت شدید",
     "📰 اخبار و DEX": "اخبار، فعالیت صرافی‌های غیرمتمرکز و فشار خرید و فروش",
     "🐋 جریان پول و مشتقات": "جریان پول، خرید و فروش واقعی، فاندینگ و سود باز",
     "📁 داده‌ها": "مشاهده و دریافت داده خام بازار",
 }[section])
 st.divider()
- 
+
 # =========================================================
 if section == "🏠 نمای کلی":
     # MAIN FILTERS / KPIS
@@ -1540,12 +2688,14 @@ if section == "🏠 نمای کلی":
             st.success(f"Public derivatives feed: {bybit_status} • cached 90 seconds")
         else:
             st.warning(f"Public derivatives feed {bybit_status}. Scanner continues without it.")
- 
+
     # Live sentiment meters — these are market context indicators, not entry signals.
     st.divider()
     st.subheader("🌡️ دماسنج احساسات بازار")
     st.caption("دو شاخص مستقل برای سنجش جو بازار؛ مقدارها از ارائه‌دهنده دریافت می‌شوند و در صورت قطعی API عدد ساختگی نمایش داده نمی‌شود.")
     fg_col, alt_col = st.columns(2, gap="large")
+    fg_value = None
+    alt_value = None
     try:
         fg_history = fetch_fear_greed_history()
         fg_latest = fg_history.iloc[-1]
@@ -1582,9 +2732,14 @@ if section == "🏠 نمای کلی":
     except Exception as exc:
         with fg_col:
             st.warning(f"شاخص ترس و طمع فعلاً دریافت نشد: {str(exc)[:180]}")
- 
+
     try:
-        alt_data = fetch_altcoin_season_index()
+        alt_retry_until = float(st.session_state.get("cmc_altcoin_retry_until", 0) or 0)
+        if time.time() < alt_retry_until:
+            wait_left = max(1, int(alt_retry_until - time.time()))
+            raise RuntimeError(f"برای جلوگیری از تکرار خطای 429، دریافت شاخص موقتاً متوقف است؛ حدود {wait_left} ثانیه دیگر دوباره صفحه را تازه کنید.")
+        alt_data = fetch_altcoin_season_index(st.session_state.get("cmc_api_key_input", ""))
+        st.session_state.pop("cmc_altcoin_retry_until", None)
         alt_value = alt_data["value"]
         if alt_value < 25:
             alt_label = "فصل بیت‌کوین"
@@ -1603,11 +2758,19 @@ if section == "🏠 نمای کلی":
             if alt_data.get("snapshot_time"):
                 st.caption(f"زمان ثبت داده: {alt_data['snapshot_time']}")
     except Exception as exc:
+        response = getattr(exc, "response", None)
+        if response is not None and response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "60")
+            try:
+                cooldown = max(30, int(float(retry_after)))
+            except (TypeError, ValueError):
+                cooldown = 60
+            st.session_state["cmc_altcoin_retry_until"] = time.time() + cooldown
         with alt_col:
-            st.warning(f"شاخص فصل آلت‌کوین‌ها فعلاً دریافت نشد: {str(exc)[:180]}")
- 
+            st.warning(f"شاخص فصل آلت‌کوین‌ها فعلاً دریافت نشد: {str(exc)[:240]}")
+
     st.divider()
- 
+
     search = st.text_input("🔎 Search coin name or symbol", value="")
     filtered = df.copy()
     if search.strip():
@@ -1620,28 +2783,28 @@ if section == "🏠 نمای کلی":
         rank_max = st.slider("Maximum market-cap rank", 10, max(10, int(pd.to_numeric(df.get("Market_Cap_Rank", pd.Series([250])), errors="coerce").max() or 250)), value=min(250, max(10, int(pd.to_numeric(df.get("Market_Cap_Rank", pd.Series([250])), errors="coerce").max() or 250))))
         filtered = filtered[pd.to_numeric(filtered["Market_Cap_Rank"], errors="coerce").fillna(rank_max + 1) <= rank_max]
     filtered = filtered[(numeric(filtered["PrePump_Score"]).fillna(0) >= min_score) & (~filtered["Is_Excluded_Asset"])]
- 
+
     if filtered.empty:
         st.info("No coins match these filters. Lower the minimum score or broaden your search.")
         # Do not stop: DEX and news panels may still be useful.
- 
+
     a, b, c, d = st.columns(4)
     a.metric("🪙 Coins loaded", f"{len(df):,}")
     b.metric("🔎 Matching signals", f"{len(filtered):,}")
     c.metric("🟢 Positive 24h", int((numeric(df["Change_24h_Percent"]) > 0).sum()))
     d.metric("📊 Median score", fmt_num(numeric(df["Pump_Potential_Score"]).median()))
- 
+
     e, f, g = st.columns(3)
     e.metric("💰 Total 24h volume", fmt_money(numeric(df["Volume_24h"]).sum(), currency))
     f.metric("🛰️ Pre-pump watch", int(df["Signal"].astype(str).str.startswith("Pre-pump watch").sum()))
     g.metric("⚠️ High-risk / overheated", int(df["Risk_Level"].astype(str).str.startswith("High").sum()))
- 
+
     # Persian market intelligence report (uses only fields actually present)
     st.divider()
     with st.container(border=True):
         st.subheader("🧠 گزارش هوشمند بازار و ردپای نهنگ‌ها")
         st.caption("گزارش پویا بر اساس داده‌های همین اجرای اسکنر؛ نبود داده به‌عنوان سیگنال مثبت تفسیر نمی‌شود.")
- 
+
         report_parts = []
         market_up = int((numeric(df.get("Change_24h_Percent", pd.Series(np.nan, index=df.index))) > 0).sum())
         market_down = int((numeric(df.get("Change_24h_Percent", pd.Series(np.nan, index=df.index))) < 0).sum())
@@ -1656,7 +2819,7 @@ if section == "🏠 نمای کلی":
                 report_parts.append(f"**تصویر کلی بازار:** وضعیت دوطرفه و بدون برتری روشن است؛ {up_share:.0f}٪ از ارزهای دارای داده مثبت‌اند. بهتر است منتظر تأیید جهت بازار بمانیم.")
         else:
             report_parts.append("**تصویر کلی بازار:** داده کافی برای سنجش گستردگی رشد و ریزش بازار وجود ندارد.")
- 
+
         flow_col = "Net_Buy_USD" if "Net_Buy_USD" in df.columns else None
         buy_share_col = "Buy_Share_Percent" if "Buy_Share_Percent" in df.columns else None
         if flow_col:
@@ -1674,30 +2837,61 @@ if section == "🏠 نمای کلی":
                 report_parts.append("**جریان پول:** داده واقعی خالص خرید برای این بازار در دسترس نیست؛ حجم ۲۴ساعته به‌تنهایی ورود پول را ثابت نمی‌کند.")
         else:
             report_parts.append("**جریان پول:** ستون خالص خرید واقعی در داده فعلی موجود نیست؛ از حجم معاملات به‌عنوان ورود پول قطعی استفاده نمی‌کنیم.")
- 
+
         if buy_share_col:
             shares = numeric(df[buy_share_col]).dropna()
             if not shares.empty:
                 mean_share = float(shares.mean())
                 report_parts.append(f"**فشار خرید:** میانگین سهم خرید ثبت‌شده در ارزهای دارای داده {mean_share:.1f}٪ است؛ این عدد فقط برای همان نمونه‌های پوشش‌داده‌شده معتبر است.")
- 
+
         cm_report = st.session_state.get("cryptometer_results", {})
         whale_payload = cm_report.get("whales", {}).get("payload") if isinstance(cm_report, dict) else None
         if whale_payload:
             report_parts.append("**ردپای نهنگ‌ها:** داده معاملات بزرگ CryptoMeter دریافت شده است. جمع‌بندی جهت خرید و فروش در بخش «جریان پول و مشتقات» و نمودار معاملات نهنگ‌ها نمایش داده می‌شود.")
         else:
             report_parts.append("**ردپای نهنگ‌ها:** در این اجرا داده معاملات نهنگ از CryptoMeter دریافت نشده است؛ بنابراین نمی‌توان با اطمینان از انباشت یا توزیع نهنگ‌ها صحبت کرد.")
- 
+
         if "Signal" in df.columns:
             pre_count = int(df["Signal"].astype(str).str.startswith("Pre-pump watch").sum())
             avoid_count = int(df["Risk_Level"].astype(str).str.startswith("High").sum()) if "Risk_Level" in df.columns else 0
             report_parts.append(f"**فرصت‌های زیرنظر:** اسکنر {pre_count} مورد در وضعیت رصد پیش‌پامپ و {avoid_count} مورد با ریسک بالا شناسایی کرده است. رصد به معنی نقطه ورود نیست؛ شکست مقاومت و تثبیت همراه حجم لازم است.")
- 
+
+        st.markdown("### 🧭 خلاصه تصمیم‌گیری بازار")
+        market_change = numeric(df.get("Change_24h_Percent", pd.Series(np.nan, index=df.index)))
+        median_change = market_change.median()
+        btc_rows = df[df.get("Symbol", pd.Series("", index=df.index)).astype(str).str.upper().eq("BTC")]
+        if not btc_rows.empty:
+            btc_row = btc_rows.iloc[0]
+            btc_24 = numeric(pd.Series([btc_row.get("Change_24h_Percent")])).iloc[0]
+            btc_7 = numeric(pd.Series([btc_row.get("Change_7d_Percent")])).iloc[0]
+            btc_text = f"بیت‌کوین: ۲۴ساعته {btc_24:+.2f}٪" if pd.notna(btc_24) else "بیت‌کوین: تغییر ۲۴ساعته ناموجود"
+            btc_text += f" و هفتگی {btc_7:+.2f}٪" if pd.notna(btc_7) else "؛ داده هفتگی ناموجود"
+        else:
+            btc_text = "داده بیت‌کوین در فهرست فعلی موجود نیست."
+        if pd.notna(median_change):
+            breadth_text = f"میانه تغییر ۲۴ساعته کل فهرست {median_change:+.2f}٪ است؛ "
+            breadth_text += "اکثریت بازار تمایل مثبت دارد." if market_valid and market_up / market_valid >= 0.60 else ("اکثریت بازار تمایل منفی دارد." if market_valid and market_up / market_valid <= 0.40 else "بازار جهت یکپارچه‌ای ندارد.")
+        else:
+            breadth_text = "برای محاسبه میانه تغییرات بازار داده کافی نداریم."
+        st.write(f"**وضعیت بیت‌کوین:** {btc_text}")
+        st.write(f"**گستردگی بازار:** {breadth_text}")
+        candidates = df[~df.get("Is_Excluded_Asset", pd.Series(False, index=df.index)).fillna(False)].copy()
+        if "PrePump_Score" in candidates.columns:
+            candidates["PrePump_Score"] = numeric(candidates["PrePump_Score"])
+            candidates = candidates[candidates["PrePump_Score"].notna()].sort_values("PrePump_Score", ascending=False)
+            if not candidates.empty:
+                top = candidates.head(3)
+                top_text = "، ".join(f"{r.get('Symbol','?')} ({float(r['PrePump_Score']):.0f}/100)" for _, r in top.iterrows())
+                st.write(f"**سه گزینه با امتیاز پیش‌پامپ بالاتر:** {top_text}؛ این‌ها فقط برای رصد هستند و بدون تأیید خرید واقعی/حجم، سیگنال ورود محسوب نمی‌شوند.")
+            else:
+                st.write("**فرصت پیش‌پامپ:** هنوز گزینه‌ای با امتیاز معتبر و داده کافی شناسایی نشده است.")
+        else:
+            st.write("**فرصت پیش‌پامپ:** امتیاز پیش‌پامپ در داده فعلی محاسبه نشده است.")
         for report_line in report_parts:
             st.markdown(report_line)
- 
+
         st.caption("این گزارش تحلیلی و غربالگری است، نه پیش‌بینی قطعی. کیفیت نتیجه به پوشش و تازگی داده‌های API وابسته است.")
- 
+
     st.divider()
 if section == "🧲 رادار انباشت و پیش‌پامپ":
     st.subheader("🧲 رادار انباشت قبل از شکست مقاومت")
@@ -1727,10 +2921,167 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
             st.info("برای محاسبه رادار انباشت، ابتدا از تنظیمات کناری دکمه «Calculate technical indicators» را اجرا کن.")
     else:
         st.info("ستون‌های لازم برای ارزیابی انباشت هنوز موجود نیستند.")
- 
+
     st.divider()
     st.subheader("🛰️ فرصت‌های احتمالی پیش از رشد")
     st.caption("استیبل‌کوین‌ها حذف شده‌اند. سیگنال معتبر نیازمند خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه، نقدشوندگی مناسب و بازار BTC غیرنزولی است. درصد پوشش نشان می‌دهد چه مقدار از هفت عامل واقعاً داده داشته‌اند.")
+
+    # CoinMarketCap broad-universe radar: no 30-coin CoinGecko cutoff.
+    st.markdown("### 🌐 رادار گسترده CoinMarketCap")
+    st.caption(
+        "CMC فهرست ارزهای فعال را می‌سازد؛ سپس کندل‌های روزانه کامل‌شده، حجم سه‌روزه، ATH و قدرت نسبی در برابر BTC بررسی می‌شوند. "
+        "استیبل‌کوین‌ها و بازارهای کم‌عمق حذف می‌شوند. این اسکن جدا از منبع اصلی CoinGecko کار می‌کند."
+    )
+    cmc_key = (st.session_state.get("cmc_api_key_input") or secret_or_env("COINMARKETCAP_API_KEY") or secret_or_env("CMC_PRO_API_KEY")).strip()
+    cmc_a, cmc_b = st.columns([1, 2])
+    with cmc_a:
+        cmc_universe_limit = st.selectbox("تعداد ارزهای فهرست CMC", [250, 500, 1000], index=1, key="cmc_universe_limit")
+    with cmc_b:
+        st.caption("حجم ۲۴ساعته حداقل ۱۰۰ هزار دلار • ارزش بازار حداقل ۱ میلیون دلار • حداقل ۳ بازار معاملاتی")
+    if not cmc_key:
+        st.info("برای فعال‌سازی این رادار، کلید API کوین‌مارکت‌کپ را در کادر تنظیمات کناری وارد کن. کلید در این برنامه به‌صورت رمز عبور نمایش داده می‌شود.")
+    elif st.button("🚀 اسکن گسترده بازار با CoinMarketCap", key="run_cmc_broad_pre_pump", type="primary"):
+        with st.spinner(f"در حال دریافت {cmc_universe_limit:,} ارز فعال CMC و بررسی کندل‌های روزانه..."):
+            try:
+                cmc_candidates, cmc_watch, cmc_meta = run_cmc_pre_pump_scan(cmc_universe_limit, cmc_key)
+                st.session_state["cmc_pre_pump_candidates_v1"] = cmc_candidates
+                st.session_state["cmc_pre_pump_watch_v1"] = cmc_watch
+                st.session_state["cmc_pre_pump_meta_v1"] = cmc_meta
+                st.session_state["cmc_pre_pump_time_v1"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
+            except Exception as exc:
+                st.error(f"اسکن CMC کامل نشد: {str(exc)[:500]}")
+                if "403" in str(exc) or "plan" in str(exc).lower() or "subscription" in str(exc).lower():
+                    st.warning("طبق مستندات CMC، دسترسی به OHLCV تاریخی و آمار ATH از پلن Startup یا بالاتر شروع می‌شود؛ پلن Basic این داده‌ها را ارائه نمی‌کند.")
+
+    cmc_candidates = st.session_state.get("cmc_pre_pump_candidates_v1")
+    cmc_watch = st.session_state.get("cmc_pre_pump_watch_v1")
+    if isinstance(cmc_candidates, pd.DataFrame) and isinstance(cmc_watch, pd.DataFrame):
+        cm = st.session_state.get("cmc_pre_pump_meta_v1", {})
+        st.caption(
+            f"آخرین اسکن: {st.session_state.get('cmc_pre_pump_time_v1', '—')} • "
+            f"فهرست CMC: {cm.get('universe', 0):,} • واجد شرایط نقدشوندگی: {cm.get('eligible', 0):,} • "
+            f"کندل روزانه بررسی‌شده: {cm.get('daily_checked', 0):,} • تأیید ساعتی: {cm.get('hourly_checked', 0):,} • "
+            f"تغییر ۷روزه BTC: {cm.get('btc_7d', 0):+.2f}%"
+        )
+        m1, m2, m3 = st.columns(3)
+        m1.metric("کاندیدهای آماده", len(cmc_candidates))
+        m2.metric("رادار زیرنظر", len(cmc_watch))
+        m3.metric("خطاهای دسته‌ای API", cm.get("errors", 0))
+        cmc_cols = {
+            "Coin": "ارز", "Symbol": "نماد", "Market_Cap_Rank": "رتبه CMC",
+            "Price": "قیمت USD", "Change_1h_Percent": "تغییر ۱ساعته٪",
+            "Change_24h_Percent": "تغییر ۲۴ساعته٪", "Change_7d_Percent": "تغییر ۷روزه٪",
+            "Relative_Strength_vs_BTC_7d": "قدرت نسبی نسبت به BTC٪",
+            "Green_Days_Last_3": "تعداد کندل سبز از ۳ روز", "Volume_Increasing_3d": "حجم سه‌روزه افزایشی",
+            "Volume_vs_Previous_7d_Avg": "حجم روز آخر / میانگین قبلی",
+            "ATH_Price": "سقف تاریخی USD", "ATH_Drawdown_Percent": "فاصله از ATH٪",
+            "Last_Closed_1h_Candle": "آخرین کندل بسته‌شده ۱ساعته",
+            "Last_Closed_1h_Time_UTC": "زمان کندل ساعتی UTC", "Volume_24h": "حجم ۲۴ساعته USD",
+            "Market_Cap": "ارزش بازار USD", "Num_Market_Pairs": "تعداد بازارها", "Signal": "وضعیت رادار"
+        }
+        st.markdown("#### 🟢 کاندیدهای آماده؛ تمام شروط اصلی برقرار")
+        if cmc_candidates.empty:
+            st.info("فعلاً هیچ ارزی تمام شروط سخت‌گیرانه را ندارد. این نتیجه در بازار نزولی طبیعی است.")
+        else:
+            st.dataframe(cmc_candidates.rename(columns=cmc_cols), use_container_width=True, hide_index=True)
+        st.markdown("#### 🟡 رادار زیرنظر؛ قدرت نسبی در بازار ضعیف")
+        if cmc_watch.empty:
+            st.info("در این اسکن، ارزی با قدرت نسبی مثبت و افزایش حجم کافی برای زیرنظر پیدا نشد.")
+        else:
+            st.dataframe(cmc_watch.rename(columns=cmc_cols), use_container_width=True, hide_index=True)
+        if cm.get("ath_stats_error"):
+            st.warning("داده ATH از CMC دریافت نشد؛ بنابراین هیچ ارزی بدون تأیید سقف تاریخی به فهرست کاندید آماده راه پیدا نکرد. جزئیات: " + str(cm.get("ath_stats_error")))
+        st.caption("نکته: سه کندل روزانه کامل‌شده بر اساس UTC سنجیده می‌شوند. کندل یک‌ساعته فقط اطلاعات تأییدی است؛ رنگ آن از آخرین کندل کامل‌شده CMC گرفته می‌شود. کاندید آماده به معنی توصیه خرید یا تضمین پامپ نیست.")
+
+    # Dedicated 1-hour early-pump radar. It is on-demand to avoid 30 API calls
+    # on every Streamlit rerun and uses DEX-reported hourly volume/transactions.
+    st.markdown("### ⏱️ رادار شکار پامپ یک‌ساعته")
+    st.caption(
+        "علاوه بر حجم و نسبت خرید به فروش، آخرین کندل یک‌ساعته بسته‌شده از OHLCV جفت DEX بررسی می‌شود. "
+        "کندل قرمز یا داده کندل ناموجود اجازه صدور وضعیت کاندید اولیه نمی‌دهد. "
+        "اسکن تا ۱۰۰ ارز بازار را بررسی می‌کند: ابتدا جفت‌های DEX و در صورت نبود جفت مناسب، کندل عمومی Binance/OKX/Kraken را بدون API Key می‌خواند. "
+        "استیبل‌کوین‌ها حذف می‌شوند؛ برای ردیف‌های CEX، نقدشوندگی DEX و سهم خرید فقط در صورت ارائه منبع نمایش داده می‌شود."
+    )
+    if data_source != "CoinGecko market":
+        st.info("برای ساخت فهرست نمادهای بازار، منبع زنده CoinGecko market را انتخاب کن.")
+    else:
+        if st.button("🚀 اجرای رادار یک‌ساعته (تا ۱۰۰ ارز)", key="run_hourly_pump_radar_candle_v3", type="primary"):
+            with st.spinner("در حال بررسی DEX و کندل‌های عمومی صرافی‌ها برای حداکثر ۱۰۰ ارز..."):
+                hourly_result, hourly_meta = scan_hourly_pump_radar(df, max_coins=100)
+            st.session_state["hourly_pump_radar_results_candle_v3"] = hourly_result
+            st.session_state["hourly_pump_radar_meta_candle_v3"] = hourly_meta
+            st.session_state["hourly_pump_radar_time_candle_v3"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        hourly_result = st.session_state.get("hourly_pump_radar_results_candle_v3")
+        if isinstance(hourly_result, pd.DataFrame):
+            meta = st.session_state.get("hourly_pump_radar_meta_candle_v3", {})
+            st.caption(
+                f"آخرین اسکن: {st.session_state.get('hourly_pump_radar_time_candle_v3', '—')} • "
+                f"نمادهای بررسی‌شده: {meta.get('checked', 0)} • جفت‌های منطبق: {meta.get('matched', 0)} • "
+                f"بررسی کندل: {meta.get('candle_checked', 0)} • ردیف CEX: {meta.get('cex_rows', 0)} • "
+                f"جفت تکراری حذف‌شده: {meta.get('duplicate_pair_skipped', 0)} • "
+                f"خطاهای دریافت: {meta.get('errors', 0)}"
+            )
+            if hourly_result.empty:
+                st.warning("برای نمادهای بررسی‌شده جفت DEX با نقدشوندگی حداقل ۱۰۰ هزار دلار و داده یک‌ساعته کافی پیدا نشد.")
+            else:
+                confirmed_1h = int(hourly_result["Hourly_Status"].eq("نامزد اولیه؛ کندل سبز تأیید شد").sum())
+                watch_1h = int(hourly_result["Hourly_Status"].isin(["زیر نظر؛ کندل سبز، شروط ناقص", "در انتظار تأیید؛ آخرین کندل قرمز", "در انتظار تأیید؛ کندل خنثی", "کندل بررسی نشد؛ کاندید نیست"]).sum())
+                late_1h = int(hourly_result["Hourly_Status"].eq("حرکت تند؛ احتمالاً دیرهنگام").sum())
+                h1a, h1b, h1c = st.columns(3)
+                h1a.metric("نامزدهای اولیه", confirmed_1h)
+                h1b.metric("زیر نظر", watch_1h)
+                h1c.metric("حرکت‌های احتمالاً دیرهنگام", late_1h)
+                hourly_display = hourly_result.rename(columns={
+                    "Coin": "ارز", "Symbol": "نماد", "Change_1h_Percent": "تغییر ۱ساعته٪",
+                    "Volume_1h_USD": "حجم واقعی ۱ساعته USD",
+                    "Volume_1h_vs_6h_Avg": "حجم ۱ساعته / میانگین ۶ساعته",
+                    "Buys_1h": "تعداد خرید ۱ساعته", "Sells_1h": "تعداد فروش ۱ساعته",
+                    "Transactions_1h": "کل معاملات ۱ساعته",
+                    "Buy_Count_Share_1h": "سهم تعداد خرید٪",
+                    "Liquidity_USD": "نقدشوندگی USD",
+                    "Change_24h_Percent": "تغییر ۲۴ساعته٪",
+                    "Pump_1h_Score": "امتیاز رادار ۱ساعته",
+                    "Last_Closed_1h_Candle": "آخرین کندل بسته‌شده ۱ساعته",
+                    "Last_Closed_1h_Time_UTC": "زمان کندل UTC",
+                    "Previous_1h_Candle": "کندل قبلی",
+                    "Hourly_Status": "وضعیت", "Chain": "شبکه", "DEX": "صرافی غیرمتمرکز",
+                    "Base_Token_Address": "آدرس قرارداد توکن", "Pair_URL": "لینک جفت معاملاتی",
+                    "Market_Data_Source": "منبع داده", "Buy_Pressure_Type": "نوع سنجش فشار خرید",
+                })
+                hourly_cols = [
+                    "ارز", "نماد", "تغییر ۱ساعته٪", "حجم واقعی ۱ساعته USD",
+                    "حجم ۱ساعته / میانگین ۶ساعته", "تعداد خرید ۱ساعته",
+                    "تعداد فروش ۱ساعته", "سهم تعداد خرید٪", "نقدشوندگی USD",
+                    "آخرین کندل بسته‌شده ۱ساعته", "زمان کندل UTC", "کندل قبلی",
+                    "تغییر ۲۴ساعته٪", "امتیاز رادار ۱ساعته", "وضعیت",
+                    "شبکه", "صرافی غیرمتمرکز", "منبع داده", "نوع سنجش فشار خرید", "آدرس قرارداد توکن", "لینک جفت معاملاتی",
+                ]
+                hourly_cols = [c for c in hourly_cols if c in hourly_display.columns]
+                st.dataframe(
+                    hourly_display[hourly_cols].head(30),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "لینک جفت معاملاتی": st.column_config.LinkColumn("بازار / جفت معاملاتی"),
+                    "آدرس قرارداد توکن": st.column_config.TextColumn("قرارداد توکن", help="برای تشخیص برخورد نمادها؛ قبل از معامله با منبع رسمی تطبیق بده."),
+                        "تغییر ۱ساعته٪": st.column_config.NumberColumn(format="%.2f%%"),
+                        "تغییر ۲۴ساعته٪": st.column_config.NumberColumn(format="%.2f%%"),
+                        "حجم واقعی ۱ساعته USD": st.column_config.NumberColumn(format="$%.0f"),
+                        "نقدشوندگی USD": st.column_config.NumberColumn(format="$%.0f"),
+                        "سهم تعداد خرید٪": st.column_config.NumberColumn(format="%.1f%%"),
+                        "امتیاز رادار ۱ساعته": st.column_config.NumberColumn(format="%.1f"),
+                    },
+                )
+                st.caption(
+                    "نامزد اولیه فقط وقتی صادر می‌شود که آخرین کندل بسته‌شده ۱ساعته سبز باشد و هم‌زمان شتاب حجم، "
+                    "غلبه تعداد خرید، نقدشوندگی و حداقل فعالیت تأیید نسبی داشته باشند. حداکثر ۱۰ جفت برتر برای OHLCV بررسی می‌شوند؛ "
+                    "بقیه تا بررسی کندل کاندید محسوب نمی‌شوند. سهم خرید بر اساس تعداد معاملات است، نه دلار؛ "
+                    "حجم ۱ساعته، حجم معامله‌شده گزارش‌شده توسط DEX است و ورود خالص پول یا خرید نهنگ را ثابت نمی‌کند. "
+                    "برای DEX، سهم خرید بر اساس تعداد معاملات است؛ برای Binance سهم حجم خرید تیکر گزارش می‌شود؛ این دو معیار یکسان نیستند. ردیف CEX نقدشوندگی DEX ندارد و تا تأیید مستقل نقدشوندگی کاندید آماده نمی‌شود. نبود کندل نیز هرگز سیگنال مثبت نیست. قبل از هر تصمیم لینک و بازار را بررسی کن."
+                )
+        else:
+            st.info("برای شروع، دکمه اجرای رادار یک‌ساعته را بزن. این اسکن خودکار در هر بار تازه‌سازی اجرا نمی‌شود تا درخواست API بی‌دلیل زیاد نشود.")
+
     if not filtered.empty:
         if "Volume_24h_vs_7d_Avg" not in filtered.columns:
             filtered["Volume_24h_vs_7d_Avg"] = np.nan
@@ -1879,67 +3230,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
             st.caption("روش ورود: ۲۵٪ اولیه فقط در ناحیه ساختاری مناسب؛ ۷۵٪ پس از شکست و تثبیت مقاومت. حدضرر پشت کف/حمایت ساختاری؛ اگر داده تاریخی برای تعیین آن نداریم، سطح ورود و خروج ساخته نمی‌شود. سقف ریسک هر معامله ۰٫۵٪ سرمایه و حداقل R/R برابر ۲ است.")
     else:
         st.info("No verified early-activity candidates match these filters yet. Calculate historical indicators or lower the minimum score to inspect unconfirmed setups.")
- 
-if section == "📈 همگرایی و واگرایی با بیت‌کوین":
-    st.subheader("📈 همگرایی و واگرایی جفت‌ارزها با بیت‌کوین")
-    st.caption("این صفحه بازده ۲۴ ساعته و ۷ روزه هر آلت‌کوین را با BTC مقایسه می‌کند. هم‌جهتی یعنی جهت بازده مشابه؛ واگرایی یعنی جهت متفاوت. اختلاف بازده، قدرت نسبی را نشان می‌دهد و به‌تنهایی همبستگی آماری یا سیگنال خرید نیست.")
- 
-    btc_rows = df[df["Symbol"].astype(str).str.upper().eq("BTC")].copy()
-    if btc_rows.empty:
-        st.warning("ردیف بیت‌کوین در داده‌های فعلی بازار وجود ندارد؛ مقایسه همگرایی/واگرایی انجام نشد.")
-    else:
-        btc_row = btc_rows.iloc[0]
-        btc_24h = numeric(pd.Series([btc_row.get("Change_24h_Percent")])).iloc[0]
-        btc_7d = numeric(pd.Series([btc_row.get("Change_7d_Percent")])).iloc[0]
-        k1, k2 = st.columns(2)
-        k1.metric("تغییر بیت‌کوین در ۲۴ ساعت", f"{btc_24h:+.2f}%" if pd.notna(btc_24h) else "ناموجود")
-        k2.metric("تغییر بیت‌کوین در ۷ روز", f"{btc_7d:+.2f}%" if pd.notna(btc_7d) else "ناموجود")
- 
-        pairs = df[(~df["Is_Excluded_Asset"]) & (~df["Symbol"].astype(str).str.upper().eq("BTC"))].copy()
-        pairs["تغییر ۲۴ساعته ارز (%)"] = numeric(pairs["Change_24h_Percent"])
-        pairs["تغییر ۷روزه ارز (%)"] = numeric(pairs["Change_7d_Percent"])
-        pairs["اختلاف با BTC در ۲۴ساعت (واحد درصد)"] = pairs["تغییر ۲۴ساعته ارز (%)"] - btc_24h if pd.notna(btc_24h) else np.nan
-        pairs["اختلاف با BTC در ۷روز (واحد درصد)"] = pairs["تغییر ۷روزه ارز (%)"] - btc_7d if pd.notna(btc_7d) else np.nan
- 
-        def _direction_label(asset_return, btc_return):
-            if pd.isna(asset_return) or pd.isna(btc_return):
-                return "داده ناکافی"
-            if (asset_return >= 0 and btc_return >= 0) or (asset_return < 0 and btc_return < 0):
-                return "هم‌جهت با BTC"
-            return "واگرا از BTC"
- 
-        pairs["وضعیت ۲۴ساعته"] = [_direction_label(a, btc_24h) for a in pairs["تغییر ۲۴ساعته ارز (%)"]]
-        pairs["وضعیت ۷روزه"] = [_direction_label(a, btc_7d) for a in pairs["تغییر ۷روزه ارز (%)"]]
-        pairs["قدرت نسبی ۷روزه"] = pairs["اختلاف با BTC در ۷روز (واحد درصد)"].apply(
-            lambda x: "قوی‌تر از BTC" if pd.notna(x) and x > 0 else ("ضعیف‌تر از BTC" if pd.notna(x) and x < 0 else ("هم‌سطح" if pd.notna(x) else "ناموجود"))
-        )
- 
-        mode = st.radio("فیلتر حرکت", ["همه ارزها", "واگرا در ۲۴ ساعت", "واگرا در ۷ روز", "قوی‌تر از BTC در ۷ روز"], horizontal=True, key="btc_divergence_filter")
-        view = pairs.copy()
-        if mode == "واگرا در ۲۴ ساعت":
-            view = view[view["وضعیت ۲۴ساعته"] == "واگرا از BTC"]
-        elif mode == "واگرا در ۷ روز":
-            view = view[view["وضعیت ۷روزه"] == "واگرا از BTC"]
-        elif mode == "قوی‌تر از BTC در ۷ روز":
-            view = view[view["قدرت نسبی ۷روزه"] == "قوی‌تر از BTC"]
- 
-        sort_col = "اختلاف با BTC در ۷روز (واحد درصد)" if pd.notna(btc_7d) else "اختلاف با BTC در ۲۴ساعت (واحد درصد)"
-        view = view.sort_values(sort_col, ascending=False, na_position="last")
-        display_cols = ["Coin", "Symbol", "تغییر ۲۴ساعته ارز (%)", "اختلاف با BTC در ۲۴ساعت (واحد درصد)", "وضعیت ۲۴ساعته", "تغییر ۷روزه ارز (%)", "اختلاف با BTC در ۷روز (واحد درصد)", "وضعیت ۷روزه", "قدرت نسبی ۷روزه", "Volume_24h"]
-        display_cols = [c for c in display_cols if c in view.columns]
-        if view.empty:
-            st.info("با فیلتر انتخاب‌شده موردی در داده‌های فعلی پیدا نشد.")
-        else:
-            st.dataframe(view[display_cols].head(100), width="stretch", hide_index=True)
-            st.download_button(
-                "⬇️ دریافت گزارش همگرایی و واگرایی",
-                data=view[display_cols].to_csv(index=False).encode("utf-8-sig"),
-                file_name="btc_altcoin_convergence_divergence.csv",
-                mime="text/csv",
-                key="download_btc_divergence",
-            )
-        st.info("تفسیر: اگر آلت‌کوین مثبت باشد و BTC منفی، واگرایی صعودیِ حرکتی دیده می‌شود؛ اما برای تأیید واگرایی تکنیکال واقعی باید سری زمانی قیمت و سقف/کف‌های نمودار نیز بررسی شود. این نسخه از بازده‌های ۲۴ساعته و ۷روزه استفاده می‌کند و ادعای محاسبه ضریب همبستگی ندارد.")
- 
+
 if section == "📊 نمودارها و ریزش‌ها":
     # Separate watchlist for deeply declined assets (not mixed with pre-pump candidates).
     st.subheader("📉 ارزهای با بیشترین ریزش")
@@ -1952,16 +3243,222 @@ if section == "📊 نمودارها و ریزش‌ها":
         st.dataframe(drop_view[drop_cols], width="stretch", hide_index=True)
     else:
         st.info("داده کافی برای رتبه‌بندی ریزش هفتگی موجود نیست.")
- 
+
+    # Historical high recovery watchlist: separate from active pre-pump signals.
+    st.divider()
+    st.subheader("🏔️ رادار فاصله از سقف تاریخی با بررسی پتانسیل برگشت")
+    st.caption("این جدول ارزهایی را جدا می‌کند که قیمت فعلی‌شان پایین‌تر از سقف تاریخی است؛ رتبه‌بندی فقط بر اساس فاصله از ATH نیست و فعالیت بازار و مومنتوم اخیر هم بررسی می‌شود. امتیاز، احتمال آماری یا وعده بازگشت به سقف نیست.")
+    ath_view = df[~df["Is_Excluded_Asset"].fillna(False)].copy()
+    # Normalize optional ATH fields: market providers do not share one schema.
+    # Create absent columns explicitly so a provider omission never crashes the app.
+    for _col in ["Price", "ATH_Price", "ATH_Change_Percent", "ATH_Drawdown_Percent", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Market_Cap", "PrePump_Score"]:
+        if _col not in ath_view.columns:
+            ath_view[_col] = np.nan
+        ath_view[_col] = numeric(ath_view[_col])
+    if "ATH_Drawdown_Percent" in ath_view.columns and ath_view["ATH_Drawdown_Percent"].notna().any():
+        # Prefer a valid drawdown supplied by the market-data normalizer.
+        ath_view["ATH_Drawdown_Percent"] = ath_view["ATH_Drawdown_Percent"].clip(lower=0)
+    elif ath_view["ATH_Change_Percent"].notna().any():
+        # CoinGecko ATH change is negative below the historical high.
+        ath_view["ATH_Drawdown_Percent"] = (-ath_view["ATH_Change_Percent"]).clip(lower=0)
+    elif ath_view["ATH_Price"].notna().any():
+        ath_view["ATH_Drawdown_Percent"] = np.where(
+            (ath_view["Price"] > 0) & (ath_view["ATH_Price"] > ath_view["Price"]),
+            (1 - ath_view["Price"] / ath_view["ATH_Price"]) * 100, np.nan
+        )
+    else:
+        ath_view["ATH_Drawdown_Percent"] = np.nan
+    # Reconstruct ATH price only when a valid drawdown/ATH-change value exists.
+    missing_ath_price = ath_view["ATH_Price"].isna() | (ath_view["ATH_Price"] <= 0)
+    valid_price = ath_view["Price"].notna() & (ath_view["Price"] > 0)
+    valid_drawdown = ath_view["ATH_Drawdown_Percent"].notna() & (ath_view["ATH_Drawdown_Percent"] >= 0) & (ath_view["ATH_Drawdown_Percent"] < 100)
+    reconstruct = missing_ath_price & valid_price & valid_drawdown
+    ath_view.loc[reconstruct, "ATH_Price"] = (
+        ath_view.loc[reconstruct, "Price"] / (1 - ath_view.loc[reconstruct, "ATH_Drawdown_Percent"] / 100)
+    )
+    if "ATH_Date" not in ath_view.columns:
+        ath_view["ATH_Date"] = np.nan
+    ath_view["Gain_Needed_To_ATH_Percent"] = np.where(
+        (ath_view["Price"] > 0) & (ath_view["ATH_Price"] > ath_view["Price"]),
+        (ath_view["ATH_Price"] / ath_view["Price"] - 1) * 100, np.nan
+    )
+    # Screen out inactive / tiny markets and assets almost entirely collapsed.
+    ath_view = ath_view[
+        (ath_view["ATH_Drawdown_Percent"] >= 10)
+        & (ath_view["ATH_Drawdown_Percent"] <= 95)
+        & (ath_view["Volume_24h"].fillna(0) >= 50000)
+        & (ath_view["Market_Cap"].fillna(0) >= 1000000)
+        & (ath_view["Price"] > 0)
+        & (ath_view["ATH_Price"] > ath_view["Price"])
+    ].copy()
+    if not ath_view.empty:
+        if data_source != "CoinGecko market" or "CoinGecko_ID" not in ath_view.columns:
+            st.info("برای تأیید برگشت روند، منبع CoinGecko market و شناسه تاریخی ارز لازم است.")
+            ath_view = ath_view.iloc[0:0].copy()
+        else:
+            st.caption("فقط ارزهایی در فهرست فرصت بازیابی می‌مانند که بازده و شیب ۳ روزه مثبت، آخرین روز صعودی و حداقل ۲ کندل سبز از ۳ روز کامل اخیر داشته باشند؛ ارزهای بدون تأیید حذف می‌شوند.")
+            if st.button("🔎 بررسی برگشت روند ارزهای زیر ATH", type="primary", key="scan_ath_recovery_trend"):
+                trend_universe = ath_view.copy()
+                trend_universe["_scan_volume"] = numeric(trend_universe["Volume_24h"]).fillna(0)
+                trend_universe = trend_universe.sort_values("_scan_volume", ascending=False).head(40)
+                trend_rows, trend_errors = [], 0
+                def _scan_ath_trend(row):
+                    hist = fetch_history(str(row["CoinGecko_ID"]), currency, 30, cg_key)
+                    trend = analyze_recent_recovery_trend(hist, lookback_days=7)
+                    if trend:
+                        return {"CoinGecko_ID": row["CoinGecko_ID"], **trend}
+                    return None
+                with st.spinner(f"در حال بررسی روند روزانه {len(trend_universe)} ارز نقدشونده..."):
+                    with ThreadPoolExecutor(max_workers=4) as pool:
+                        futures = [pool.submit(_scan_ath_trend, row) for _, row in trend_universe.iterrows()]
+                        for future in futures:
+                            try:
+                                item = future.result()
+                                if item:
+                                    trend_rows.append(item)
+                            except Exception:
+                                trend_errors += 1
+                st.session_state["ath_recovery_trend_results"] = pd.DataFrame(trend_rows)
+                st.session_state["ath_recovery_trend_errors"] = trend_errors
+            trend_result = st.session_state.get("ath_recovery_trend_results")
+            if isinstance(trend_result, pd.DataFrame) and not trend_result.empty:
+                ath_view = ath_view.merge(trend_result, on="CoinGecko_ID", how="inner")
+                ath_view = ath_view[ath_view["Recovery_Trend_Eligible"].fillna(False)].copy()
+            else:
+                ath_view = ath_view.iloc[0:0].copy()
+                st.info("برای نمایش فرصت‌های بازیابی، دکمه بررسی برگشت روند را بزن. تا قبل از دریافت تاریخچه، هیچ ارزی به‌عنوان روند برگشتی تأیید نمی‌شود.")
+            if st.session_state.get("ath_recovery_trend_errors", 0):
+                st.caption(f"تعداد خطاهای دریافت تاریخچه: {st.session_state['ath_recovery_trend_errors']}؛ این ارزها بدون تأیید باقی مانده‌اند.")
+    if not ath_view.empty:
+        # Recovery-screen score rewards a meaningful discount only when current activity/momentum exists.
+        dd_score = (ath_view["ATH_Drawdown_Percent"].clip(10, 80) - 10) / 70 * 25
+        momentum_7d = ath_view["Change_7d_Percent"].fillna(-15).clip(-15, 20)
+        momentum_score = ((momentum_7d + 15) / 35 * 25)
+        momentum_24h = ath_view["Change_24h_Percent"].fillna(-5).clip(-5, 10)
+        daily_score = ((momentum_24h + 5) / 15 * 10)
+        turnover = (ath_view["Volume_24h"].fillna(0) / ath_view["Market_Cap"].replace(0, np.nan)).fillna(0)
+        activity_score = (turnover.clip(0, 0.30) / 0.30 * 20)
+        pump_score = numeric(ath_view["PrePump_Score"]).fillna(40).clip(0, 100) / 100 * 20
+        trend_bonus = (ath_view["Recent_3d_Change_Percent"].clip(0, 8) / 8 * 10)
+        ath_view["Recovery_Screen_Score"] = (dd_score + momentum_score + daily_score + activity_score + pump_score + trend_bonus).clip(0, 100).round(1)
+        ath_view["Recovery_Screen_Status"] = np.select(
+            [
+                (ath_view["Recovery_Screen_Score"] >= 70) & (ath_view["Change_7d_Percent"] > 0),
+                (ath_view["Recovery_Screen_Score"] >= 55),
+                (ath_view["Change_7d_Percent"] < 0),
+            ],
+            ["بررسی جدی‌تر؛ مومنتوم مثبت", "زیرنظر؛ نیازمند تأیید", "فعلاً ضعیف؛ روند اخیر منفی"],
+            default="فقط فاصله از سقف؛ تأیید ناکافی",
+        )
+        ath_view = ath_view.sort_values(["Recovery_Screen_Score", "Change_7d_Percent"], ascending=[False, False]).head(40)
+        ath_cols = ["Coin", "Symbol", "Price", "ATH_Price", "ATH_Date", "ATH_Drawdown_Percent", "Gain_Needed_To_ATH_Percent", "Change_24h_Percent", "Change_7d_Percent", "Recent_3d_Change_Percent", "Recent_3d_Slope_Percent", "Green_Days_Last_3", "Trend_Last_Date", "Volume_24h", "Recovery_Screen_Score", "Recovery_Trend_Status", "Recovery_Screen_Status"]
+        ath_display = ath_view[[c for c in ath_cols if c in ath_view.columns]].rename(columns={
+            "Coin": "ارز", "Symbol": "نماد", "Price": "قیمت فعلی", "ATH_Price": "قیمت سقف تاریخی",
+            "ATH_Date": "تاریخ سقف تاریخی", "ATH_Drawdown_Percent": "فاصله از سقف (%)",
+            "Gain_Needed_To_ATH_Percent": "رشد لازم تا سقف (%)", "Change_24h_Percent": "تغییر ۲۴ساعته (%)",
+            "Change_7d_Percent": "تغییر ۷روزه (%)", "Recent_3d_Change_Percent": "تغییر ۳ روز اخیر (%)",
+            "Recent_3d_Slope_Percent": "شیب روند ۳ روزه (%)", "Green_Days_Last_3": "کندل سبز از ۳ روز",
+            "Trend_Last_Date": "آخرین روز بررسی‌شده",
+            "Volume_24h": "حجم ۲۴ساعته (USD)", "Recovery_Screen_Score": "امتیاز بررسی برگشت / ۱۰۰",
+            "Recovery_Trend_Status": "وضعیت روند کوتاه‌مدت", "Recovery_Screen_Status": "وضعیت بررسی",
+        })
+        st.dataframe(ath_display, use_container_width=True, hide_index=True, column_config={
+            "قیمت فعلی": st.column_config.NumberColumn(format="$%.8g"),
+            "قیمت سقف تاریخی": st.column_config.NumberColumn(format="$%.8g"),
+            "فاصله از سقف (%)": st.column_config.NumberColumn(format="%.1f%%"),
+            "رشد لازم تا سقف (%)": st.column_config.NumberColumn(format="%.1f%%"),
+            "تغییر ۲۴ساعته (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "تغییر ۷روزه (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "تغییر ۳ روز اخیر (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "شیب روند ۳ روزه (%)": st.column_config.NumberColumn(format="%.3f%%"),
+            "حجم ۲۴ساعته (USD)": st.column_config.NumberColumn(format="$%.0f"),
+            "امتیاز بررسی برگشت / ۱۰۰": st.column_config.NumberColumn(format="%.1f"),
+        })
+        st.caption("فیلتر اولیه: افت ۱۰ تا ۹۵ درصد از ATH، ارزش بازار حداقل ۱ میلیون دلار و حجم ۲۴ساعته حداقل ۵۰ هزار دلار. تأیید روند سخت‌گیرانه‌تر است: بازده و شیب ۳ روزه مثبت، قیمت بسته‌شدن آخرین روز بالاتر از روز قبل، و حداقل ۲ کندل سبز از ۳ روز کامل اخیر. ارزهای بدون این شروط حذف می‌شوند. داده روز جاری ناقص است و وارد محاسبه نمی‌شود. افت ۸۰٪ به معنی نیاز به رشد ۴۰۰٪ برای بازگشت به سقف است.")
+    else:
+        if not st.session_state.get("ath_recovery_trend_results") is not None:
+            st.info("پس از اجرای اسکن روند، فقط ارزهایی نمایش داده می‌شوند که نزول آن‌ها در داده‌های روزانه برگشته باشد.")
+        else:
+            st.info("فعلاً ارزی که هم شرایط فاصله از ATH و نقدشوندگی را داشته باشد و هم برگشت صعودی ۳ روز اخیرش تأیید شود پیدا نشد؛ این بهتر از معرفی ارز نزولی به‌عنوان فرصت است.")
+
     # Alerts for sharp moves
     st.subheader("🔔 هشدار حرکت‌های غیرعادی بازار")
     alerts = df[(numeric(df["Change_24h_Percent"]).abs() >= 5) | (numeric(df["Change_7d_Percent"]).abs() >= 15)].copy()
     if not alerts.empty:
-        alerts = alerts.sort_values("Change_24h_Percent", ascending=False)
-        st.dataframe(alerts[["Coin", "Symbol", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Pump_Potential_Score", "Risk_Level"]].head(30), use_container_width=True, hide_index=True)
+        # Restore the original alert ranking: highest 24h percentage move first.
+        alerts = alerts.sort_values(
+            "Change_24h_Percent", ascending=False, na_position="last", kind="mergesort"
+        )
+        alert_columns = ["Coin", "Symbol", "Change_24h_Percent", "Change_7d_Percent", "Volume_24h", "Pump_Potential_Score", "Risk_Level"]
+        st.dataframe(alerts[alert_columns].head(30), use_container_width=True, hide_index=True)
     else:
         st.info("No moves crossed the default alert thresholds.")
- 
+
+    # Latest three completed green daily candles (UTC).
+    st.divider()
+    st.subheader("🟢 ارزهای دارای ۳ کندل سبز ۲۴ ساعته آخر")
+    st.caption("فقط سه کندل روزانهٔ کامل و متوالی UTC بررسی می‌شوند؛ هر سه باید سبز باشند. درصد کنار هر ارز، تغییر قیمت از ابتدای روز اول تا بسته‌شدن روز سوم است. استیبل‌کوین‌ها و داده‌های ناقص/قدیمی حذف می‌شوند.")
+    if data_source != "CoinGecko market" or "CoinGecko_ID" not in df.columns:
+        st.info("برای اسکن کندل‌های روزانه، منبع داده CoinGecko market را انتخاب کن.")
+    else:
+        if st.button("🔍 اسکن ارزهای دارای ۳ کندل سبز آخر", type="primary", key="scan_green_streaks"):
+            scan_universe = df.copy()
+            if "Is_Excluded_Asset" in scan_universe.columns:
+                scan_universe = scan_universe[~scan_universe["Is_Excluded_Asset"].fillna(False)]
+            scan_universe["_scan_volume"] = numeric(scan_universe["Volume_24h"]).fillna(0)
+            # Scan the full currently loaded market universe, not only the top 40.
+            scan_universe = scan_universe[scan_universe["CoinGecko_ID"].notna()].sort_values("_scan_volume", ascending=False)
+            found = []
+            errors = 0
+
+            def _scan_one_green(row):
+                hist = fetch_history(str(row["CoinGecko_ID"]), currency, 30, cg_key)
+                signal = last_three_green_daily_candles(hist)
+                if signal:
+                    return {
+                        "Coin": row.get("Coin", ""), "Symbol": row.get("Symbol", ""),
+                        "Three_Day_Change_Percent": signal["Three_Day_Change_Percent"],
+                        "Streak_Start": signal["Streak_Start"], "Streak_End": signal["Streak_End"],
+                        "Last_Daily_Close": signal["Last_Daily_Close"],
+                        "Volume_24h": row.get("Volume_24h", np.nan),
+                    }
+                return None
+
+            with st.spinner(f"در حال بررسی سه کندل روزانهٔ آخر برای {len(scan_universe)} ارز... ممکن است کمی زمان ببرد."):
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    futures = [pool.submit(_scan_one_green, row) for _, row in scan_universe.iterrows()]
+                    for future in futures:
+                        try:
+                            item = future.result()
+                            if item:
+                                found.append(item)
+                        except Exception:
+                            errors += 1
+            result_df = pd.DataFrame(found)
+            if not result_df.empty:
+                result_df = result_df.sort_values("Three_Day_Change_Percent", ascending=False, kind="mergesort")
+            st.session_state["green_streak_scan_results"] = result_df
+            st.session_state["green_streak_scan_errors"] = errors
+            st.session_state["green_streak_scan_universe"] = len(scan_universe)
+
+        green_results = st.session_state.get("green_streak_scan_results", pd.DataFrame())
+        if isinstance(green_results, pd.DataFrame) and not green_results.empty:
+            green_display = green_results.rename(columns={
+                "Coin": "ارز", "Symbol": "نماد",
+                "Three_Day_Change_Percent": "درصد تغییر ۳ روز (%)",
+                "Streak_Start": "شروع روز اول", "Streak_End": "پایان روز سوم",
+                "Last_Daily_Close": "قیمت بسته‌شدن آخرین روز", "Volume_24h": "حجم ۲۴ساعته",
+            })
+            st.dataframe(green_display, use_container_width=True, hide_index=True,
+                         column_config={"درصد تغییر ۳ روز (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                                        "قیمت بسته‌شدن آخرین روز": st.column_config.NumberColumn(format="%.8g"),
+                                        "حجم ۲۴ساعته": st.column_config.NumberColumn(format="$%.2f")})
+            st.success(f"{len(green_results)} ارز با سه کندل سبز ۲۴ ساعتهٔ آخر پیدا شد؛ مرتب‌سازی از بیشترین درصد رشد به کمترین است.")
+        elif "green_streak_scan_results" in st.session_state:
+            st.info("در سه روز کامل UTC اخیر، ارزی با هر سه کندل سبز و دادهٔ معتبر پیدا نشد.")
+        if st.session_state.get("green_streak_scan_errors", 0):
+            st.caption(f"{st.session_state['green_streak_scan_errors']} درخواست از منبع تاریخی با خطا یا محدودیت روبه‌رو شد. پوشش اسکن: {st.session_state.get('green_streak_scan_universe', 0)} ارز از بازار بارگذاری‌شده.")
+
     # Market chart
     chart_source = filtered if not filtered.empty else df.head(50)
     if not chart_source.empty:
@@ -1978,7 +3475,7 @@ if section == "📊 نمودارها و ریزش‌ها":
         )
         fig.update_layout(paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font_color="#172b4d", height=520, xaxis=dict(gridcolor="#e5edf6"), yaxis=dict(gridcolor="#e5edf6"))
         st.plotly_chart(fig, use_container_width=True)
- 
+
     # Historical chart + Persian technical indicators
     st.divider()
     st.subheader("📈 نمودار قیمت و تحلیل تکنیکال به زبان فارسی")
@@ -2013,7 +3510,7 @@ if section == "📊 نمودارها و ریزش‌ها":
                         hist["MACD_Signal"] = hist["MACD"].ewm(span=9, adjust=False).mean()
                         hist["MACD_Hist"] = hist["MACD"] - hist["MACD_Signal"]
                         hist["Volume"] = pd.to_numeric(hist.get("volume_24h", pd.Series(index=hist.index, dtype=float)), errors="coerce")
- 
+
                         last_price = close.iloc[-1]
                         last_rsi = hist["RSI"].iloc[-1]
                         last_macd = hist["MACD"].iloc[-1]
@@ -2033,7 +3530,7 @@ if section == "📊 نمودارها و ریزش‌ها":
                         else:
                             rsi_text = "قدرت فروشندگان هنوز بیشتر است؛ برای بررسی خرید بهتر است نشانه برگشت و عبور شاخص از محدوده میانی دیده شود."
                             rsi_status = "فشار فروش بیشتر"
- 
+
                         if pd.isna(last_macd) or pd.isna(last_signal):
                             macd_text = "داده کافی برای تفسیر مکدی وجود ندارد."
                             macd_status = "داده ناکافی"
@@ -2043,7 +3540,7 @@ if section == "📊 نمودارها و ریزش‌ها":
                         else:
                             macd_text = "خط مکدی پایین‌تر از خط سیگنال است؛ مومنتوم هنوز ضعیف یا نزولی است و ورود عجولانه ریسک دارد."
                             macd_status = "وضعیت نزولی"
- 
+
                         st.markdown(f"**{choice} — قیمت آخرین داده:** `{fmt_money(last_price)}` {currency.upper()}")
                         fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.055,
                                             row_heights=[0.38, 0.16, 0.21, 0.25],
@@ -2089,30 +3586,71 @@ if section == "📊 نمودارها و ریزش‌ها":
                     st.error(f"خطا در دریافت یا رسم نمودار: {exc}")
     else:
         st.info("برای نمایش نمودارهای تکنیکال، منبع داده CoinGecko را انتخاب کن.")
- 
+
 if section == "📰 اخبار و DEX":
     # News panel
     st.divider()
     st.subheader("📰 اخبار و عوامل بنیادی")
-    news_symbol = st.text_input("News currency code (e.g. BTC, ETH, SOL)", value="BTC").strip().upper()
-    if st.button("Fetch latest news"):
-        with st.spinner("Fetching news..."):
-            news_df, news_status = fetch_news(news_key_input, news_symbol or None)
-        if news_df.empty:
-            st.info(f"No news returned. {news_status}")
+    st.caption("خبرها بدون نیاز به کلید API از RSS رسانه‌های عمومی دریافت می‌شوند؛ در صورت واردکردن کلید، CryptoPanic در اولویت است.")
+    news_symbol = st.selectbox("محدوده خبر", ["ALL", "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"], index=0,
+                               format_func=lambda x: "کل بازار" if x == "ALL" else x)
+    fetch_news_clicked = st.button("🔄 دریافت آخرین اخبار و تحلیل بنیادی", type="primary", key="fetch_market_news")
+    if fetch_news_clicked or "news_feed_cache" not in st.session_state or st.session_state.get("news_feed_symbol") != news_symbol:
+        with st.spinner("در حال دریافت خبرهای بازار از منابع خبری..."):
+            loaded_news, loaded_status = fetch_news(news_key_input, news_symbol)
+        st.session_state["news_feed_cache"] = loaded_news
+        st.session_state["news_feed_status"] = loaded_status
+        st.session_state["news_feed_symbol"] = news_symbol
+    news_df = st.session_state.get("news_feed_cache", pd.DataFrame())
+    news_status = st.session_state.get("news_feed_status", "هنوز خبری دریافت نشده است.")
+    st.caption(f"وضعیت منبع: {news_status}")
+    if news_df is None or news_df.empty:
+        st.warning("در حال حاضر خبری از منابع انتخاب‌شده دریافت نشد. وضعیت اتصال و پیام منبع بالا را بررسی کن.")
+    else:
+        # Transparent headline keyword proxy; this is not trained NLP or fact-checking.
+        positive_terms = ("approval", "adoption", "partnership", "launch", "upgrade", "inflow", "bullish", "listing", "گسترش", "همکاری", "تایید", "تصویب", "رشد")
+        negative_terms = ("hack", "exploit", "lawsuit", "ban", "delist", "outflow", "bearish", "scam", "breach", "هک", "حمله", "شکایت", "ممنوع", "حذف", "کلاهبرداری", "ورشکستگی")
+        def headline_score(title):
+            t = str(title).lower()
+            return sum(w in t for w in positive_terms) - sum(w in t for w in negative_terms)
+        news_df = news_df.copy()
+        news_df["Sentiment"] = news_df["Title"].apply(headline_score).map(
+            lambda x: "مثبتِ کلمه‌محور" if x > 0 else ("منفیِ کلمه‌محور" if x < 0 else "خنثی / نامشخص")
+        )
+        scores = news_df["Title"].apply(headline_score)
+        pos_n, neg_n = int((scores > 0).sum()), int((scores < 0).sum())
+        n1, n2, n3 = st.columns(3)
+        n1.metric("تعداد خبرهای دریافتی", len(news_df))
+        n2.metric("تیترهای دارای واژه مثبت", pos_n)
+        n3.metric("تیترهای دارای واژه منفی", neg_n)
+        if pos_n > neg_n:
+            st.success("جمع‌بندی خبری: در تیترهای دریافت‌شده واژه‌های مثبت بیشتر دیده می‌شود؛ این برداشت اولیه است و باید متن خبر و منبع آن بررسی شود.")
+        elif neg_n > pos_n:
+            st.warning("جمع‌بندی خبری: تیترهای دارای واژه منفی بیشترند؛ ریسک خبرهای منفی را قبل از تصمیم بررسی کن.")
         else:
-            # Lightweight headline sentiment proxy; never represented as a trained sentiment model.
-            pos_words = ("approval", "adoption", "partnership", "launch", "upgrade", "inflow", "bullish", "listing")
-            neg_words = ("hack", "exploit", "lawsuit", "ban", "delist", "outflow", "bearish", "scam", "breach")
-            def headline_score(title):
-                t = str(title).lower()
-                return sum(w in t for w in pos_words) - sum(w in t for w in neg_words)
-            news_df["Headline_Sentiment_Proxy"] = news_df["Title"].apply(headline_score).map(
-                lambda x: "Positive keyword" if x > 0 else ("Negative keyword" if x < 0 else "Neutral / unclassified")
-            )
-            st.dataframe(news_df, use_container_width=True, hide_index=True)
-            st.caption("Headline sentiment is a simple keyword proxy, not a trained NLP model or a fact-check.")
- 
+            st.info("جمع‌بندی خبری: تیترها از نظر واژه‌های مثبت و منفی برتری روشنی ندارند یا بخش زیادی از آن‌ها خنثی‌اند.")
+        # Translate titles and summaries independently; delimiter-based combined translation
+        # was unreliable because translation services sometimes modify/remove delimiters.
+        news_df = news_df.copy().head(8)
+        translated_titles = []
+        translated_summaries = []
+        with st.spinner("در حال ترجمه تیترها و خلاصه خبرها به فارسی..."):
+            for _, article in news_df.iterrows():
+                title_en = str(article.get("Title", "") or "")
+                summary_en = str(article.get("Summary", "") or "")
+                title_fa = translate_news_to_persian(title_en[:350]) if title_en else ""
+                summary_fa = translate_news_to_persian(summary_en[:350]) if summary_en else ""
+                translated_titles.append(title_fa or title_en)
+                translated_summaries.append(summary_fa or summary_en)
+        news_df["عنوان فارسی"] = translated_titles
+        news_df["خلاصه فارسی"] = translated_summaries
+        translated_count = sum(1 for fa, en in zip(translated_titles, news_df["Title"]) if fa and fa != en)
+        st.caption(f"ترجمه فارسی: {translated_count} از {len(news_df)} تیتر ترجمه شد؛ MyMemory و در صورت نیاز Google Translate عمومی امتحان می‌شوند. حداکثر ۸ خبر تازه برای کنترل زمان و محدودیت سرویس ترجمه می‌شود؛ در صورت اختلال متن اصلی باقی می‌ماند.")
+        display_news = news_df.rename(columns={"Published": "زمان انتشار", "Title": "عنوان اصلی (انگلیسی)", "Summary": "خلاصه اصلی (انگلیسی)", "Source": "منبع", "Currencies": "ارز", "Sentiment": "برداشت اولیه", "URL": "لینک"})
+        keep_news = [c for c in ["زمان انتشار", "عنوان فارسی", "خلاصه فارسی", "عنوان اصلی (انگلیسی)", "منبع", "ارز", "برداشت اولیه", "لینک"] if c in display_news.columns]
+        st.dataframe(display_news[keep_news], use_container_width=True, hide_index=True, column_config={"لینک": st.column_config.LinkColumn("لینک خبر")})
+        st.caption("ترجمه از سرویس‌های عمومی رایگان انجام می‌شود و ممکن است محدود یا نادقیق باشد. برداشت مثبت/منفی فقط بر اساس واژه‌های تیتر است، نه تحلیل هوش مصنوعی یا راستی‌آزمایی خبر؛ اثر خبر بر قیمت قطعی نیست.")
+
     # DEX panel
     st.divider()
     st.subheader("🧪 جریان معاملات، فشار خرید و فروش و نشانه‌های نهنگ‌ها")
@@ -2165,7 +3703,7 @@ if section == "📰 اخبار و DEX":
                     )
             except Exception as exc:
                 st.error(f"DEX Screener error: {exc}")
- 
+
     # =========================================================
 if section == "🐋 جریان پول و مشتقات":
     # LIVE FUNDING + OPEN INTEREST PANEL
@@ -2189,8 +3727,8 @@ if section == "🐋 جریان پول و مشتقات":
             deriv_cols = [c for c in ["Coin", "Symbol", "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange", "Derivatives_Change_24h_Percent", "Derivatives_Context_Score", "PrePump_Score", "Signal"] if c in deriv_view.columns]
             st.dataframe(deriv_view[deriv_cols].head(60), use_container_width=True, hide_index=True)
             st.caption("Interpretation: very positive funding can indicate crowded longs; negative funding can indicate crowded shorts. Combine with price, volume and OI changes—one snapshot alone cannot confirm a squeeze or a pump.")
- 
- 
+
+
     # =========================================================
     # CRYPTOMETER INTELLIGENCE PANEL
     # =========================================================
@@ -2214,10 +3752,10 @@ if section == "🐋 جریان پول و مشتقات":
             cm_timeframe = st.selectbox("Flow timeframe", ["15m", "1h", "4h", "d"], index=2, key="cm_flow_timeframe")
         with cm_c:
             cm_mover_timeframe = st.selectbox("Gainers/losers timeframe", ["5m", "15m", "1h", "1d", "1w"], index=2, key="cm_mover_timeframe")
- 
+
         st.markdown("**Free feeds** — account status, market trend pressure and the Rapid Movements feed.")
         st.caption("The Rapid Movements endpoint is the original 4-hour movement feed. The richer Rapid Movements V2 feed is a paid endpoint.")
- 
+
         paid_options = {
             "Whale trades (xtrades) — paid": "whales",
             "Volume flow — paid": "volume_flow",
@@ -2235,7 +3773,7 @@ if section == "🐋 جریان پول و مشتقات":
             "Whale trades, Volume Flow, Liquidity Lens, Funding Rates and Gainers/Losers are marked Paid in CryptoMeter's API documentation. "
             "If your plan does not include an endpoint, leave it unselected."
         )
- 
+
         st.caption("برای دریافت داده‌ها، دکمه زیر را لمس کن؛ هنگام دریافت، پیام انتظار نمایش داده می‌شود. در این بخش به‌روزرسانی خودکار موقتاً متوقف است.")
         # Use Streamlit's form-submit event for a more reliable touch action on
         # mobile browsers; unlike a normal button, the browser submits the form.
@@ -2266,7 +3804,7 @@ if section == "🐋 جریان پول و مشتقات":
                     endpoint_jobs[result_key] = ("funding-rates", params)
                 elif result_key == "movers":
                     endpoint_jobs[result_key] = ("gainers-losers", {"timeframe": cm_mover_timeframe})
- 
+
             collected = {}
             with st.spinner("Requesting selected CryptoMeter feeds in parallel..."):
                 job_results = _run_parallel_jobs(
@@ -2286,7 +3824,7 @@ if section == "🐋 جریان پول و مشتقات":
                         }
             st.session_state["cryptometer_results"] = collected
             st.session_state["cryptometer_last_fetch"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
- 
+
         cm_results = st.session_state.get("cryptometer_results", {})
         if cm_results:
             st.caption(f"Last requested: {st.session_state.get('cryptometer_last_fetch', 'unknown')} • Responses are cached for 5 minutes.")
@@ -2295,7 +3833,7 @@ if section == "🐋 جریان پول و مشتقات":
                 with st.expander("⚠️ Feed access / API errors", expanded=True):
                     for key, value in errors:
                         st.warning(f"{value.get('endpoint', key)}: {value['error']}")
- 
+
             account_result = cm_results.get("account", {})
             if account_result.get("payload"):
                 account_df = cryptometer_frame(account_result["payload"])
@@ -2309,7 +3847,7 @@ if section == "🐋 جریان پول و مشتقات":
                     extras = account.get("extra_endpoints")
                     if isinstance(extras, list) and extras:
                         st.caption("Additional enabled endpoints reported by account: " + ", ".join(map(str, extras)))
- 
+
             trend_result = cm_results.get("trend", {})
             if trend_result.get("payload"):
                 trend_df = cryptometer_frame(trend_result["payload"])
@@ -2322,7 +3860,7 @@ if section == "🐋 جریان پول و مشتقات":
                     t3.metric("Sell pressure", f"{fmt_num(trend.get('sell_pressure'))}%")
                     if trend.get("timestamp"):
                         st.caption(f"Provider timestamp: {trend.get('timestamp')}. Treat this as broad market context, not a coin-specific signal.")
- 
+
             rapid_result = cm_results.get("rapid", {})
             if rapid_result.get("payload"):
                 rapid_df = cryptometer_frame(rapid_result["payload"])
@@ -2332,7 +3870,7 @@ if section == "🐋 جریان پول و مشتقات":
                 else:
                     show_cols = [c for c in ["pair", "exchange", "change_detected", "side", "timestamp"] if c in rapid_df.columns]
                     st.dataframe(rapid_df[show_cols] if show_cols else rapid_df, use_container_width=True, hide_index=True)
- 
+
             whale_result = cm_results.get("whales", {})
             if whale_result.get("payload"):
                 whale_df = cryptometer_frame(whale_result["payload"])
@@ -2370,7 +3908,7 @@ if section == "🐋 جریان پول و مشتقات":
                                 st.info("تحلیل نهنگ‌ها: ارزش خرید و فروش بزرگ تقریباً برابر است؛ فعلاً جهت غالب مشخصی دیده نمی‌شود.")
                         else:
                             st.info("برای ترسیم نمودار نهنگ‌ها، داده معتبر خرید/فروش دلاری دریافت نشد.")
- 
+
             volume_result = cm_results.get("volume_flow", {})
             if volume_result.get("payload"):
                 flow_data = cryptometer_data(volume_result["payload"])
@@ -2387,7 +3925,7 @@ if section == "🐋 جریان پول و مشتقات":
                                 st.dataframe(flow_frame, use_container_width=True, hide_index=True)
                 else:
                     st.json(flow_data)
- 
+
             # ---------------------------------------------------------
             # ACTUAL PROVIDER BUY/SELL TRADED VOLUME (NOT TXN-COUNT PROXY)
             # ---------------------------------------------------------
@@ -2501,7 +4039,7 @@ if section == "🐋 جریان پول و مشتقات":
                             reading = "تعادل نسبی خرید و فروش؛ جهت جریان فعلاً خنثی است."
                         st.write(f"**{sym}:** {reading} (خرید {fmt_num(buy_usd, 0)} دلار، فروش {fmt_num(sell_usd, 0)} دلار، خالص {fmt_num(net, 0)} دلار، سهم خرید {buy_share:.1f}٪).")
                     st.caption("این نمودار حجم معاملات خرید/فروش گزارش‌شده توسط صرافی را نشان می‌دهد، نه انتقال خالص دارایی بین کیف‌پول‌ها. داده فقط مربوط به جفت و صرافی انتخاب‌شده است.")
- 
+
             liquidity_result = cm_results.get("liquidity", {})
             if liquidity_result.get("payload"):
                 liquidity_data = cryptometer_data(liquidity_result["payload"])
@@ -2521,7 +4059,7 @@ if section == "🐋 جریان پول و مشتقات":
                     if "netflow" in liquidity_df.columns:
                         liquidity_df = liquidity_df.sort_values("netflow", ascending=False)
                     st.dataframe(liquidity_df, use_container_width=True, hide_index=True)
- 
+
             funding_result = cm_results.get("funding", {})
             if funding_result.get("payload"):
                 funding_df = cryptometer_frame(funding_result["payload"])
@@ -2531,7 +4069,7 @@ if section == "🐋 جریان پول و مشتقات":
                 else:
                     funding_cols = [c for c in ["symbol", "pair", "exchange", "rate_percent", "annualized_percent", "interval_hours", "next_funding_at"] if c in funding_df.columns]
                     st.dataframe(funding_df[funding_cols] if funding_cols else funding_df, use_container_width=True, hide_index=True)
- 
+
             movers_result = cm_results.get("movers", {})
             if movers_result.get("payload"):
                 movers_data = cryptometer_data(movers_result["payload"])
@@ -2547,7 +4085,7 @@ if section == "🐋 جریان پول و مشتقات":
                                 st.dataframe(side_df, use_container_width=True, hide_index=True)
                 else:
                     st.json(movers_data)
- 
+
             watchlist_df = cryptometer_watchlist(cm_results)
             if not watchlist_df.empty:
                 st.markdown("**Cross-signal activity watchlist**")
@@ -2566,8 +4104,8 @@ if section == "🐋 جریان پول و مشتقات":
                 )
         else:
             st.info("Click 'Fetch CryptoMeter intelligence' to request the free feeds. Paid feeds remain off until you select them above.")
- 
- 
+
+
 if section == "📁 داده‌ها":
     # Full data export
     st.divider()
@@ -2581,9 +4119,63 @@ if section == "📁 داده‌ها":
             file_name="crypto_intelligence_scanner_export.csv",
             mime="text/csv",
         )
- 
+
     st.caption(
         "Data coverage depends on the connected APIs and their limits. "
         "CoinGecko market pages cover listed market assets; DEX search is query-based. "
         "CryptoMeter paid feeds require endpoint access in your plan. This tool is informational only, not financial advice."
     )
+
+# =========================================================
+# BTC CORRELATION & DIVERGENCE — independent menu page
+# =========================================================
+if section == "₿ رابطه ارزها با بیت‌کوین":
+    st.title("₿ رابطه ارزها با بیت‌کوین؛ همبستگی و واگرایی")
+    st.caption("تحلیل بر پایه بازده کندل‌های یک‌ساعته بسته‌شده و هم‌زمان؛ منبع کندل: Binance Spot عمومی")
+    st.info("همبستگی ۱ساعت* با پنجره متحرک ۲۴ بازده ساعتی محاسبه می‌شود؛ یک کندل به‌تنهایی برای محاسبه همبستگی کافی نیست. بازه‌های ۷ و ۳۰ روز به‌ترتیب از ۱۶۸ و ۷۲۰ بازده ساعتی هم‌زمان استفاده می‌کنند. واگرایی با عملکرد بهتر از BTC، سهم ساعات مثبت ارز هنگام افت BTC و ساعات خلاف‌جهت سنجیده می‌شود؛ همبستگی پایین به‌تنهایی واگرایی نیست.")
+    corr_a, corr_b = st.columns([1, 1])
+    with corr_a:
+        corr_universe = st.selectbox("تعداد ارزهای بازار برای بررسی", [30, 60, 100], index=1, key="btc_corr_universe")
+    with corr_b:
+        st.metric("واحد قیمت", currency.upper())
+    run_corr = st.button("🔄 دریافت و محاسبه همبستگی و واگرایی", type="primary", key="run_btc_corr")
+    if run_corr or "btc_corr_result" not in st.session_state:
+        with st.spinner("در حال دریافت کندل‌های یک‌ساعته BTC و ارزهای منتخب از Binance؛ ممکن است کمی زمان ببرد..."):
+            corr_frame, corr_status = build_btc_correlation_frame(df, currency, corr_universe)
+        st.session_state["btc_corr_result"] = corr_frame
+        st.session_state["btc_corr_status"] = corr_status
+    corr_frame = st.session_state.get("btc_corr_result", pd.DataFrame())
+    st.caption(st.session_state.get("btc_corr_status", "برای شروع، دریافت داده را اجرا کنید."))
+    if corr_frame.empty:
+        st.warning("داده کافی برای نمایش نتیجه وجود ندارد. اتصال API یا جفت‌های معاملاتی Binance را بررسی کنید و دوباره دریافت را بزنید.")
+    else:
+        corr_view = corr_frame.copy()
+        for col in ["همبستگی ۱ساعت*", "همبستگی ۷روز", "همبستگی ۳۰روز"]:
+            corr_view[col] = pd.to_numeric(corr_view[col], errors="coerce")
+        st.subheader("📈 بیشترین ارتباط با بیت‌کوین")
+        st.caption("مرتب‌سازی بر اساس همبستگی ۷روزه از بیشترین مثبت به کمترین؛ مقدار نزدیک +۱ یعنی حرکت هم‌جهت‌تر.")
+        strongest = corr_view.dropna(subset=["همبستگی ۷روز"]).sort_values("همبستگی ۷روز", ascending=False).head(20)
+        if not strongest.empty:
+            fig_corr = px.bar(strongest.sort_values("همبستگی ۷روز"), x="همبستگی ۷روز", y="نماد", orientation="h", color="همبستگی ۷روز", color_continuous_scale="RdYlGn", range_color=[-1, 1], hover_data=["ارز", "همبستگی ۱ساعت*", "همبستگی ۳۰روز"])
+            fig_corr.update_layout(height=max(380, 25 * len(strongest)), margin=dict(l=10, r=10, t=25, b=15), coloraxis_colorbar_title="Correlation")
+            st.plotly_chart(fig_corr, use_container_width=True, config={"displayModeBar": False})
+            corr_cols = ["ارز", "نماد", "قیمت فعلی", "همبستگی ۱ساعت*", "همبستگی ۷روز", "همبستگی ۳۰روز", "تعداد کندل مشترک"]
+            st.dataframe(strongest[corr_cols].style.format({"قیمت فعلی": "{:,.8g}", "همبستگی ۱ساعت*": "{:+.3f}", "همبستگی ۷روز": "{:+.3f}", "همبستگی ۳۰روز": "{:+.3f}"}, na_rep="—"), use_container_width=True, hide_index=True)
+        else:
+            st.info("برای این بازه، داده همبستگی کافی وجود ندارد.")
+        st.divider()
+        st.subheader("🧭 بیشترین واگرایی از بیت‌کوین")
+        st.caption("رتبه‌بندی بر پایه عملکرد بهتر از BTC طی ۷ روز، همراه با رفتار ارز در ساعت‌هایی که BTC منفی بوده است؛ صرفاً همبستگی پایین، واگرایی محسوب نمی‌شود.")
+        divergence = corr_view.dropna(subset=["قدرت واگرایی", "عملکرد بهتر از BTC در ۷روز٪"]).sort_values(["قدرت واگرایی", "عملکرد بهتر از BTC در ۷روز٪"], ascending=False).head(20)
+        if not divergence.empty:
+            fig_div = px.bar(divergence.sort_values("عملکرد بهتر از BTC در ۷روز٪"), x="عملکرد بهتر از BTC در ۷روز٪", y="نماد", orientation="h", color="عملکرد بهتر از BTC در ۷روز٪", color_continuous_scale="RdYlGn", hover_data=["ارز", "قدرت واگرایی", "سبز بودن ارز هنگام افت BTC٪", "درصد ساعات خلاف‌جهت", "وضعیت"])
+            fig_div.update_layout(height=max(380, 25 * len(divergence)), margin=dict(l=10, r=10, t=25, b=15), xaxis_title="عملکرد بهتر از BTC در ۷ روز (واحد درصد)")
+            st.plotly_chart(fig_div, use_container_width=True, config={"displayModeBar": False})
+            div_cols = ["ارز", "نماد", "قیمت فعلی", "تغییر ۷روز ارز٪", "تغییر ۷روز BTC٪", "عملکرد بهتر از BTC در ۷روز٪", "قدرت واگرایی", "سبز بودن ارز هنگام افت BTC٪", "درصد ساعات خلاف‌جهت", "وضعیت"]
+            st.dataframe(divergence[div_cols].style.format({c: "{:+.2f}%" for c in ["تغییر ۷روز ارز٪", "تغییر ۷روز BTC٪", "عملکرد بهتر از BTC در ۷روز٪"]} | {"قیمت فعلی": "{:,.8g}", "قدرت واگرایی": "{:.2f}", "سبز بودن ارز هنگام افت BTC٪": "{:.1f}%", "درصد ساعات خلاف‌جهت": "{:.1f}%"}, na_rep="—"), use_container_width=True, hide_index=True)
+        else:
+            st.info("در داده‌های موجود، واگرایی قابل رتبه‌بندی با تاریخچه کافی پیدا نشد.")
+        with st.expander("همه ارزهای بررسی‌شده"):
+            st.dataframe(corr_view, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ دریافت CSV همبستگی و واگرایی", data=corr_view.to_csv(index=False).encode("utf-8-sig"), file_name="btc_correlation_divergence.csv", mime="text/csv", key="download_btc_corr")
+    st.caption("محدودیت: این نسخه فقط ارزهایی را وارد می‌کند که جفت اسپات USDT فعال در Binance و تاریخچه ساعتی کافی دارند. این تحلیل پیش‌بینی قیمت یا توصیه خرید نیست.")

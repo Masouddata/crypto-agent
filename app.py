@@ -352,13 +352,13 @@ STABLECOIN_SYMBOLS = {
     "USDT", "USDC", "USDE", "USDS", "DAI", "FDUSD", "TUSD", "USDP",
     "USDD", "PYUSD", "USD1", "USDX", "USDSC", "GUSD", "FRAX",
     "LUSD", "USDB", "USDTB", "EURC", "EURS", "EUROC",
-    "USTC", "UST", "SUSD", "USDK", "USDF", "USD0", "EURCV",
+    "USTC", "UST", "SUSD", "USDK", "USDF", "USD0", "EURCV", "USDG", "RLUSD",
 }
 STABLECOIN_NAME_HINTS = (
     "tether", "usd coin", "usdc", "usdt", "first digital usd",
     "paypal usd", "trueusd", "pax dollar", "dai stablecoin",
     "frax", "liquity usd", "staked usde", "ethena usde", "euro coinvertible", "eur coinvertible",
-    "stablecoin", "united stables", "usd1", "usdd", "gemini dollar",
+    "stablecoin", "united stables", "usd1", "usdd", "gemini dollar", "global dollar", "ripple usd",
 )
 
 def mark_stablecoins(frame):
@@ -376,7 +376,13 @@ def mark_stablecoins(frame):
     equity_name_match = names.apply(lambda value: any(hint in value for hint in equity_hints))
     equity_symbol_match = symbols.str.endswith("B", na=False) & names.str.contains("stock|equity|share", na=False)
     out["Is_Tokenized_Equity"] = equity_name_match | equity_symbol_match
-    out["Is_Excluded_Asset"] = out["Is_Stablecoin"] | out["Is_Tokenized_Equity"]
+    # Exclude non-crypto credit/security instruments from a crypto pre-pump ranking.
+    # FIGR_HELOC is a tokenized home-equity-credit instrument, not a conventional crypto asset.
+    excluded_instrument_symbols = {"FIGR_HELOC"}
+    out["Is_Excluded_Instrument"] = symbols.isin(excluded_instrument_symbols)
+    out["Is_Excluded_Asset"] = (
+        out["Is_Stablecoin"] | out["Is_Tokenized_Equity"] | out["Is_Excluded_Instrument"]
+    )
     return out
 
 
@@ -610,8 +616,9 @@ def calculate_pre_pump_score(frame):
                    rsi_value.between(40, 68) & strong_coverage & btc_not_bearish)
     watch_setup = (eligible & ~symbol_ambiguous & ~overheated & ~thin & ~missing_market & ~extreme_turnover &
                    ch24.abs().le(7) & ch7.abs().le(18) & turnover.between(0.001, 0.15) & score.ge(55))
+    excluded_instrument = out.get("Is_Excluded_Instrument", pd.Series(False, index=out.index)).fillna(False).astype(bool)
     out["Signal"] = np.select(
-        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], symbol_ambiguous, overheated, valid_setup,
+        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], excluded_instrument, symbol_ambiguous, overheated, valid_setup,
          watch_setup & ~flow_available, watch_setup & flow_available & ~positive_flow,
          watch_setup & ~surge.notna(), watch_setup],
         ["Excluded — stablecoin", "Excluded — tokenized equity", "Hold — ambiguous ticker; verify contract",
@@ -621,8 +628,9 @@ def calculate_pre_pump_score(frame):
          "Early activity — volume history missing",
          "Early activity — monitor"], default="Watch — not enough evidence")
     out["Risk_Level"] = np.select(
-        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], symbol_ambiguous, thin, overheated, extreme_turnover, missing_market],
-        ["Excluded — stablecoin", "Excluded — tokenized equity", "Unverified ticker / contract", "High / thin market", "High / volatile", "High / abnormal turnover", "Incomplete market data"],
+        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], excluded_instrument, symbol_ambiguous, thin, overheated, extreme_turnover, missing_market],
+        ["Excluded — stablecoin", "Excluded — tokenized equity", "Excluded — non-crypto instrument",
+         "Unverified ticker / contract", "High / thin market", "High / volatile", "High / abnormal turnover", "Incomplete market data"],
         default="Medium / review")
     return out
 
@@ -822,7 +830,7 @@ def fetch_cmc_market_universe(limit, api_key):
     # CMC's own stablecoin tag supplements symbol/name heuristics.
     frame = mark_stablecoins(frame)
     frame["Is_Stablecoin"] = frame["Is_Stablecoin"] | frame["CMC_Tags"].str.contains(r"stablecoin|stable-coin", case=False, na=False)
-    frame["Is_Excluded_Asset"] = frame["Is_Stablecoin"] | frame["Is_Tokenized_Equity"]
+    frame["Is_Excluded_Asset"] = frame["Is_Stablecoin"] | frame["Is_Tokenized_Equity"] | frame.get("Is_Excluded_Instrument", False)
     return frame
 
 
@@ -1024,7 +1032,9 @@ def _summarize_pattern_neighbors(neighbors):
                 "Analog_CI_Upper_7d": np.nan, "Analog_Median_Return_3d": np.nan,
                 "Analog_Median_Return_7d": np.nan, "Analog_Mean_Return_7d": np.nan,
                 "Analog_Median_MFE_7d": np.nan, "Analog_Median_MAE_7d": np.nan,
-                "Analog_Median_Distance": np.nan, "Analog_Status": "نمونه مشابه کافی نیست"}
+                "Analog_Median_Distance": np.nan, "Analog_Status": "نمونه مشابه کافی نیست",
+                "Analog_Same_Asset_Count": 0, "Analog_Cross_Asset_Count": 0,
+                "Analog_Source_Asset_Count": 0}
     r3 = pd.to_numeric(neighbors["forward_return_3d"], errors="coerce")
     r7 = pd.to_numeric(neighbors["forward_return_7d"], errors="coerce")
     n3, n7 = int(r3.notna().sum()), int(r7.notna().sum())
@@ -1227,6 +1237,15 @@ def run_historical_pattern_scan(universe_limit, api_key="", max_assets=30, histo
         matured = sample_frame[pd.to_datetime(sample_frame["sample_date"]) <= current_date - pd.Timedelta(days=7)] if not sample_frame.empty else pd.DataFrame()
         neighbors = _select_pattern_neighbors(matured, current_features, k=30, per_symbol=2) if not matured.empty else pd.DataFrame()
         summary = _summarize_pattern_neighbors(neighbors)
+        if neighbors is not None and not neighbors.empty:
+            same_asset_count = int(neighbors["Symbol"].astype(str).str.upper().eq(symbol).sum())
+            source_asset_count = int(neighbors["Symbol"].astype(str).str.upper().nunique())
+        else:
+            same_asset_count = 0
+            source_asset_count = 0
+        summary["Analog_Same_Asset_Count"] = same_asset_count
+        summary["Analog_Cross_Asset_Count"] = max(0, int(summary.get("Analog_Match_Count", 0)) - same_asset_count)
+        summary["Analog_Source_Asset_Count"] = source_asset_count
         current_rows.append({
             "Coin": name, "Symbol": symbol, "CoinGecko_ID": coin_id,
             "Market_Cap": float(row.get("Market_Cap", np.nan)),
@@ -4730,13 +4749,14 @@ if section == "🧬 الگوهای تاریخی":
     st.info(
         "این موتور از تاریخچه ساعتی قیمت CoinGecko در بازه ۹۰روزه، تجمیع‌شده به روزانه استفاده می‌کند. "
         "گردش ۲۴ساعته فقط پروکسی حجم است و کندل‌ها OHLC رسمی صرافی نیستند. برای جلوگیری از نگاه به آینده، "
-        "نمونه‌های آموزشی فقط وقتی وارد مقایسه می‌شوند که نتیجه ۷ روز بعدشان کامل شده باشد. "
+        "نمونه‌های آموزشی از چند دارایی نقدشونده جمع می‌شوند و هر نماد حداکثر دو نمونه می‌دهد؛ نتیجه‌ها الگوهای بین‌ارزی‌اند، نه فقط تاریخچه همان ارز. " 
+        "نمونه‌ها فقط وقتی وارد مقایسه می‌شوند که نتیجه ۷ روز بعدشان کامل شده باشد. "
         "آمار مشابه‌ها احتمال کالیبره‌شده یا تضمین رشد نیست؛ بک‌تست نیز فقط روی دارایی‌های فعلاً فهرست‌شده انجام می‌شود و سوگیری بقا را کاملاً حذف نمی‌کند."
     )
     hist_key = secret_or_env("COINGECKO_API_KEY")
     h1, h2, h3 = st.columns(3)
     with h1:
-        hist_universe = st.selectbox("فهرست اولیه CMC", [100, 250, 500], index=1, key="hist_pattern_universe")
+        hist_universe = st.selectbox("تعداد ارزهای اولیه از CoinGecko", [100, 250, 500], index=1, key="hist_pattern_universe")
     with h2:
         hist_assets = st.selectbox("تعداد ارزهای دارای تاریخچه", [20, 30, 40, 60], index=1, key="hist_pattern_assets")
     with h3:
@@ -4760,8 +4780,10 @@ if section == "🧬 الگوهای تاریخی":
                 st.session_state["historical_pattern_run_time_v1"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
             except Exception as exc:
                 st.error(f"اجرای موتور تاریخی ناموفق بود: {str(exc)[:500]}")
-                if "403" in str(exc) or "plan" in str(exc).lower() or "subscription" in str(exc).lower():
-                    st.warning("دسترسی OHLCV تاریخی CMC ممکن است به پلن Startup یا بالاتر نیاز داشته باشد.")
+                if "429" in str(exc):
+                    st.warning("محدودیت تعداد درخواست CoinGecko رخ داده است. چند دقیقه صبر کن و دوباره اجرا کن؛ از زدن پیاپی دکمه خودداری کن.")
+                elif "403" in str(exc) or "plan" in str(exc).lower() or "subscription" in str(exc).lower():
+                    st.warning("CoinGecko دسترسی این درخواست را رد کرده است. وضعیت پلن یا محدودیت IP را بررسی کن؛ این موتور به CMC وابسته نیست.")
     hist_result = st.session_state.get("historical_pattern_result_v1", pd.DataFrame())
     hist_meta = st.session_state.get("historical_pattern_meta_v1", {})
     hist_backtest = st.session_state.get("historical_pattern_backtest_v1", {})
@@ -4780,7 +4802,9 @@ if section == "🧬 الگوهای تاریخی":
         st.caption("توجه داده‌ای: حجم = میانه گردش ۲۴ساعته CoinGecko (پروکسی)، نه ورود پول خالص؛ سقف/کف روزانه از نمونه‌های ساعتی است، نه کندل رسمی صرافی.")
         st.subheader("🔎 ارزهایی با الگوهای تاریخی مشابه")
         hist_columns = [
-            "Coin", "Symbol", "Analog_Match_Count", "Analog_Hit_Rate_3d", "Analog_Hit_Rate_7d",
+            "Coin", "Symbol", "Analog_Match_Count", "Analog_Same_Asset_Count",
+            "Analog_Cross_Asset_Count", "Analog_Source_Asset_Count",
+            "Analog_Hit_Rate_3d", "Analog_Hit_Rate_7d",
             "Analog_Pump_Rate_7d", "Analog_CI_Lower_7d", "Analog_CI_Upper_7d", "Analog_Median_Return_3d",
             "Analog_Median_Return_7d", "Analog_Mean_Return_7d", "Analog_Median_MFE_7d", "Analog_Median_MAE_7d",
             "Analog_Median_Distance", "Analog_Score", "Analog_Status", "ret_1d", "ret_3d", "ret_7d",
@@ -4790,6 +4814,9 @@ if section == "🧬 الگوهای تاریخی":
         hist_columns = [c for c in hist_columns if c in hist_result.columns]
         hist_labels = {
             "Coin": "ارز", "Symbol": "نماد", "Analog_Match_Count": "تعداد نمونه مشابه",
+            "Analog_Same_Asset_Count": "نمونه از تاریخچه همین ارز",
+            "Analog_Cross_Asset_Count": "نمونه از ارزهای دیگر",
+            "Analog_Source_Asset_Count": "تعداد ارزهای منبع نمونه‌ها",
             "Analog_Hit_Rate_3d": "نرخ رشد ≥۳٪ در ۳روز (%)",
             "Analog_Hit_Rate_7d": "نرخ رشد ≥۵٪ در ۷روز (%)",
             "Analog_Pump_Rate_7d": "نرخ رشد ≥۱۰٪ در ۷روز (%)",

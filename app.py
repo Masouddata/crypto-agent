@@ -1624,9 +1624,31 @@ def fetch_okx_hourly_closes(inst_id, limit=721):
 
 
 def build_btc_correlation_frame(market_df, currency, universe_limit=60, symbols=None):
-    """Align completed hourly returns; OKX is primary and Binance is fallback."""
-    if market_df is None or market_df.empty or "symbol" not in market_df.columns:
-        return pd.DataFrame(), "فهرست بازار برای تحلیل در دسترس نیست."
+    """Align completed hourly returns; OKX is primary and Binance is fallback.
+
+    The main Streamlit market frame uses display columns (Symbol, Coin, Price,
+    Market_Cap), while this analysis historically expected CoinGecko API names
+    (symbol, name, current_price, market_cap). Normalize both schemas here.
+    """
+    if market_df is None or market_df.empty:
+        return pd.DataFrame(), "فهرست بازار خالی است؛ ابتدا دریافت بازار را اجرا کنید."
+    market_df = market_df.copy()
+    aliases = {
+        "symbol": ("symbol", "Symbol", "ticker", "Ticker"),
+        "name": ("name", "Name", "Coin", "coin"),
+        "current_price": ("current_price", "Current_Price", "Price", "price"),
+        "market_cap": ("market_cap", "Market_Cap", "Market_Cap_USD"),
+    }
+    for target, candidates in aliases.items():
+        if target not in market_df.columns:
+            for candidate in candidates:
+                if candidate in market_df.columns:
+                    market_df[target] = market_df[candidate]
+                    break
+    if "symbol" not in market_df.columns:
+        return pd.DataFrame(), "ستون نماد ارز در داده بازار پیدا نشد؛ ستون‌های Symbol یا symbol لازم است."
+    market_df["symbol"] = market_df["symbol"].astype(str).str.strip().str.upper()
+    market_df = market_df[market_df["symbol"].ne("") & market_df["symbol"].ne("NAN")]
     venue_errors = []
     okx_symbols = set()
     binance_symbols = set()

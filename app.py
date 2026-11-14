@@ -1209,6 +1209,10 @@ def classify_historical_candidate(row):
     num = lambda key: pd.to_numeric(pd.Series([row.get(key, np.nan)]), errors="coerce").iloc[0]
     hist_score = num("Analog_Score")
     hist_n = num("Analog_Match_Count")
+    same_n = num("Analog_Same_Asset_Count")
+    cross_n = num("Analog_Cross_Asset_Count")
+    same_pump_rate = num("SameAsset_Analog_Pump_Rate_7d")
+    cross_pump_rate = num("CrossAsset_Analog_Pump_Rate_7d")
     pump_n = num("Pump_Precedent_Count")
     pump_sources = num("Pump_Precedent_Source_Assets")
     median_return = num("Analog_Median_Return_7d")
@@ -1227,18 +1231,39 @@ def classify_historical_candidate(row):
         pd.notna(relative_strength) and relative_strength > 0 and
         pd.notna(ret7) and -12 <= ret7 <= 12
     )
+    # Cross-asset analogs are useful for discovery, but must not be presented as
+    # proof that this exact coin historically behaved the same way. For the
+    # strongest tier, require a minimum same-asset sample as well as cross-asset
+    # breadth and a current technical structure.
+    same_asset_support = (
+        pd.notna(same_n) and same_n >= 5 and
+        pd.notna(same_pump_rate) and same_pump_rate >= 20
+    )
+    cross_asset_support = (
+        pd.notna(cross_n) and cross_n >= 15 and
+        pd.notna(cross_pump_rate) and cross_pump_rate >= 20
+    )
     history_ok = (
         pd.notna(hist_score) and hist_score >= 55 and
         pd.notna(hist_n) and hist_n >= 20 and
         pd.notna(median_return) and median_return > 0 and
         pd.notna(pump_n) and pump_n >= 5 and
-        pd.notna(pump_sources) and pump_sources >= 3
+        pd.notna(pump_sources) and pump_sources >= 3 and
+        (same_asset_support or cross_asset_support)
     )
     if history_ok and structure_ok:
         return "نامزد بررسی خرید — جریان پول باید تأیید شود"
-    if ((pd.notna(hist_score) and hist_score >= 35 and pd.notna(hist_n) and hist_n >= 15)
-            or (pd.notna(vol_ratio) and vol_ratio >= 1.5 and
-                pd.notna(compression) and compression <= 0.85)):
+    historical_watch = (
+        (pd.notna(hist_score) and hist_score >= 35 and pd.notna(hist_n) and hist_n >= 15)
+        or (pd.notna(same_n) and same_n >= 4 and pd.notna(same_pump_rate) and same_pump_rate >= 15)
+        or (pd.notna(cross_n) and cross_n >= 12 and pd.notna(cross_pump_rate) and cross_pump_rate >= 15)
+    )
+    structure_watch = (
+        (pd.notna(vol_ratio) and vol_ratio >= 1.20)
+        or (pd.notna(compression) and compression <= 0.85)
+        or (pd.notna(higher_low) and higher_low > 0)
+    )
+    if historical_watch or structure_watch:
         return "زیر نظر — نقطه ورود تأیید نشده"
     return "عدم خرید فعلاً — شواهد ناکافی یا نامناسب"
 
@@ -1365,8 +1390,8 @@ def run_historical_pattern_scan(universe_limit, api_key="", max_assets=30, histo
                 current["خلاصه تصمیم"].str.startswith("زیر نظر"),
             ],
             [
-                "الگوی تاریخی و ساختار فعلی هم‌زمان مناسب‌اند؛ ورود پول واقعی و شرایط معامله هنوز باید جداگانه تأیید شوند.",
-                "حداقل یک نشانه مثبت وجود دارد، اما همه شروط ورود هم‌زمان برقرار نیستند.",
+                "الگوی تاریخی و ساختار فعلی هم‌زمان مناسب‌اند؛ شواهد همان ارز یا الگوهای بین‌ارزی باید در ستون‌های جداگانه دیده شوند. ورود پول واقعی و شرایط معامله هنوز باید تأیید شوند.",
+                "حداقل یک نشانه تاریخی یا ساختاری مثبت وجود دارد، اما همه شروط ورود هم‌زمان برقرار نیستند.",
             ],
             default="تطبیق تاریخی/ساختار فعلی برای اولویت دادن به این ارز کافی نیست."
         )
@@ -1598,7 +1623,7 @@ def fetch_okx_hourly_closes(inst_id, limit=721):
     return pd.Series([x[1] for x in items], index=index, dtype=float).dropna()
 
 
-def build_btc_correlation_frame(market_df, currency, universe_limit=60):
+def build_btc_correlation_frame(market_df, currency, universe_limit=60, symbols=None):
     """Align completed hourly returns; OKX is primary and Binance is fallback."""
     if market_df is None or market_df.empty or "symbol" not in market_df.columns:
         return pd.DataFrame(), "فهرست بازار برای تحلیل در دسترس نیست."
@@ -1622,7 +1647,12 @@ def build_btc_correlation_frame(market_df, currency, universe_limit=60):
     base = base[~base["symbol"].isin(excluded)].drop_duplicates("symbol")
     if "market_cap" in base.columns:
         base = base.sort_values("market_cap", ascending=False, na_position="last")
-    base = base.head(int(universe_limit))
+    if symbols:
+        requested = {str(x).strip().upper() for x in symbols if str(x).strip()}
+        # Always include BTC as the reference series; analyze only the requested asset(s).
+        base = base[base["symbol"].isin(requested | {"BTC"})]
+    else:
+        base = base.head(int(universe_limit))
     jobs = []
     for _, row in base.iterrows():
         symbol = str(row.get("symbol", "")).upper()
@@ -2891,7 +2921,7 @@ def cryptometer_watchlist(results):
 # =========================================================
 st.title("📡 اسکنر هوشمند بازار ارزهای دیجیتال")
 st.caption("پایش گسترده بازار • شناسایی فرصت‌های پیش از رشد • رادار انباشت • افزایش حجم • کنترل ریسک")
-st.caption("Build 2026-11-09.3 • Rate-limit-aware market fetch + pooled HTTP + smart cache • Analysis engine preserved")
+st.caption("Build 2026-11-14.1 • Same-asset vs cross-asset historical evidence separated • Conservative pre-pump triage")
 st.caption("دریافت بازار با فاصله‌گذاری بین صفحات و تلاش مجدد هوشمند انجام می‌شود؛ پاسخ‌ها ۵ دقیقه کش می‌شوند و در صورت محدودیت صفحه بعد، داده صفحات موفق حفظ می‌شود.")
 st.warning(
     "امتیازها ابزار غربالگری‌اند، نه احتمال قطعی پامپ یا توصیه مالی. داده‌های ناقص به‌عنوان سیگنال مثبت فرض نمی‌شوند؛ درصد پوشش شواهد را کنار امتیاز ببین."
@@ -3120,6 +3150,50 @@ elif (data_source == "CoinGecko market" and technical_limit > 0
 
 # The primary ranking is now Pre-Pump: unusual turnover + quiet price + liquidity + optional history.
 df = calculate_pre_pump_score(df)
+
+# Trade signals are deliberately restricted to assets with completed technical history.
+# A market-wide score alone is not enough to issue BUY/SELL.
+def add_analyzed_trade_signals(frame):
+    out = frame.copy()
+    idx = out.index
+    rsi_v = numeric(out.get("RSI_14", pd.Series(np.nan, index=idx)))
+    macd_v = numeric(out.get("MACD", pd.Series(np.nan, index=idx)))
+    macd_sig = numeric(out.get("MACD_Signal", pd.Series(np.nan, index=idx)))
+    tech_v = numeric(out.get("Technical_Score", pd.Series(np.nan, index=idx)))
+    trend_v = numeric(out.get("Trend_7d_Percent", pd.Series(np.nan, index=idx)))
+    surge_v = numeric(out.get("Volume_24h_vs_7d_Avg", pd.Series(np.nan, index=idx)))
+    change24 = numeric(out.get("Change_24h_Percent", pd.Series(np.nan, index=idx)))
+    change7 = numeric(out.get("Change_7d_Percent", pd.Series(np.nan, index=idx)))
+    score_v = numeric(out.get("PrePump_Score", pd.Series(np.nan, index=idx)))
+    # Analyzed means actual history-derived technical indicators exist, not just market snapshot fields.
+    analyzed = (rsi_v.notna() & macd_v.notna() & macd_sig.notna() & tech_v.notna())
+    out["Trade_Analysis_Completed"] = analyzed
+
+    base_signal = out.get("Signal", pd.Series("", index=idx)).astype(str)
+    buy = (analyzed & base_signal.str.startswith("Pre-pump watch — real buying") &
+           rsi_v.between(45, 68) & (macd_v > macd_sig) &
+           surge_v.ge(1.5) & score_v.ge(70))
+    sell = (analyzed & (macd_v < macd_sig) &
+            ((rsi_v < 42) | (trend_v <= -5)) &
+            ((change24 <= -2) | (change7 <= -5)))
+
+    out["Trade_Signal"] = np.select(
+        [buy, sell, analyzed],
+        ["BUY", "SELL", "WAIT"],
+        default=""
+    )
+    out["Trade_Signal_Reason"] = np.select(
+        [buy, sell, analyzed],
+        [
+            "تاریخچه تکنیکال کامل + مومنتوم مثبت + شتاب حجم + تأیید خرید واقعی؛ ورود همچنان نیازمند مدیریت ریسک است",
+            "تاریخچه تکنیکال کامل + MACD نزولی و ضعف قیمت/روند؛ بررسی خروج یا پرهیز از ورود",
+            "تحلیل تکنیکال انجام شده اما شروط خرید یا فروش هم‌زمان تأیید نشده‌اند"
+        ],
+        default="تحلیل تکنیکال این ارز هنوز انجام نشده؛ سیگنال خرید/فروش صادر نمی‌شود"
+    )
+    return out
+
+df = add_analyzed_trade_signals(df)
 if data_source == "CoinGecko market" and use_bybit_derivatives:
     df = add_derivatives_score(df)
 
@@ -3720,6 +3794,14 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
         if "Volume_24h_vs_7d_Avg" not in filtered.columns:
             filtered["Volume_24h_vs_7d_Avg"] = np.nan
         ranked = filtered.sort_values(["PrePump_Score", "Volume_24h_vs_7d_Avg"], ascending=[False, False], na_position="last").copy()
+        st.subheader("🎯 سیگنال خرید و فروش فقط برای ارزهای تحلیل‌شده")
+        analyzed_rows = ranked[ranked.get("Trade_Analysis_Completed", pd.Series(False, index=ranked.index)).fillna(False)]
+        action_rows = analyzed_rows[analyzed_rows.get("Trade_Signal", pd.Series("", index=analyzed_rows.index)).isin(["BUY", "SELL"])]
+        if not action_rows.empty:
+            signal_cols = [c for c in ["Coin", "Symbol", "Trade_Signal", "Price", "PrePump_Score", "RSI_14", "MACD", "MACD_Signal", "Volume_24h_vs_7d_Avg", "Trade_Signal_Reason"] if c in action_rows.columns]
+            st.dataframe(action_rows[signal_cols].sort_values(["Trade_Signal", "PrePump_Score"], ascending=[True, False]), use_container_width=True, hide_index=True)
+        else:
+            st.info(f"از {len(analyzed_rows)} ارزی که واقعاً تحلیل تکنیکال شده‌اند، فعلاً هیچ‌کدام شروط کامل BUY یا SELL را ندارند. برای سایر ارزها هیچ سیگنال خرید/فروش صادر نمی‌شود.")
         # Radar view of the leading candidates. Missing factors stay blank, not zero or a fabricated neutral.
         radar_factors = [
             ("Buy_Flow_Score", "خرید واقعی"),
@@ -3776,7 +3858,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                 "Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent", "Buy_Flow_Status",
                 "Momentum_Factor_Score", "Liquidity_Quality_Score", "BTC_Market_Context", "BTC_Regime_Score", "News_Factor_Score", "Evidence_Coverage_Percent",
                 "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange",
-                "Derivatives_Context_Score", "PrePump_Score", "Pump_Potential_Score", "Signal", "Risk_Level", "Technical_Signal",
+                "Derivatives_Context_Score", "PrePump_Score", "Pump_Potential_Score", "Trade_Signal", "Trade_Signal_Reason", "Trade_Analysis_Completed", "Signal", "Risk_Level", "Technical_Signal",
             ]
             cols = [c for c in preferred_cols if c in ranked.columns]
             display_names = {
@@ -3798,7 +3880,8 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                 "Funding_Rate_Percent": "Funding (%)", "Open_Interest_USD": "Open interest (USD)",
                 "Derivatives_Turnover_24h_USD": "Perp turnover (USD)", "Derivatives_Exchange": "Derivatives source", "Derivatives_Context_Score": "Derivatives context",
                 "PrePump_Score": "Pre-Pump score", "Pump_Potential_Score": "Legacy score (same value)",
-                "Signal": "Signal / interpretation", "Risk_Level": "Risk flag", "Technical_Signal": "Technical reading",
+                "Trade_Signal": "BUY / SELL (فقط ارز تحلیل‌شده)", "Trade_Signal_Reason": "دلیل سیگنال معامله", "Trade_Analysis_Completed": "تحلیل تکنیکال کامل؟",
+                "Signal": "Pre-pump screening status", "Risk_Level": "Risk flag", "Technical_Signal": "Technical reading",
             }
             display_df = ranked[cols].rename(columns=display_names)
             st.caption("برای دیدن نمودار یک ارز، روی ردیف آن کلیک کن.")
@@ -4845,7 +4928,52 @@ if section == "₿ رابطه ارزها با بیت‌کوین":
         with st.expander("همه ارزهای بررسی‌شده"):
             st.dataframe(corr_view, use_container_width=True, hide_index=True)
         st.download_button("⬇️ دریافت CSV همبستگی و واگرایی", data=corr_view.to_csv(index=False).encode("utf-8-sig"), file_name="btc_correlation_divergence.csv", mime="text/csv", key="download_btc_corr")
-    st.caption("محدودیت: تاریخچه این بخش از CoinGecko است؛ داده‌های روزانه در بازه بلندتر از ۹۰ روز OHLC رسمی صرافی نیستند. داده ناکافی امتیاز مثبت نمی‌گیرد. این تحلیل پیش‌بینی قطعی یا توصیه خرید نیست.")
+    st.divider()
+    st.subheader("🔎 تحلیل اختصاصی یک ارز در برابر بیت‌کوین")
+    st.caption("نام یا نماد ارز را وارد کن؛ فقط همان ارز همراه BTC بررسی می‌شود و نتیجه همبستگی، عملکرد نسبی و واگرایی نمایش داده خواهد شد.")
+    custom_col, custom_btn_col = st.columns([3, 1])
+    with custom_col:
+        custom_coin = st.text_input("نام یا نماد ارز (مثلاً SOL یا Solana)", key="btc_custom_coin_input", placeholder="مثلاً SOL")
+    with custom_btn_col:
+        st.write("")
+        st.write("")
+        custom_run = st.button("تحلیل ارز", type="primary", key="btc_custom_coin_run")
+    if custom_run:
+        query = custom_coin.strip().upper()
+        if not query:
+            st.warning("ابتدا نام یا نماد ارز را وارد کن.")
+        else:
+            # Resolve user input against the loaded CoinGecko market universe.
+            source = df.copy()
+            if "Symbol" in source.columns and "symbol" not in source.columns:
+                source["symbol"] = source["Symbol"].astype(str).str.upper()
+            if "Coin" in source.columns and "name" not in source.columns:
+                source["name"] = source["Coin"].astype(str)
+            matches = source[
+                source.get("symbol", pd.Series("", index=source.index)).astype(str).str.upper().eq(query)
+                | source.get("name", pd.Series("", index=source.index)).astype(str).str.upper().eq(query)
+            ]
+            if matches.empty:
+                st.error("این ارز در فهرست بازار فعلی پیدا نشد. ابتدا تعداد ارزهای بازار را افزایش بده یا نماد دقیق آن را وارد کن.")
+            else:
+                chosen = matches.iloc[0]
+                chosen_symbol = str(chosen.get("symbol", "")).upper()
+                with st.spinner(f"در حال تحلیل {chosen.get('name', chosen_symbol)} در برابر BTC..."):
+                    custom_frame, custom_status = build_btc_correlation_frame(source, currency, 2, symbols=[chosen_symbol])
+                st.caption(custom_status)
+                if custom_frame.empty or not custom_frame["نماد"].astype(str).str.upper().eq(chosen_symbol).any():
+                    st.warning("تاریخچه ساعتی کافی یا جفت USDT قابل‌دسترسی برای این ارز پیدا نشد؛ بنابراین نتیجه‌ای صادر نمی‌شود.")
+                else:
+                    item = custom_frame[custom_frame["نماد"].astype(str).str.upper().eq(chosen_symbol)].iloc[0]
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("همبستگی ۷روزه با BTC", f"{item['همبستگی ۷روز']:+.3f}" if pd.notna(item['همبستگی ۷روز']) else "—")
+                    m2.metric("عملکرد بهتر از BTC در ۷روز", f"{item['عملکرد بهتر از BTC در ۷روز٪']:+.2f}%" if pd.notna(item['عملکرد بهتر از BTC در ۷روز٪']) else "—")
+                    m3.metric("قدرت واگرایی", f"{item['قدرت واگرایی']:.1f}" if pd.notna(item['قدرت واگرایی']) else "—")
+                    m4.metric("مقاومت هنگام افت BTC", f"{item['سبز بودن ارز هنگام افت BTC٪']:.1f}%" if pd.notna(item['سبز بودن ارز هنگام افت BTC٪']) else "—")
+                    st.markdown(f"**نتیجه: {item['وضعیت']}**")
+                    st.dataframe(custom_frame, use_container_width=True, hide_index=True)
+                    st.caption("تفسیر: همبستگی مثبت بالا یعنی حرکت هم‌جهت؛ عملکرد نسبی مثبت و مقاومت هنگام افت BTC نشانه واگرایی مثبت است. این نتیجه به‌تنهایی سیگنال خرید یا فروش نیست.")
+    st.caption("محدودیت: تاریخچه این بخش از کندل‌های ساعتی صرافی‌های در دسترس استفاده می‌کند. داده ناکافی امتیاز مثبت نمی‌گیرد. این تحلیل پیش‌بینی قطعی یا توصیه خرید نیست.")
 
 # =========================================================
 # HISTORICAL PATTERN INTELLIGENCE — independent menu page
@@ -4908,22 +5036,29 @@ if section == "🧬 الگوهای تاریخی":
         k4.metric("سیگنال‌های بک‌تست", hist_backtest.get("signals", 0))
         st.caption("توجه داده‌ای: حجم = میانه گردش ۲۴ساعته CoinGecko (پروکسی)، نه ورود پول خالص؛ سقف/کف روزانه از نمونه‌های ساعتی است، نه کندل رسمی صرافی.")
         st.subheader("🧭 کدام ارز برای بررسی خرید مناسب‌تر است؟")
-        st.caption("این برچسب‌ها فهرست بررسی را اولویت‌بندی می‌کنند، نه دستور خرید: «نامزد بررسی خرید» فقط وقتی صادر می‌شود که شواهد تاریخی و ساختار فعلی هم‌زمان مناسب باشند؛ تأیید جریان پول واقعی، نقدشوندگی لحظه‌ای و حد ضرر همچنان لازم است.")
+        st.caption("این برچسب‌ها فهرست بررسی را اولویت‌بندی می‌کنند، نه دستور خرید. نمونه‌های همان ارز و نمونه‌های ارزهای دیگر جداگانه گزارش می‌شوند؛ تطبیق بین‌ارزی به‌تنهایی به‌عنوان سابقه همان ارز جا زده نمی‌شود. سطح «نامزد بررسی خرید» علاوه بر ساختار فعلی، به شواهد تاریخی کافی از همان ارز یا الگوهای بین‌ارزی نیاز دارد؛ ورود پول واقعی، نقدشوندگی لحظه‌ای و حد ضرر همچنان باید جداگانه تأیید شوند.")
         decision_order = {"نامزد بررسی خرید — جریان پول باید تأیید شود": 0,
                           "زیر نظر — نقطه ورود تأیید نشده": 1,
                           "عدم خرید فعلاً — شواهد ناکافی یا نامناسب": 2}
         hist_result["_decision_order"] = hist_result["خلاصه تصمیم"].map(decision_order).fillna(3)
         hist_result = hist_result.sort_values(["_decision_order", "Analog_Score"], ascending=[True, False])
-        decision_view = hist_result[["Coin", "Symbol", "خلاصه تصمیم", "توضیح تصمیم",
-                                     "Analog_Score", "Analog_Match_Count",
-                                     "Pump_Precedent_Count", "Pump_Precedent_Source_Assets",
-                                     "volume_ratio_3v14", "range_compression_3v14",
-                                     "higher_low_3v7", "rsi_14", "relative_strength_7d",
-                                     "ret_7d"]].copy()
+        decision_cols = [
+            "Coin", "Symbol", "خلاصه تصمیم", "توضیح تصمیم", "Analog_Score",
+            "Analog_Match_Count", "Analog_Same_Asset_Count", "Analog_Cross_Asset_Count",
+            "SameAsset_Analog_Pump_Rate_7d", "CrossAsset_Analog_Pump_Rate_7d",
+            "Pump_Precedent_Count", "Pump_Precedent_Source_Assets",
+            "volume_ratio_3v14", "range_compression_3v14", "higher_low_3v7",
+            "rsi_14", "relative_strength_7d", "ret_7d"
+        ]
+        decision_view = hist_result[[c for c in decision_cols if c in hist_result.columns]].copy()
         decision_labels = {
             "Coin": "ارز", "Symbol": "نماد", "خلاصه تصمیم": "ارزیابی فعلی",
             "توضیح تصمیم": "دلیل", "Analog_Score": "امتیاز تاریخی",
-            "Analog_Match_Count": "تعداد نمونه معتبر",
+            "Analog_Match_Count": "کل نمونه‌های مشابه",
+            "Analog_Same_Asset_Count": "نمونه از تاریخچه همین ارز",
+            "Analog_Cross_Asset_Count": "نمونه از ارزهای دیگر",
+            "SameAsset_Analog_Pump_Rate_7d": "نرخ پامپ تاریخی همین ارز (%)",
+            "CrossAsset_Analog_Pump_Rate_7d": "نرخ پامپ الگوهای بین‌ارزی (%)",
             "Pump_Precedent_Count": "نمونه‌های تاریخی منتهی به رشد ≥۱۰٪",
             "Pump_Precedent_Source_Assets": "تعداد ارزهای منبع",
             "volume_ratio_3v14": "شتاب گردش ۳روز/۱۴روز",

@@ -1204,6 +1204,45 @@ def fetch_cg_pattern_daily(coin_id, currency="usd", days=90, api_key=""):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def classify_historical_candidate(row):
+    """Conservative triage: historical analogs + present-day structure; never a buy order."""
+    num = lambda key: pd.to_numeric(pd.Series([row.get(key, np.nan)]), errors="coerce").iloc[0]
+    hist_score = num("Analog_Score")
+    hist_n = num("Analog_Match_Count")
+    pump_n = num("Pump_Precedent_Count")
+    pump_sources = num("Pump_Precedent_Source_Assets")
+    median_return = num("Analog_Median_Return_7d")
+    vol_ratio = num("volume_ratio_3v14")
+    compression = num("range_compression_3v14")
+    higher_low = num("higher_low_3v7")
+    rsi = num("rsi_14")
+    relative_strength = num("relative_strength_7d")
+    ret7 = num("ret_7d")
+
+    structure_ok = (
+        pd.notna(vol_ratio) and vol_ratio >= 1.20 and
+        pd.notna(compression) and compression <= 0.85 and
+        pd.notna(higher_low) and higher_low >= 0 and
+        pd.notna(rsi) and 40 <= rsi <= 68 and
+        pd.notna(relative_strength) and relative_strength > 0 and
+        pd.notna(ret7) and -12 <= ret7 <= 12
+    )
+    history_ok = (
+        pd.notna(hist_score) and hist_score >= 55 and
+        pd.notna(hist_n) and hist_n >= 20 and
+        pd.notna(median_return) and median_return > 0 and
+        pd.notna(pump_n) and pump_n >= 5 and
+        pd.notna(pump_sources) and pump_sources >= 3
+    )
+    if history_ok and structure_ok:
+        return "نامزد بررسی خرید — جریان پول باید تأیید شود"
+    if ((pd.notna(hist_score) and hist_score >= 35 and pd.notna(hist_n) and hist_n >= 15)
+            or (pd.notna(vol_ratio) and vol_ratio >= 1.5 and
+                pd.notna(compression) and compression <= 0.85)):
+        return "زیر نظر — نقطه ورود تأیید نشده"
+    return "عدم خرید فعلاً — شواهد ناکافی یا نامناسب"
+
+
 def run_historical_pattern_scan(universe_limit, api_key="", max_assets=30, history_days=90):
     """CoinGecko-based historical analog scan; no paid CMC OHLCV key required."""
     history_days = max(90, min(365, int(history_days)))  # >90d is daily granularity on public market_chart.
@@ -1231,7 +1270,7 @@ def run_historical_pattern_scan(universe_limit, api_key="", max_assets=30, histo
     for idx, (_, row) in enumerate(selected.iterrows(), start=1):
         coin_id = str(row["CoinGecko_ID"])
         try:
-            candles = fetch_cg_pattern_daily(coin_id, "usd", 90, api_key)
+            candles = fetch_cg_pattern_daily(coin_id, "usd", history_days, api_key)
             if len(candles) >= 30:
                 clean_candles[coin_id] = (row, candles)
         except Exception:
@@ -1319,6 +1358,18 @@ def run_historical_pattern_scan(universe_limit, api_key="", max_assets=30, histo
             0.45 * pd.to_numeric(current["Analog_Pump_Rate_7d"], errors="coerce")
         )
         current.loc[current["Analog_Match_Count"] < 20, "Analog_Score"] = np.nan
+        current["خلاصه تصمیم"] = current.apply(classify_historical_candidate, axis=1)
+        current["توضیح تصمیم"] = np.select(
+            [
+                current["خلاصه تصمیم"].str.startswith("نامزد بررسی خرید"),
+                current["خلاصه تصمیم"].str.startswith("زیر نظر"),
+            ],
+            [
+                "الگوی تاریخی و ساختار فعلی هم‌زمان مناسب‌اند؛ ورود پول واقعی و شرایط معامله هنوز باید جداگانه تأیید شوند.",
+                "حداقل یک نشانه مثبت وجود دارد، اما همه شروط ورود هم‌زمان برقرار نیستند.",
+            ],
+            default="تطبیق تاریخی/ساختار فعلی برای اولویت دادن به این ارز کافی نیست."
+        )
         current = current.sort_values(["Analog_Score", "Analog_Median_Return_7d", "Analog_Match_Count"], ascending=[False, False, False], na_position="last").reset_index(drop=True)
     meta = {
         "market_universe": int(len(market)), "eligible_assets": int(len(eligible)),
@@ -4856,7 +4907,34 @@ if section == "🧬 الگوهای تاریخی":
         k3.metric("تعداد آزمون‌های خارج از نمونه", hist_backtest.get("test_cases", 0))
         k4.metric("سیگنال‌های بک‌تست", hist_backtest.get("signals", 0))
         st.caption("توجه داده‌ای: حجم = میانه گردش ۲۴ساعته CoinGecko (پروکسی)، نه ورود پول خالص؛ سقف/کف روزانه از نمونه‌های ساعتی است، نه کندل رسمی صرافی.")
-        st.subheader("🔎 ارزهایی با الگوهای تاریخی مشابه")
+        st.subheader("🧭 کدام ارز برای بررسی خرید مناسب‌تر است؟")
+        st.caption("این برچسب‌ها فهرست بررسی را اولویت‌بندی می‌کنند، نه دستور خرید: «نامزد بررسی خرید» فقط وقتی صادر می‌شود که شواهد تاریخی و ساختار فعلی هم‌زمان مناسب باشند؛ تأیید جریان پول واقعی، نقدشوندگی لحظه‌ای و حد ضرر همچنان لازم است.")
+        decision_order = {"نامزد بررسی خرید — جریان پول باید تأیید شود": 0,
+                          "زیر نظر — نقطه ورود تأیید نشده": 1,
+                          "عدم خرید فعلاً — شواهد ناکافی یا نامناسب": 2}
+        hist_result["_decision_order"] = hist_result["خلاصه تصمیم"].map(decision_order).fillna(3)
+        hist_result = hist_result.sort_values(["_decision_order", "Analog_Score"], ascending=[True, False])
+        decision_view = hist_result[["Coin", "Symbol", "خلاصه تصمیم", "توضیح تصمیم",
+                                     "Analog_Score", "Analog_Match_Count",
+                                     "Pump_Precedent_Count", "Pump_Precedent_Source_Assets",
+                                     "volume_ratio_3v14", "range_compression_3v14",
+                                     "higher_low_3v7", "rsi_14", "relative_strength_7d",
+                                     "ret_7d"]].copy()
+        decision_labels = {
+            "Coin": "ارز", "Symbol": "نماد", "خلاصه تصمیم": "ارزیابی فعلی",
+            "توضیح تصمیم": "دلیل", "Analog_Score": "امتیاز تاریخی",
+            "Analog_Match_Count": "تعداد نمونه معتبر",
+            "Pump_Precedent_Count": "نمونه‌های تاریخی منتهی به رشد ≥۱۰٪",
+            "Pump_Precedent_Source_Assets": "تعداد ارزهای منبع",
+            "volume_ratio_3v14": "شتاب گردش ۳روز/۱۴روز",
+            "range_compression_3v14": "فشردگی دامنه",
+            "higher_low_3v7": "تغییر کف‌های اخیر٪", "rsi_14": "RSI",
+            "relative_strength_7d": "قدرت نسبی نسبت به BTC٪",
+            "ret_7d": "بازده فعلی ۷روزه٪"
+        }
+        st.dataframe(decision_view.rename(columns=decision_labels), use_container_width=True, hide_index=True)
+        st.divider()
+        st.subheader("🔎 جزئیات الگوهای تاریخی مشابه")
         hist_columns = [
             "Coin", "Symbol", "Analog_Match_Count", "Analog_Same_Asset_Count",
             "Analog_Cross_Asset_Count", "Analog_Source_Asset_Count",
@@ -4906,7 +4984,7 @@ if section == "🧬 الگوهای تاریخی":
         st.dataframe(hist_result[hist_columns].rename(columns=hist_labels), use_container_width=True, hide_index=True)
         st.download_button(
             "⬇️ دریافت نتایج الگوهای تاریخی CSV",
-            data=hist_result.to_csv(index=False).encode("utf-8-sig"),
+            data=hist_result.drop(columns=["_decision_order"], errors="ignore").to_csv(index=False).encode("utf-8-sig"),
             file_name="historical_pattern_intelligence.csv", mime="text/csv",
             key="download_historical_pattern_results"
         )

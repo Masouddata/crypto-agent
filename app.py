@@ -872,6 +872,342 @@ def fetch_cmc_ohlcv_batch(ids, period, count, api_key):
     return result
 
 
+# =========================================================
+# HISTORICAL PATTERN INTELLIGENCE — walk-forward analog engine
+# =========================================================
+PATTERN_FEATURES = [
+    "ret_1d", "ret_3d", "ret_7d", "volume_ratio_3v14",
+    "range_compression_3v14", "higher_low_3v7", "rsi_14",
+    "relative_strength_7d",
+]
+
+
+def _pattern_feature_at(candles, end_index, btc_close_by_date=None):
+    """Build a strictly backward-looking daily feature vector at a candle close."""
+    if end_index < 21:
+        return None
+    hist = candles[:end_index + 1]
+    closes = np.asarray([float(x["close"]) for x in hist], dtype=float)
+    if len(closes) < 22 or not np.isfinite(closes[-1]) or closes[-1] <= 0:
+        return None
+    current = float(closes[-1])
+    def ret(period):
+        prior = float(closes[-1 - period])
+        return (current / prior - 1.0) * 100.0 if prior > 0 else np.nan
+    volumes = np.asarray([float(x.get("volume", np.nan)) for x in hist], dtype=float)
+    recent_vol = volumes[-3:]
+    base_vol = volumes[-17:-3]
+    recent_vol_mean = float(np.nanmean(recent_vol)) if np.isfinite(recent_vol).any() else np.nan
+    base_vol_mean = float(np.nanmean(base_vol)) if np.isfinite(base_vol).any() else np.nan
+    volume_ratio = recent_vol_mean / base_vol_mean if np.isfinite(base_vol_mean) and base_vol_mean > 0 else np.nan
+
+    highs = np.asarray([float(x.get("high", x["close"])) for x in hist], dtype=float)
+    lows = np.asarray([float(x.get("low", x["close"])) for x in hist], dtype=float)
+    recent_range = float(np.nanmax(highs[-3:]) - np.nanmin(lows[-3:]))
+    prior_range = float(np.nanmax(highs[-17:-3]) - np.nanmin(lows[-17:-3]))
+    range_ratio = (recent_range / current) / (prior_range / float(np.nanmedian(closes[-17:-3]))) if prior_range > 0 and np.nanmedian(closes[-17:-3]) > 0 else np.nan
+    prior_low = float(np.nanmin(lows[-10:-3]))
+    recent_low = float(np.nanmin(lows[-3:]))
+    higher_low = (recent_low / prior_low - 1.0) * 100.0 if prior_low > 0 else np.nan
+    rsi_value = rsi(pd.Series(closes), 14).iloc[-1]
+    ret7 = ret(7)
+    relative_strength = np.nan
+    if btc_close_by_date:
+        date_key = pd.Timestamp(hist[-1]["close_time"]).normalize()
+        btc_now = btc_close_by_date.get(date_key)
+        btc_then = btc_close_by_date.get(date_key - pd.Timedelta(days=7))
+        if btc_now and btc_then and btc_then > 0:
+            relative_strength = ret7 - (btc_now / btc_then - 1.0) * 100.0
+    features = {
+        "ret_1d": ret(1), "ret_3d": ret(3), "ret_7d": ret7,
+        "volume_ratio_3v14": volume_ratio,
+        "range_compression_3v14": range_ratio,
+        "higher_low_3v7": higher_low,
+        "rsi_14": float(rsi_value) if pd.notna(rsi_value) else np.nan,
+        "relative_strength_7d": relative_strength,
+    }
+    valid = sum(pd.notna(features.get(k)) for k in PATTERN_FEATURES)
+    if valid < 6:
+        return None
+    return features
+
+
+def _build_pattern_samples(candles, symbol, coin_name, btc_close_by_date=None):
+    """Create non-overlapping historical examples; labels use only candles after each setup."""
+    rows = []
+    # Seven-day spacing avoids repeatedly counting overlapping forward outcome windows.
+    for i in range(21, len(candles) - 7, 7):
+        features = _pattern_feature_at(candles, i, btc_close_by_date)
+        if not features:
+            continue
+        entry = float(candles[i]["close"])
+        future = candles[i + 1:i + 8]
+        if entry <= 0 or len(future) != 7:
+            continue
+        close3 = float(future[2]["close"])
+        close7 = float(future[6]["close"])
+        future_high = max(float(x.get("high", x["close"])) for x in future)
+        future_low = min(float(x.get("low", x["close"])) for x in future)
+        rows.append({
+            **features,
+            "sample_date": pd.Timestamp(candles[i]["close_time"]).normalize(),
+            "Symbol": str(symbol).upper(), "Coin": str(coin_name),
+            "forward_return_3d": (close3 / entry - 1.0) * 100.0,
+            "forward_return_7d": (close7 / entry - 1.0) * 100.0,
+            "max_favorable_7d": (future_high / entry - 1.0) * 100.0,
+            "max_adverse_7d": (future_low / entry - 1.0) * 100.0,
+        })
+    return rows
+
+
+def _pattern_distance_frame(training, query_features):
+    """Robust-IQR standardized distances using only information in the training set."""
+    usable = [c for c in PATTERN_FEATURES if c in training.columns and pd.notna(query_features.get(c))]
+    if len(usable) < 6:
+        return pd.Series(dtype=float)
+    matrix = training[usable].apply(pd.to_numeric, errors="coerce")
+    medians = matrix.median(axis=0, skipna=True)
+    iqrs = matrix.quantile(0.75) - matrix.quantile(0.25)
+    scales = iqrs.where(iqrs > 1e-9, matrix.std(ddof=0)).replace(0, 1.0).fillna(1.0)
+    query = pd.Series({c: float(query_features[c]) for c in usable})
+    qz = ((query - medians) / scales).clip(-6, 6)
+    z = ((matrix - medians) / scales).clip(-6, 6)
+    mask = z.notna()
+    squared = z.sub(qz, axis=1).pow(2).where(mask)
+    counts = mask.sum(axis=1)
+    distances = np.sqrt(squared.sum(axis=1, skipna=True) / counts.replace(0, np.nan))
+    return distances.where(counts >= 6).dropna()
+
+
+def _select_pattern_neighbors(training, query_features, k=30, per_symbol=2):
+    if training is None or training.empty:
+        return training.iloc[0:0].copy() if isinstance(training, pd.DataFrame) else pd.DataFrame()
+    distances = _pattern_distance_frame(training, query_features)
+    if distances.empty:
+        return training.iloc[0:0].copy()
+    ordered = distances.sort_values().index.tolist()
+    selected, counts, last_dates = [], {}, {}
+    for idx in ordered:
+        row = training.loc[idx]
+        symbol = str(row.get("Symbol", "")).upper()
+        if counts.get(symbol, 0) >= per_symbol:
+            continue
+        date = pd.Timestamp(row["sample_date"])
+        previous = last_dates.get(symbol)
+        if previous is not None and abs((date - previous).days) < 7:
+            continue
+        selected.append(idx)
+        counts[symbol] = counts.get(symbol, 0) + 1
+        last_dates[symbol] = date
+        if len(selected) >= k:
+            break
+    result = training.loc[selected].copy()
+    result["Pattern_Distance"] = distances.loc[selected].values
+    return result
+
+
+def _wilson_interval(successes, total, z=1.96):
+    if total <= 0:
+        return np.nan, np.nan
+    p = successes / total
+    denom = 1 + z * z / total
+    center = (p + z * z / (2 * total)) / denom
+    margin = z * np.sqrt((p * (1 - p) + z * z / (4 * total)) / total) / denom
+    return max(0.0, center - margin), min(1.0, center + margin)
+
+
+def _summarize_pattern_neighbors(neighbors):
+    if neighbors is None or len(neighbors) == 0:
+        return {"Analog_Match_Count": 0, "Analog_Hit_Rate_3d": np.nan,
+                "Analog_Hit_Rate_7d": np.nan, "Analog_Pump_Rate_7d": np.nan,
+                "Analog_CI_Lower_7d": np.nan,
+                "Analog_CI_Upper_7d": np.nan, "Analog_Median_Return_3d": np.nan,
+                "Analog_Median_Return_7d": np.nan, "Analog_Mean_Return_7d": np.nan,
+                "Analog_Median_MFE_7d": np.nan, "Analog_Median_MAE_7d": np.nan,
+                "Analog_Median_Distance": np.nan, "Analog_Status": "نمونه مشابه کافی نیست"}
+    r3 = pd.to_numeric(neighbors["forward_return_3d"], errors="coerce")
+    r7 = pd.to_numeric(neighbors["forward_return_7d"], errors="coerce")
+    n3, n7 = int(r3.notna().sum()), int(r7.notna().sum())
+    wins3 = int((r3 >= 3.0).sum())
+    wins7 = int((r7 >= 5.0).sum())
+    pump_wins7 = int((r7 >= 10.0).sum())
+    low, high = _wilson_interval(wins7, n7)
+    status = "نمونه مشابه کافی نیست"
+    if n7 >= 30:
+        if wins7 / n7 >= 0.60 and float(r7.median()) > 0:
+            status = "الگوی تاریخی امیدوارکننده؛ نیازمند تأیید زنده"
+        elif wins7 / n7 <= 0.40 or float(r7.median()) <= 0:
+            status = "نتیجه تاریخی ضعیف؛ اولویت پایین"
+        else:
+            status = "الگوی خنثی؛ شواهد کافی برای برتری ندارد"
+    return {
+        "Analog_Match_Count": n7,
+        "Analog_Hit_Rate_3d": wins3 / n3 * 100 if n3 else np.nan,
+        "Analog_Hit_Rate_7d": wins7 / n7 * 100 if n7 else np.nan,
+        "Analog_Pump_Rate_7d": pump_wins7 / n7 * 100 if n7 else np.nan,
+        "Analog_CI_Lower_7d": low * 100 if pd.notna(low) else np.nan,
+        "Analog_CI_Upper_7d": high * 100 if pd.notna(high) else np.nan,
+        "Analog_Median_Return_3d": float(r3.median()) if n3 else np.nan,
+        "Analog_Median_Return_7d": float(r7.median()) if n7 else np.nan,
+        "Analog_Mean_Return_7d": float(r7.mean()) if n7 else np.nan,
+        "Analog_Median_MFE_7d": float(pd.to_numeric(neighbors["max_favorable_7d"], errors="coerce").median()),
+        "Analog_Median_MAE_7d": float(pd.to_numeric(neighbors["max_adverse_7d"], errors="coerce").median()),
+        "Analog_Median_Distance": float(pd.to_numeric(neighbors["Pattern_Distance"], errors="coerce").median()),
+        "Analog_Status": status,
+    }
+
+
+def _walk_forward_pattern_backtest(samples, max_tests=240):
+    """Chronological out-of-sample test; each test sees only examples matured 7+ days earlier."""
+    empty = {"test_cases": 0, "signals": 0, "precision_3d": np.nan, "baseline_3d": np.nan,
+             "precision_7d": np.nan, "baseline_7d": np.nan,
+             "precision_pump_7d": np.nan, "baseline_pump_7d": np.nan,
+             "mean_return_7d": np.nan,
+             "coverage_percent": np.nan, "method": "walk-forward, 7-day label embargo"}
+    if samples is None or len(samples) < 100:
+        return empty
+    dates = sorted(pd.to_datetime(samples["sample_date"]).dropna().unique())
+    if len(dates) < 8:
+        return empty
+    cutoff = dates[max(1, int(len(dates) * 0.70))]
+    tests = samples[pd.to_datetime(samples["sample_date"]) >= cutoff].copy().sort_values(["sample_date", "Symbol"])
+    if len(tests) > max_tests:
+        positions = np.linspace(0, len(tests) - 1, max_tests).astype(int)
+        tests = tests.iloc[positions]
+    records = []
+    for _, test in tests.iterrows():
+        test_date = pd.Timestamp(test["sample_date"])
+        train = samples[pd.to_datetime(samples["sample_date"]) <= test_date - pd.Timedelta(days=7)]
+        if len(train) < 40:
+            continue
+        query = {c: test.get(c, np.nan) for c in PATTERN_FEATURES}
+        neighbors = _select_pattern_neighbors(train, query, k=30, per_symbol=2)
+        if len(neighbors) < 20:
+            continue
+        summary = _summarize_pattern_neighbors(neighbors)
+        predicted = (summary["Analog_Hit_Rate_7d"] >= 60 and
+                     summary["Analog_Median_Return_7d"] > 0 and
+                     summary["Analog_Match_Count"] >= 20)
+        records.append({
+            "predicted": bool(predicted),
+            "actual_3d": float(test["forward_return_3d"]) >= 3.0,
+            "actual_7d": float(test["forward_return_7d"]) >= 5.0,
+            "actual_pump_7d": float(test["forward_return_7d"]) >= 10.0,
+            "return_7d": float(test["forward_return_7d"]),
+        })
+    if not records:
+        return empty
+    result = pd.DataFrame(records)
+    selected = result[result["predicted"]]
+    return {
+        "test_cases": int(len(result)), "signals": int(len(selected)),
+        "precision_3d": float(selected["actual_3d"].mean() * 100) if not selected.empty else np.nan,
+        "baseline_3d": float(result["actual_3d"].mean() * 100),
+        "precision_7d": float(selected["actual_7d"].mean() * 100) if not selected.empty else np.nan,
+        "baseline_7d": float(result["actual_7d"].mean() * 100),
+        "precision_pump_7d": float(selected["actual_pump_7d"].mean() * 100) if not selected.empty else np.nan,
+        "baseline_pump_7d": float(result["actual_pump_7d"].mean() * 100),
+        "mean_return_7d": float(selected["return_7d"].mean()) if not selected.empty else np.nan,
+        "coverage_percent": float(len(selected) / len(result) * 100),
+        "method": "walk-forward; training labels are at least 7 days older than each test date",
+    }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def run_historical_pattern_scan(universe_limit, api_key, max_assets=40, history_days=120):
+    """Fetch daily OHLCV and compare today's setups with matured historical analogs."""
+    if not api_key:
+        raise ValueError("برای تاریخچه OHLCV باید کلید API کوین‌مارکت‌کپ وارد شود.")
+    market = fetch_cmc_market_universe(int(universe_limit), api_key)
+    eligible = market[
+        (~market["Is_Excluded_Asset"].fillna(False))
+        & market["CMC_ID"].notna()
+        & (market["Volume_24h"].fillna(0) >= 300_000)
+        & (market["Market_Cap"].fillna(0) >= 10_000_000)
+        & (market["Num_Market_Pairs"].fillna(0) >= 3)
+    ].copy()
+    btc_rows = market[market["Symbol"].astype(str).str.upper().eq("BTC")]
+    if btc_rows.empty:
+        raise RuntimeError("BTC در فهرست CMC پیدا نشد؛ محاسبه قدرت نسبی و مقایسه بازار ممکن نیست.")
+    selected = eligible.sort_values("Volume_24h", ascending=False).head(int(max_assets)).copy()
+    if not selected["CMC_ID"].isin(btc_rows["CMC_ID"]).any():
+        selected = pd.concat([selected, btc_rows.head(1)], ignore_index=True).drop_duplicates("CMC_ID")
+    ids = selected["CMC_ID"].dropna().astype(int).tolist()
+    daily_map, errors = {}, 0
+    for start in range(0, len(ids), 75):
+        batch = tuple(ids[start:start + 75])
+        try:
+            daily_map.update(fetch_cmc_ohlcv_batch(batch, "daily", int(history_days) + 1, api_key))
+        except Exception:
+            errors += 1
+    today = pd.Timestamp.now(tz="UTC").normalize()
+    clean_candles = {}
+    for _, row in selected.iterrows():
+        if pd.isna(row.get("CMC_ID")):
+            continue
+        key = str(int(row["CMC_ID"]))
+        candles = [c for c in daily_map.get(key, []) if pd.Timestamp(c["close_time"]) < today]
+        if len(candles) >= 30:
+            clean_candles[key] = (row, candles)
+    btc_entry = next(((row, candles) for row, candles in clean_candles.values()
+                      if str(row.get("Symbol", "")).upper() == "BTC"), None)
+    if btc_entry is None:
+        raise RuntimeError("کندل‌های روزانه BTC دریافت نشد؛ اسکن تاریخی متوقف شد تا قدرت نسبی ساختگی محاسبه نشود.")
+    btc_candles = btc_entry[1]
+    btc_close_by_date = {pd.Timestamp(c["close_time"]).normalize(): float(c["close"]) for c in btc_candles}
+    samples = []
+    # First build the complete historical library across every selected asset.
+    # Only after that do we score current setups, so results do not depend on row order.
+    for row, candles in clean_candles.values():
+        symbol = str(row.get("Symbol", "")).upper()
+        name = str(row.get("Coin", symbol))
+        samples.extend(_build_pattern_samples(candles, symbol, name, btc_close_by_date))
+    sample_frame = pd.DataFrame(samples)
+    current_rows = []
+    for key, (row, candles) in clean_candles.items():
+        symbol = str(row.get("Symbol", "")).upper()
+        name = str(row.get("Coin", symbol))
+        if symbol == "BTC":
+            continue
+        current_features = _pattern_feature_at(candles, len(candles) - 1, btc_close_by_date)
+        if not current_features:
+            continue
+        current_date = pd.Timestamp(candles[-1]["close_time"]).normalize()
+        matured = sample_frame[
+            pd.to_datetime(sample_frame["sample_date"]) <= current_date - pd.Timedelta(days=7)
+        ] if not sample_frame.empty else pd.DataFrame()
+        neighbors = _select_pattern_neighbors(matured, current_features, k=30, per_symbol=2) if not matured.empty else pd.DataFrame()
+        summary = _summarize_pattern_neighbors(neighbors)
+        current_rows.append({
+            "Coin": name, "Symbol": symbol, "CMC_ID": int(row["CMC_ID"]),
+            "Market_Cap": float(row.get("Market_Cap", np.nan)),
+            "Volume_24h": float(row.get("Volume_24h", np.nan)),
+            "Last_Completed_Day": current_date.strftime("%Y-%m-%d"),
+            **current_features, **summary,
+        })
+    if sample_frame.empty or len(sample_frame) < 100:
+        raise RuntimeError(f"نمونه تاریخی کافی ساخته نشد (فقط {len(sample_frame)} نمونه). تعداد ارزها یا دسترسی OHLCV را بررسی کن.")
+    backtest = _walk_forward_pattern_backtest(sample_frame)
+    current = pd.DataFrame(current_rows)
+    if not current.empty:
+        current["Analog_Score"] = (
+            0.40 * pd.to_numeric(current["Analog_Hit_Rate_3d"], errors="coerce") +
+            0.60 * pd.to_numeric(current["Analog_Hit_Rate_7d"], errors="coerce")
+        )
+        current.loc[current["Analog_Match_Count"] < 30, "Analog_Score"] = np.nan
+        current = current.sort_values(
+            ["Analog_Score", "Analog_Median_Return_7d", "Analog_Match_Count"],
+            ascending=[False, False, False], na_position="last"
+        ).reset_index(drop=True)
+    meta = {
+        "market_universe": int(len(market)), "eligible_assets": int(len(eligible)),
+        "assets_with_history": int(len(clean_candles)), "historical_samples": int(len(sample_frame)),
+        "history_days_requested": int(history_days), "errors": int(errors),
+        "as_of_utc": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC"),
+    }
+    return current, meta, backtest
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_cmc_ath_stats(ids, api_key):
     ids = tuple(int(x) for x in ids if pd.notna(x))
@@ -2746,18 +3082,19 @@ def render_semi_gauge(value, title, subtitle, marker_color="#1769d2"):
 filtered = df[(numeric(df["PrePump_Score"]).fillna(0) >= min_score) & (~df["Is_Excluded_Asset"])].copy()  # پیش‌فرض برای بخش‌های دیگر
 section = st.radio(
     "انتخاب بخش اسکنر",
-    ["🏠 نمای کلی", "🧲 رادار انباشت و پیش‌پامپ", "₿ رابطه ارزها با بیت‌کوین", "📊 نمودارها و ریزش‌ها", "📰 اخبار و DEX", "🐋 جریان پول و مشتقات", "📁 داده‌ها"],
+    ["🏠 نمای کلی", "🧲 رادار انباشت و پیش‌پامپ", "🧬 الگوهای تاریخی", "₿ رابطه ارزها با بیت‌کوین", "📊 نمودارها و ریزش‌ها", "📰 اخبار و DEX", "🐋 جریان پول و مشتقات", "📁 داده‌ها"],
     horizontal=True,
     label_visibility="collapsed",
     key="scanner_section_navigation",
 )
 # Keep scheduled refreshes away from the CryptoMeter panel so they cannot
 # interrupt a user-initiated mobile/API request.
-if section != "🐋 جریان پول و مشتقات" and data_source == "CoinGecko market":
+if section not in ("🐋 جریان پول و مشتقات", "🧬 الگوهای تاریخی") and data_source == "CoinGecko market":
     st_autorefresh(interval=refresh_seconds * 1000, key="scanner_refresh")
 st.caption({
     "🏠 نمای کلی": "خلاصه وضعیت بازار و شاخص‌های اصلی اسکنر",
     "🧲 رادار انباشت و پیش‌پامپ": "ارزهایی که نشانه‌های اولیه انباشت یا فعالیت پیش از رشد دارند",
+    "🧬 الگوهای تاریخی": "مقایسه وضعیت امروز با نمونه‌های تاریخی و آزمون walk-forward بدون نگاه به آینده",
     "₿ رابطه ارزها با بیت‌کوین": "همبستگی ساعتی و واگرایی عملکرد ارزها نسبت به BTC",
     "📊 نمودارها و ریزش‌ها": "بررسی ساختار قیمت، شاخص‌های تکنیکال و ارزهای با افت شدید",
     "📰 اخبار و DEX": "اخبار، فعالیت صرافی‌های غیرمتمرکز و فشار خرید و فروش",
@@ -4335,3 +4672,120 @@ if section == "₿ رابطه ارزها با بیت‌کوین":
             st.dataframe(corr_view, use_container_width=True, hide_index=True)
         st.download_button("⬇️ دریافت CSV همبستگی و واگرایی", data=corr_view.to_csv(index=False).encode("utf-8-sig"), file_name="btc_correlation_divergence.csv", mime="text/csv", key="download_btc_corr")
     st.caption("محدودیت: فقط ارزهای دارای جفت اسپات USDT فعال و تاریخچه ساعتی کافی در OKX یا Binance بررسی می‌شوند. کندل‌های ناتمام حذف می‌شوند؛ داده ناکافی امتیاز مثبت نمی‌گیرد. این تحلیل پیش‌بینی قیمت یا توصیه خرید نیست.")
+
+# =========================================================
+# HISTORICAL PATTERN INTELLIGENCE — independent menu page
+# =========================================================
+if section == "🧬 الگوهای تاریخی":
+    st.title("🧬 موتور هوشمند الگوهای تاریخی")
+    st.caption("مقایسه وضعیت فعلی با نمونه‌های گذشته، سنجش بازده بعدی و آزمون زمانی؛ نه صرفاً امتیازدهی با اندیکاتورهای ثابت")
+    st.info(
+        "این موتور از کندل‌های روزانه OHLCV کوین‌مارکت‌کپ استفاده می‌کند. برای جلوگیری از نگاه به آینده، "
+        "نمونه‌های آموزشی فقط وقتی وارد مقایسه می‌شوند که نتیجه ۷ روز بعدشان کامل شده باشد. "
+        "آمار مشابه‌ها، احتمال کالیبره‌شده یا تضمین رشد نیست؛ نتیجه بک‌تست walk-forward نیز باید با تعداد نمونه و نرخ پایه خوانده شود."
+    )
+    hist_key = (st.session_state.get("cmc_api_key_input") or secret_or_env("COINMARKETCAP_API_KEY") or secret_or_env("CMC_PRO_API_KEY")).strip()
+    h1, h2, h3 = st.columns(3)
+    with h1:
+        hist_universe = st.selectbox("فهرست اولیه CMC", [100, 250, 500], index=1, key="hist_pattern_universe")
+    with h2:
+        hist_assets = st.selectbox("تعداد ارزهای دارای تاریخچه", [20, 30, 40, 60], index=1, key="hist_pattern_assets")
+    with h3:
+        hist_days = st.selectbox("طول تاریخچه روزانه", [90, 120, 180], index=1, key="hist_pattern_days")
+    estimated_ohlcv_credits = int(np.ceil((hist_assets + 1) * (hist_days + 1) / 100))
+    st.caption(
+        "فیلتر پایه: ارزش بازار حداقل ۱۰ میلیون دلار، حجم ۲۴ساعته حداقل ۳۰۰ هزار دلار و حداقل ۳ بازار معاملاتی. "
+        f"BTC برای محاسبه قدرت نسبی جداگانه اضافه می‌شود. مصرف تخمینی OHLCV: حدود {estimated_ohlcv_credits} اعتبار CMC "
+        "برای این اجرا (تقریباً یک اعتبار به‌ازای هر ۱۰۰ کندل دریافتی؛ کش ۱۵دقیقه‌ای از درخواست تکراری جلوگیری می‌کند)."
+    )
+    st.caption("الگوهای تاریخی فعلاً از قیمت، حجم روزانه، فشردگی دامنه، کف‌های بالاتر، RSI و قدرت نسبی در برابر BTC ساخته می‌شوند. تاریخچه جریان نهنگ‌ها، Funding، Open Interest و اخبار در این منبع کندلی موجود نیست و به‌عنوان داده تاریخی جعل نمی‌شود.")
+    if not hist_key:
+        st.warning("برای این موتور باید کلید CMC با دسترسی OHLCV تاریخی وارد شود. کلید در تنظیمات کناری قرار دارد؛ پلن Basic ممکن است دسترسی کافی نداشته باشد.")
+    elif st.button("🔬 اجرای مقایسه الگوهای تاریخی و بک‌تست", type="primary", key="run_historical_pattern_engine"):
+        with st.spinner("در حال دریافت کندل‌های روزانه، ساخت بانک نمونه‌های تاریخی و اجرای آزمون walk-forward... این مرحله ممکن است چند دقیقه طول بکشد."):
+            try:
+                hist_result, hist_meta, hist_backtest = run_historical_pattern_scan(
+                    hist_universe, hist_key, max_assets=hist_assets, history_days=hist_days
+                )
+                st.session_state["historical_pattern_result_v1"] = hist_result
+                st.session_state["historical_pattern_meta_v1"] = hist_meta
+                st.session_state["historical_pattern_backtest_v1"] = hist_backtest
+                st.session_state["historical_pattern_run_time_v1"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
+            except Exception as exc:
+                st.error(f"اجرای موتور تاریخی ناموفق بود: {str(exc)[:500]}")
+                if "403" in str(exc) or "plan" in str(exc).lower() or "subscription" in str(exc).lower():
+                    st.warning("دسترسی OHLCV تاریخی CMC ممکن است به پلن Startup یا بالاتر نیاز داشته باشد.")
+    hist_result = st.session_state.get("historical_pattern_result_v1", pd.DataFrame())
+    hist_meta = st.session_state.get("historical_pattern_meta_v1", {})
+    hist_backtest = st.session_state.get("historical_pattern_backtest_v1", {})
+    if isinstance(hist_result, pd.DataFrame) and not hist_result.empty:
+        st.caption(
+            f"آخرین اجرا: {st.session_state.get('historical_pattern_run_time_v1', '—')} • "
+            f"ارزهای دارای تاریخچه: {hist_meta.get('assets_with_history', 0)} • "
+            f"نمونه‌های تاریخی: {hist_meta.get('historical_samples', 0):,} • "
+            f"خطاهای دسته‌ای API: {hist_meta.get('errors', 0)} • تاریخ داده: {hist_meta.get('as_of_utc', '—')}"
+        )
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("نمونه‌های تاریخی", f"{hist_meta.get('historical_samples', 0):,}")
+        k2.metric("دارای تاریخچه", hist_meta.get("assets_with_history", 0))
+        k3.metric("تعداد آزمون‌های خارج از نمونه", hist_backtest.get("test_cases", 0))
+        k4.metric("سیگنال‌های بک‌تست", hist_backtest.get("signals", 0))
+        st.subheader("🔎 ارزهایی با الگوهای تاریخی مشابه")
+        hist_columns = [
+            "Coin", "Symbol", "Analog_Match_Count", "Analog_Hit_Rate_3d", "Analog_Hit_Rate_7d",
+            "Analog_Pump_Rate_7d", "Analog_CI_Lower_7d", "Analog_CI_Upper_7d", "Analog_Median_Return_3d",
+            "Analog_Median_Return_7d", "Analog_Mean_Return_7d", "Analog_Median_MFE_7d", "Analog_Median_MAE_7d",
+            "Analog_Median_Distance", "Analog_Score", "Analog_Status", "ret_1d", "ret_3d", "ret_7d",
+            "volume_ratio_3v14", "range_compression_3v14", "higher_low_3v7", "rsi_14",
+            "relative_strength_7d", "Last_Completed_Day"
+        ]
+        hist_columns = [c for c in hist_columns if c in hist_result.columns]
+        hist_labels = {
+            "Coin": "ارز", "Symbol": "نماد", "Analog_Match_Count": "تعداد نمونه مشابه",
+            "Analog_Hit_Rate_3d": "نرخ رشد ≥۳٪ در ۳روز (%)",
+            "Analog_Hit_Rate_7d": "نرخ رشد ≥۵٪ در ۷روز (%)",
+            "Analog_Pump_Rate_7d": "نرخ رشد ≥۱۰٪ در ۷روز (%)",
+            "Analog_CI_Lower_7d": "حد پایین بازه اطمینان ۷روزه (%)",
+            "Analog_CI_Upper_7d": "حد بالای بازه اطمینان ۷روزه (%)",
+            "Analog_Median_Return_3d": "میانه بازده ۳روزه (%)",
+            "Analog_Median_Return_7d": "میانه بازده ۷روزه (%)",
+            "Analog_Mean_Return_7d": "میانگین بازده ۷روزه (%)",
+            "Analog_Median_MFE_7d": "میانه بیشترین رشد ۷روزه (%)",
+            "Analog_Median_MAE_7d": "میانه بیشترین افت ۷روزه (%)",
+            "Analog_Median_Distance": "فاصله آماری نمونه‌ها (کمتر بهتر)",
+            "Analog_Score": "امتیاز ترکیبی شباهت تاریخی",
+            "Analog_Status": "نتیجه نمونه‌های مشابه",
+            "ret_1d": "بازده ۱روزه فعلی (%)", "ret_3d": "بازده ۳روزه فعلی (%)",
+            "ret_7d": "بازده ۷روزه فعلی (%)", "volume_ratio_3v14": "حجم ۳روز / ۱۴روز قبلی",
+            "range_compression_3v14": "فشردگی دامنه ۳روز / ۱۴روز قبلی",
+            "higher_low_3v7": "تغییر کف ۳روز نسبت به ۷روز قبلی (%)",
+            "rsi_14": "RSI 14", "relative_strength_7d": "قدرت نسبی ۷روزه نسبت به BTC (%)",
+            "Last_Completed_Day": "آخرین روز کامل‌شده"
+        }
+        st.dataframe(hist_result[hist_columns].rename(columns=hist_labels), use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ دریافت نتایج الگوهای تاریخی CSV",
+            data=hist_result.to_csv(index=False).encode("utf-8-sig"),
+            file_name="historical_pattern_intelligence.csv", mime="text/csv",
+            key="download_historical_pattern_results"
+        )
+        st.divider()
+        st.subheader("🧪 اعتبارسنجی زمانی (Walk-forward backtest)")
+        b1, b2, b3, b4, b5 = st.columns(5)
+        b1.metric("دقت رشد ≥۵٪ در ۷روز", f"{hist_backtest.get('precision_7d'):.1f}%" if pd.notna(hist_backtest.get("precision_7d", np.nan)) else "داده کافی نیست")
+        b2.metric("نرخ پایه رشد ≥۵٪", f"{hist_backtest.get('baseline_7d'):.1f}%" if pd.notna(hist_backtest.get("baseline_7d", np.nan)) else "—")
+        b3.metric("دقت پامپ ≥۱۰٪ در ۷روز", f"{hist_backtest.get('precision_pump_7d'):.1f}%" if pd.notna(hist_backtest.get("precision_pump_7d", np.nan)) else "سیگنال کافی نیست")
+        b4.metric("نرخ پایه پامپ ≥۱۰٪", f"{hist_backtest.get('baseline_pump_7d'):.1f}%" if pd.notna(hist_backtest.get("baseline_pump_7d", np.nan)) else "—")
+        b5.metric("پوشش سیگنال‌ها", f"{hist_backtest.get('coverage_percent'):.1f}%" if pd.notna(hist_backtest.get("coverage_percent", np.nan)) else "—")
+        st.caption(
+            f"آزمون ۳روزه: دقت سیگنال {hist_backtest.get('precision_3d', np.nan):.1f}% در برابر نرخ پایه "
+            f"{hist_backtest.get('baseline_3d', np.nan):.1f}%؛ تعداد آزمون‌ها {hist_backtest.get('test_cases', 0)}. "
+            f"روش: {hist_backtest.get('method', '—')}."
+            if pd.notna(hist_backtest.get("precision_3d", np.nan)) and pd.notna(hist_backtest.get("baseline_3d", np.nan))
+            else f"نمونه کافی برای ارزیابی walk-forward وجود نداشت. روش: {hist_backtest.get('method', '—')}."
+        )
+        st.caption(f"میانگین بازده ۷روزه سیگنال‌های بک‌تست: {hist_backtest.get('mean_return_7d', np.nan):+.2f}%" if pd.notna(hist_backtest.get("mean_return_7d", np.nan)) else "در این بک‌تست سیگنال مثبت کافی برای محاسبه میانگین بازده وجود نداشت.")
+        st.warning("نرخ موفقیت نمونه‌های مشابه، احتمال کالیبره‌شده برای آینده نیست. اگر دقت بک‌تست از نرخ پایه بهتر نباشد، این موتور نباید وزن مثبت در رتبه‌بندی اصلی بگیرد.")
+    else:
+        st.info("برای ساخت بانک الگوهای تاریخی، کلید CMC را وارد کن و دکمه اجرای موتور را بزن. نتایج پس از اجرا در همین بخش باقی می‌مانند.")
+

@@ -618,15 +618,23 @@ def calculate_pre_pump_score(frame):
                    ch24.abs().le(7) & ch7.abs().le(18) & turnover.between(0.001, 0.15) & score.ge(55))
     excluded_instrument = out.get("Is_Excluded_Instrument", pd.Series(False, index=out.index)).fillna(False).astype(bool)
     out["Signal"] = np.select(
-        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], excluded_instrument, symbol_ambiguous, overheated, valid_setup,
-         watch_setup & ~flow_available, watch_setup & flow_available & ~positive_flow,
-         watch_setup & ~surge.notna(), watch_setup],
-        ["Excluded — stablecoin", "Excluded — tokenized equity", "Hold — ambiguous ticker; verify contract",
-         "Already moving / abnormal volatility — caution", "Pre-pump watch — real buying + volume confirmed",
+        [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], excluded_instrument,
+         symbol_ambiguous, overheated, valid_setup,
+         watch_setup & ~flow_available,
+         watch_setup & flow_available & ~positive_flow,
+         watch_setup & surge.isna(),
+         watch_setup],
+        ["Excluded — stablecoin",
+         "Excluded — tokenized equity",
+         "Excluded — non-crypto instrument",
+         "Hold — ambiguous ticker; verify contract",
+         "Already moving / abnormal volatility — caution",
+         "Pre-pump watch — real buying + volume confirmed",
          "Early activity — real buy/sell data missing",
          "Early activity — buy pressure not confirmed",
          "Early activity — volume history missing",
-         "Early activity — monitor"], default="Watch — not enough evidence")
+         "Early activity — monitor"],
+        default="Watch — not enough evidence")
     out["Risk_Level"] = np.select(
         [out["Is_Stablecoin"], out["Is_Tokenized_Equity"], excluded_instrument, symbol_ambiguous, thin, overheated, extreme_turnover, missing_market],
         ["Excluded — stablecoin", "Excluded — tokenized equity", "Excluded — non-crypto instrument",

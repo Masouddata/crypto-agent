@@ -1114,57 +1114,108 @@ def _walk_forward_pattern_backtest(samples, max_tests=240):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def run_historical_pattern_scan(universe_limit, api_key, max_assets=40, history_days=120):
-    """Fetch daily OHLCV and compare today's setups with matured historical analogs."""
-    if not api_key:
-        raise ValueError("برای تاریخچه OHLCV باید کلید API کوین‌مارکت‌کپ وارد شود.")
-    market = fetch_cmc_market_universe(int(universe_limit), api_key)
+def fetch_cg_pattern_daily(coin_id, currency="usd", days=90, api_key=""):
+    """Build daily sampled-price bars from CoinGecko hourly market-chart observations.
+
+    CoinGecko market_chart total_volumes is a rolling 24h turnover series, not
+    exchange candle volume. We aggregate its daily median as a turnover proxy
+    and label it as such; it must not be interpreted as net inflow or true daily volume.
+    High/low are extrema of hourly observations, not exchange-native OHLC candles.
+    """
+    payload = safe_get(
+        f"{CG_API}/coins/{str(coin_id)}/market_chart",
+        params={"vs_currency": str(currency).lower(), "days": int(days)},
+        headers=cg_headers(api_key), timeout=30,
+    )
+    prices = pd.DataFrame(payload.get("prices", []), columns=["timestamp_ms", "price"])
+    volumes = pd.DataFrame(payload.get("total_volumes", []), columns=["timestamp_ms", "turnover_24h"])
+    if prices.empty:
+        return []
+    prices["Time"] = pd.to_datetime(prices["timestamp_ms"], unit="ms", utc=True, errors="coerce")
+    prices["price"] = numeric(prices["price"])
+    if not volumes.empty:
+        volumes["Time"] = pd.to_datetime(volumes["timestamp_ms"], unit="ms", utc=True, errors="coerce")
+        volumes["turnover_24h"] = numeric(volumes["turnover_24h"])
+        prices = pd.merge_asof(
+            prices.dropna(subset=["Time"]).sort_values("Time"),
+            volumes[["Time", "turnover_24h"]].dropna(subset=["Time"]).sort_values("Time"),
+            on="Time", direction="nearest", tolerance=pd.Timedelta("90min"),
+        )
+    else:
+        prices["turnover_24h"] = np.nan
+    prices = prices.dropna(subset=["Time", "price"]).sort_values("Time").set_index("Time")
+    daily = prices.resample("1D").agg(
+        open=("price", "first"), high=("price", "max"),
+        low=("price", "min"), close=("price", "last"),
+        volume=("turnover_24h", "median"),
+    ).dropna(subset=["open", "high", "low", "close"])
+    # Exclude today's incomplete UTC day to prevent partial-candle leakage.
+    today = pd.Timestamp.now(tz="UTC").normalize()
+    daily = daily[daily.index < today]
+    output = []
+    for day, row in daily.iterrows():
+        close_time = day + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
+        output.append({
+            "open_time": day, "close_time": close_time,
+            "open": float(row["open"]), "high": float(row["high"]),
+            "low": float(row["low"]), "close": float(row["close"]),
+            "volume": float(row["volume"]) if pd.notna(row["volume"]) else np.nan,
+            "green": bool(row["close"] > row["open"]),
+        })
+    return output
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def run_historical_pattern_scan(universe_limit, api_key="", max_assets=30, history_days=90):
+    """CoinGecko-based historical analog scan; no paid CMC OHLCV key required."""
+    if int(history_days) != 90:
+        history_days = 90  # Public API provides hourly chart observations for 1–90 days.
+    pages = max(1, min(3, int(np.ceil(int(universe_limit) / 250))))
+    market = fetch_market_pages("usd", pages, api_key)
+    market = mark_stablecoins(market)
+    market["Volume_24h"] = numeric(market.get("Volume_24h"))
+    market["Market_Cap"] = numeric(market.get("Market_Cap"))
+    market["Symbol"] = market.get("Symbol", pd.Series("", index=market.index)).astype(str).str.upper()
     eligible = market[
         (~market["Is_Excluded_Asset"].fillna(False))
-        & market["CMC_ID"].notna()
+        & market["CoinGecko_ID"].notna()
         & (market["Volume_24h"].fillna(0) >= 300_000)
         & (market["Market_Cap"].fillna(0) >= 10_000_000)
-        & (market["Num_Market_Pairs"].fillna(0) >= 3)
     ].copy()
-    btc_rows = market[market["Symbol"].astype(str).str.upper().eq("BTC")]
+    btc_rows = market[market["Symbol"].eq("BTC")]
     if btc_rows.empty:
-        raise RuntimeError("BTC در فهرست CMC پیدا نشد؛ محاسبه قدرت نسبی و مقایسه بازار ممکن نیست.")
+        raise RuntimeError("BTC در فهرست CoinGecko پیدا نشد؛ محاسبه قدرت نسبی متوقف شد.")
     selected = eligible.sort_values("Volume_24h", ascending=False).head(int(max_assets)).copy()
-    if not selected["CMC_ID"].isin(btc_rows["CMC_ID"]).any():
-        selected = pd.concat([selected, btc_rows.head(1)], ignore_index=True).drop_duplicates("CMC_ID")
-    ids = selected["CMC_ID"].dropna().astype(int).tolist()
-    daily_map, errors = {}, 0
-    for start in range(0, len(ids), 75):
-        batch = tuple(ids[start:start + 75])
+    if not selected["CoinGecko_ID"].astype(str).isin(btc_rows["CoinGecko_ID"].astype(str)).any():
+        selected = pd.concat([selected, btc_rows.head(1)], ignore_index=True).drop_duplicates("CoinGecko_ID")
+    clean_candles, errors = {}, 0
+    progress = st.progress(0, text="دریافت تاریخچه CoinGecko برای ارزهای منتخب...")
+    total = max(1, len(selected))
+    for idx, (_, row) in enumerate(selected.iterrows(), start=1):
+        coin_id = str(row["CoinGecko_ID"])
         try:
-            daily_map.update(fetch_cmc_ohlcv_batch(batch, "daily", int(history_days) + 1, api_key))
+            candles = fetch_cg_pattern_daily(coin_id, "usd", 90, api_key)
+            if len(candles) >= 30:
+                clean_candles[coin_id] = (row, candles)
         except Exception:
             errors += 1
-    today = pd.Timestamp.now(tz="UTC").normalize()
-    clean_candles = {}
-    for _, row in selected.iterrows():
-        if pd.isna(row.get("CMC_ID")):
-            continue
-        key = str(int(row["CMC_ID"]))
-        candles = [c for c in daily_map.get(key, []) if pd.Timestamp(c["close_time"]) < today]
-        if len(candles) >= 30:
-            clean_candles[key] = (row, candles)
+        progress.progress(idx / total, text=f"تاریخچه {idx} از {total} ارز بررسی شد...")
+        # Public endpoints are rate limited; cached responses avoid repeat calls.
+        time.sleep(0.15)
+    progress.empty()
     btc_entry = next(((row, candles) for row, candles in clean_candles.values()
                       if str(row.get("Symbol", "")).upper() == "BTC"), None)
     if btc_entry is None:
-        raise RuntimeError("کندل‌های روزانه BTC دریافت نشد؛ اسکن تاریخی متوقف شد تا قدرت نسبی ساختگی محاسبه نشود.")
-    btc_candles = btc_entry[1]
-    btc_close_by_date = {pd.Timestamp(c["close_time"]).normalize(): float(c["close"]) for c in btc_candles}
+        raise RuntimeError("تاریخچه ۹۰روزه BTC دریافت نشد؛ مقایسه نسبی بدون BTC انجام نمی‌شود.")
+    btc_close_by_date = {pd.Timestamp(c["close_time"]).normalize(): float(c["close"]) for c in btc_entry[1]}
     samples = []
-    # First build the complete historical library across every selected asset.
-    # Only after that do we score current setups, so results do not depend on row order.
     for row, candles in clean_candles.values():
         symbol = str(row.get("Symbol", "")).upper()
         name = str(row.get("Coin", symbol))
         samples.extend(_build_pattern_samples(candles, symbol, name, btc_close_by_date))
     sample_frame = pd.DataFrame(samples)
     current_rows = []
-    for key, (row, candles) in clean_candles.items():
+    for coin_id, (row, candles) in clean_candles.items():
         symbol = str(row.get("Symbol", "")).upper()
         name = str(row.get("Coin", symbol))
         if symbol == "BTC":
@@ -1173,20 +1224,18 @@ def run_historical_pattern_scan(universe_limit, api_key, max_assets=40, history_
         if not current_features:
             continue
         current_date = pd.Timestamp(candles[-1]["close_time"]).normalize()
-        matured = sample_frame[
-            pd.to_datetime(sample_frame["sample_date"]) <= current_date - pd.Timedelta(days=7)
-        ] if not sample_frame.empty else pd.DataFrame()
+        matured = sample_frame[pd.to_datetime(sample_frame["sample_date"]) <= current_date - pd.Timedelta(days=7)] if not sample_frame.empty else pd.DataFrame()
         neighbors = _select_pattern_neighbors(matured, current_features, k=30, per_symbol=2) if not matured.empty else pd.DataFrame()
         summary = _summarize_pattern_neighbors(neighbors)
         current_rows.append({
-            "Coin": name, "Symbol": symbol, "CMC_ID": int(row["CMC_ID"]),
+            "Coin": name, "Symbol": symbol, "CoinGecko_ID": coin_id,
             "Market_Cap": float(row.get("Market_Cap", np.nan)),
             "Volume_24h": float(row.get("Volume_24h", np.nan)),
             "Last_Completed_Day": current_date.strftime("%Y-%m-%d"),
             **current_features, **summary,
         })
-    if sample_frame.empty or len(sample_frame) < 100:
-        raise RuntimeError(f"نمونه تاریخی کافی ساخته نشد (فقط {len(sample_frame)} نمونه). تعداد ارزها یا دسترسی OHLCV را بررسی کن.")
+    if sample_frame.empty or len(sample_frame) < 60:
+        raise RuntimeError(f"نمونه تاریخی کافی ساخته نشد (فقط {len(sample_frame)} نمونه از {len(clean_candles)} ارز). تعداد ارزها یا دسترسی API را بررسی کن.")
     backtest = _walk_forward_pattern_backtest(sample_frame)
     current = pd.DataFrame(current_rows)
     if not current.empty:
@@ -1194,15 +1243,14 @@ def run_historical_pattern_scan(universe_limit, api_key, max_assets=40, history_
             0.40 * pd.to_numeric(current["Analog_Hit_Rate_3d"], errors="coerce") +
             0.60 * pd.to_numeric(current["Analog_Hit_Rate_7d"], errors="coerce")
         )
-        current.loc[current["Analog_Match_Count"] < 30, "Analog_Score"] = np.nan
-        current = current.sort_values(
-            ["Analog_Score", "Analog_Median_Return_7d", "Analog_Match_Count"],
-            ascending=[False, False, False], na_position="last"
-        ).reset_index(drop=True)
+        current.loc[current["Analog_Match_Count"] < 20, "Analog_Score"] = np.nan
+        current = current.sort_values(["Analog_Score", "Analog_Median_Return_7d", "Analog_Match_Count"], ascending=[False, False, False], na_position="last").reset_index(drop=True)
     meta = {
         "market_universe": int(len(market)), "eligible_assets": int(len(eligible)),
         "assets_with_history": int(len(clean_candles)), "historical_samples": int(len(sample_frame)),
-        "history_days_requested": int(history_days), "errors": int(errors),
+        "history_days_requested": 90, "errors": int(errors),
+        "volume_source_note": "CoinGecko total_volumes rolling 24h turnover proxy; not candle volume or net inflow",
+        "candle_source_note": "Daily OHLC approximated from hourly CoinGecko price observations; not exchange-native candles",
         "as_of_utc": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC"),
     }
     return current, meta, backtest
@@ -4680,29 +4728,28 @@ if section == "🧬 الگوهای تاریخی":
     st.title("🧬 موتور هوشمند الگوهای تاریخی")
     st.caption("مقایسه وضعیت فعلی با نمونه‌های گذشته، سنجش بازده بعدی و آزمون زمانی؛ نه صرفاً امتیازدهی با اندیکاتورهای ثابت")
     st.info(
-        "این موتور از کندل‌های روزانه OHLCV کوین‌مارکت‌کپ استفاده می‌کند. برای جلوگیری از نگاه به آینده، "
+        "این موتور از تاریخچه ساعتی قیمت CoinGecko در بازه ۹۰روزه، تجمیع‌شده به روزانه استفاده می‌کند. "
+        "گردش ۲۴ساعته فقط پروکسی حجم است و کندل‌ها OHLC رسمی صرافی نیستند. برای جلوگیری از نگاه به آینده، "
         "نمونه‌های آموزشی فقط وقتی وارد مقایسه می‌شوند که نتیجه ۷ روز بعدشان کامل شده باشد. "
-        "آمار مشابه‌ها، احتمال کالیبره‌شده یا تضمین رشد نیست؛ نتیجه بک‌تست walk-forward نیز باید با تعداد نمونه و نرخ پایه خوانده شود."
+        "آمار مشابه‌ها احتمال کالیبره‌شده یا تضمین رشد نیست؛ بک‌تست نیز فقط روی دارایی‌های فعلاً فهرست‌شده انجام می‌شود و سوگیری بقا را کاملاً حذف نمی‌کند."
     )
-    hist_key = (st.session_state.get("cmc_api_key_input") or secret_or_env("COINMARKETCAP_API_KEY") or secret_or_env("CMC_PRO_API_KEY")).strip()
+    hist_key = secret_or_env("COINGECKO_API_KEY")
     h1, h2, h3 = st.columns(3)
     with h1:
         hist_universe = st.selectbox("فهرست اولیه CMC", [100, 250, 500], index=1, key="hist_pattern_universe")
     with h2:
         hist_assets = st.selectbox("تعداد ارزهای دارای تاریخچه", [20, 30, 40, 60], index=1, key="hist_pattern_assets")
     with h3:
-        hist_days = st.selectbox("طول تاریخچه روزانه", [90, 120, 180], index=1, key="hist_pattern_days")
+        hist_days = st.selectbox("طول تاریخچه", [90], index=0, key="hist_pattern_days")
     estimated_ohlcv_credits = int(np.ceil((hist_assets + 1) * (hist_days + 1) / 100))
     st.caption(
-        "فیلتر پایه: ارزش بازار حداقل ۱۰ میلیون دلار، حجم ۲۴ساعته حداقل ۳۰۰ هزار دلار و حداقل ۳ بازار معاملاتی. "
-        f"BTC برای محاسبه قدرت نسبی جداگانه اضافه می‌شود. مصرف تخمینی OHLCV: حدود {estimated_ohlcv_credits} اعتبار CMC "
-        "برای این اجرا (تقریباً یک اعتبار به‌ازای هر ۱۰۰ کندل دریافتی؛ کش ۱۵دقیقه‌ای از درخواست تکراری جلوگیری می‌کند)."
+        "فیلتر پایه: ارزش بازار حداقل ۱۰ میلیون دلار و حجم ۲۴ساعته حداقل ۳۰۰ هزار دلار. "
+        "BTC برای محاسبه قدرت نسبی جداگانه اضافه می‌شود. منبع: CoinGecko؛ بدون نیاز به کلید پولی CMC."
     )
-    st.caption("الگوهای تاریخی فعلاً از قیمت، حجم روزانه، فشردگی دامنه، کف‌های بالاتر، RSI و قدرت نسبی در برابر BTC ساخته می‌شوند. تاریخچه جریان نهنگ‌ها، Funding، Open Interest و اخبار در این منبع کندلی موجود نیست و به‌عنوان داده تاریخی جعل نمی‌شود.")
-    if not hist_key:
-        st.warning("برای این موتور باید کلید CMC با دسترسی OHLCV تاریخی وارد شود. کلید در تنظیمات کناری قرار دارد؛ پلن Basic ممکن است دسترسی کافی نداشته باشد.")
-    elif st.button("🔬 اجرای مقایسه الگوهای تاریخی و بک‌تست", type="primary", key="run_historical_pattern_engine"):
-        with st.spinner("در حال دریافت کندل‌های روزانه، ساخت بانک نمونه‌های تاریخی و اجرای آزمون walk-forward... این مرحله ممکن است چند دقیقه طول بکشد."):
+    st.caption("ویژگی‌ها از قیمت‌های ساعتی تجمیع‌شده به روزانه، گردش معاملاتی ۲۴ساعته به‌عنوان پروکسی، فشردگی دامنه، کف‌های بالاتر، RSI و قدرت نسبی در برابر BTC ساخته می‌شوند. حجم این منبع، حجم خالص ورود پول یا حجم واقعی کندل نیست؛ داده تاریخی نهنگ‌ها، Funding و Open Interest نیز در این منبع وجود ندارد.")
+    st.info("پلن عمومی CoinGecko برای بازه ۹۰روزه داده ساعتی می‌دهد. کندل‌های روزانه این بخش از مشاهدات ساعتی ساخته می‌شوند؛ بنابراین OHLC صرافی نیستند و گردش ۲۴ساعته صرفاً پروکسی است. این محدودیت در تفسیر نتایج باید لحاظ شود.")
+    if st.button("🔬 اجرای مقایسه الگوهای تاریخی و بک‌تست", type="primary", key="run_historical_pattern_engine"):
+        with st.spinner("در حال دریافت تاریخچه ۹۰روزه CoinGecko، ساخت بانک نمونه‌ها و اجرای آزمون walk-forward..."):
             try:
                 hist_result, hist_meta, hist_backtest = run_historical_pattern_scan(
                     hist_universe, hist_key, max_assets=hist_assets, history_days=hist_days
@@ -4730,6 +4777,7 @@ if section == "🧬 الگوهای تاریخی":
         k2.metric("دارای تاریخچه", hist_meta.get("assets_with_history", 0))
         k3.metric("تعداد آزمون‌های خارج از نمونه", hist_backtest.get("test_cases", 0))
         k4.metric("سیگنال‌های بک‌تست", hist_backtest.get("signals", 0))
+        st.caption("توجه داده‌ای: حجم = میانه گردش ۲۴ساعته CoinGecko (پروکسی)، نه ورود پول خالص؛ سقف/کف روزانه از نمونه‌های ساعتی است، نه کندل رسمی صرافی.")
         st.subheader("🔎 ارزهایی با الگوهای تاریخی مشابه")
         hist_columns = [
             "Coin", "Symbol", "Analog_Match_Count", "Analog_Hit_Rate_3d", "Analog_Hit_Rate_7d",
@@ -4756,7 +4804,7 @@ if section == "🧬 الگوهای تاریخی":
             "Analog_Score": "امتیاز ترکیبی شباهت تاریخی",
             "Analog_Status": "نتیجه نمونه‌های مشابه",
             "ret_1d": "بازده ۱روزه فعلی (%)", "ret_3d": "بازده ۳روزه فعلی (%)",
-            "ret_7d": "بازده ۷روزه فعلی (%)", "volume_ratio_3v14": "حجم ۳روز / ۱۴روز قبلی",
+            "ret_7d": "بازده ۷روزه فعلی (%)", "volume_ratio_3v14": "پروکسی گردش ۲۴ساعته: ۳روز / ۱۴روز قبلی",
             "range_compression_3v14": "فشردگی دامنه ۳روز / ۱۴روز قبلی",
             "higher_low_3v7": "تغییر کف ۳روز نسبت به ۷روز قبلی (%)",
             "rsi_14": "RSI 14", "relative_strength_7d": "قدرت نسبی ۷روزه نسبت به BTC (%)",
@@ -4787,5 +4835,5 @@ if section == "🧬 الگوهای تاریخی":
         st.caption(f"میانگین بازده ۷روزه سیگنال‌های بک‌تست: {hist_backtest.get('mean_return_7d', np.nan):+.2f}%" if pd.notna(hist_backtest.get("mean_return_7d", np.nan)) else "در این بک‌تست سیگنال مثبت کافی برای محاسبه میانگین بازده وجود نداشت.")
         st.warning("نرخ موفقیت نمونه‌های مشابه، احتمال کالیبره‌شده برای آینده نیست. اگر دقت بک‌تست از نرخ پایه بهتر نباشد، این موتور نباید وزن مثبت در رتبه‌بندی اصلی بگیرد.")
     else:
-        st.info("برای ساخت بانک الگوهای تاریخی، کلید CMC را وارد کن و دکمه اجرای موتور را بزن. نتایج پس از اجرا در همین بخش باقی می‌مانند.")
+        st.info("برای ساخت بانک الگوهای تاریخی، دکمه اجرا را بزن. این بخش از CoinGecko استفاده می‌کند و به کلید CMC نیاز ندارد. نتایج پس از اجرا در همین بخش باقی می‌مانند.")
 

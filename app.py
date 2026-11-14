@@ -2,8 +2,6 @@ import os
 import time
 import threading
 import re
-import html
-import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from requests.adapters import HTTPAdapter
@@ -135,7 +133,6 @@ small, .stMarkdown small { color: #465b75 !important; font-size: .86rem !importa
 CG_API = "https://api.coingecko.com/api/v3"
 CMC_API = "https://pro-api.coinmarketcap.com"
 DEX_API = "https://api.dexscreener.com"
-NEWS_API = "https://cryptopanic.com/api/v1/posts/"
 
 # =========================================================
 # HELPERS / KEYS
@@ -558,15 +555,11 @@ def calculate_pre_pump_score(frame):
     tech = tech.where(tech.notna(), derived_tech.where(rsi_value.notna() | (macd.notna() & macd_signal.notna())))
     out["Technical_PrePump_Score"] = tech
 
-    # 6) BTC regime (5%): market-wide risk filter, not an altcoin-specific catalyst.
+    # 6) BTC regime (10%): market-wide risk filter, not an altcoin-specific catalyst.
     btc_adjustment, btc_context = _btc_market_context(out)
     out["BTC_Market_Context"] = btc_context
     btc_score_value = 55.0 + btc_adjustment * 3.0
     out["BTC_Regime_Score"] = btc_score_value
-
-    # 7) News / fundamentals (5%): only use a supplied/API-computed 0-100 score.
-    news_score = numeric(out.get("News_Score", pd.Series(np.nan, index=out.index))).clip(0, 100)
-    out["News_Factor_Score"] = news_score
 
     weights = {
         "Buy_Flow_Score": 30.0,
@@ -574,8 +567,7 @@ def calculate_pre_pump_score(frame):
         "Momentum_Factor_Score": 15.0,
         "Liquidity_Quality_Score": 15.0,
         "Technical_PrePump_Score": 10.0,
-        "BTC_Regime_Score": 5.0,
-        "News_Factor_Score": 5.0,
+        "BTC_Regime_Score": 10.0,
     }
     weighted_sum = pd.Series(0.0, index=out.index)
     available_weight = pd.Series(0.0, index=out.index)
@@ -1624,31 +1616,9 @@ def fetch_okx_hourly_closes(inst_id, limit=721):
 
 
 def build_btc_correlation_frame(market_df, currency, universe_limit=60, symbols=None):
-    """Align completed hourly returns; OKX is primary and Binance is fallback.
-
-    The main Streamlit market frame uses display columns (Symbol, Coin, Price,
-    Market_Cap), while this analysis historically expected CoinGecko API names
-    (symbol, name, current_price, market_cap). Normalize both schemas here.
-    """
-    if market_df is None or market_df.empty:
-        return pd.DataFrame(), "فهرست بازار خالی است؛ ابتدا دریافت بازار را اجرا کنید."
-    market_df = market_df.copy()
-    aliases = {
-        "symbol": ("symbol", "Symbol", "ticker", "Ticker"),
-        "name": ("name", "Name", "Coin", "coin"),
-        "current_price": ("current_price", "Current_Price", "Price", "price"),
-        "market_cap": ("market_cap", "Market_Cap", "Market_Cap_USD"),
-    }
-    for target, candidates in aliases.items():
-        if target not in market_df.columns:
-            for candidate in candidates:
-                if candidate in market_df.columns:
-                    market_df[target] = market_df[candidate]
-                    break
-    if "symbol" not in market_df.columns:
-        return pd.DataFrame(), "ستون نماد ارز در داده بازار پیدا نشد؛ ستون‌های Symbol یا symbol لازم است."
-    market_df["symbol"] = market_df["symbol"].astype(str).str.strip().str.upper()
-    market_df = market_df[market_df["symbol"].ne("") & market_df["symbol"].ne("NAN")]
+    """Align completed hourly returns; OKX is primary and Binance is fallback."""
+    if market_df is None or market_df.empty or "symbol" not in market_df.columns:
+        return pd.DataFrame(), "فهرست بازار برای تحلیل در دسترس نیست."
     venue_errors = []
     okx_symbols = set()
     binance_symbols = set()
@@ -1763,6 +1733,7 @@ def build_btc_correlation_frame(market_df, currency, universe_limit=60, symbols=
     return result, f"جفت‌های بررسی‌شده: {len(jobs)} • دارای تاریخچه کافی: {len(result)} • منبع: {venues} • خطاها: {len(errors)}"
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_history(coin_id, currency, days, api_key):
     payload = safe_get(
         f"{CG_API}/coins/{coin_id}/market_chart",
@@ -1906,121 +1877,6 @@ def last_three_green_daily_candles(history):
         "Last_Daily_Close": last_close,
     }
 
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def translate_news_to_persian(text):
-    """Translate short English news text to Persian; try two public services, fail safely."""
-    original = str(text or "").strip()
-    if not original:
-        return ""
-    if re.search(r"[\u0600-\u06FF]", original):
-        return original
-
-    # First choice: MyMemory free endpoint.
-    try:
-        response = _http_session().get(
-            "https://api.mymemory.translated.net/get",
-            params={"q": original[:480], "langpair": "en|fa"},
-            timeout=8,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        translated = html.unescape(str((payload.get("responseData") or {}).get("translatedText") or "")).strip()
-        if re.search(r"[\u0600-\u06FF]", translated):
-            return translated
-    except Exception:
-        pass
-
-    # Fallback: Google Translate's public web endpoint. It is unofficial and may be rate-limited.
-    try:
-        response = _http_session().get(
-            "https://translate.googleapis.com/translate_a/single",
-            params={"client": "gtx", "sl": "auto", "tl": "fa", "dt": "t", "q": original[:480]},
-            timeout=8,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        chunks = payload[0] if isinstance(payload, list) and payload else []
-        translated = "".join(str(chunk[0]) for chunk in chunks if isinstance(chunk, list) and chunk and chunk[0])
-        translated = html.unescape(translated).strip()
-        if re.search(r"[\u0600-\u06FF]", translated):
-            return translated
-    except Exception:
-        pass
-    return ""
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_news(currency_api_key="", coin_symbol=None):
-    """Prefer CryptoPanic when keyed; otherwise use public publisher RSS feeds."""
-    rows = []
-    if currency_api_key:
-        try:
-            params = {"auth_token": currency_api_key, "public": "true", "kind": "news"}
-            if coin_symbol and str(coin_symbol).upper() != "ALL":
-                params["currencies"] = str(coin_symbol).lower()
-            payload = safe_get(NEWS_API, params=params, timeout=20)
-            for item in payload.get("results", []) if isinstance(payload, dict) else []:
-                votes = item.get("votes") or {}
-                rows.append({
-                    "Published": item.get("published_at"), "Title": item.get("title", ""),
-                    "Summary": item.get("description", ""),
-                    "Source": (item.get("source") or {}).get("title", "CryptoPanic"),
-                    "Currencies": ", ".join(c.get("code", "") for c in (item.get("currencies") or [])),
-                    "Positive_Votes": votes.get("positive", 0), "Negative_Votes": votes.get("negative", 0),
-                    "URL": item.get("url", ""),
-                })
-            if rows:
-                return pd.DataFrame(rows), "CryptoPanic"
-        except Exception as exc:
-            keyed_error = str(exc)[:160]
-        else:
-            keyed_error = "CryptoPanic returned no articles; using public RSS fallback."
-    else:
-        keyed_error = "No CryptoPanic key; using public RSS sources."
-
-    feeds = [
-        ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
-        ("Cointelegraph", "https://cointelegraph.com/rss"),
-        ("Decrypt", "https://decrypt.co/feed"),
-    ]
-    feed_errors = []
-    wanted = str(coin_symbol or "ALL").strip().upper()
-    for source, url in feeds:
-        try:
-            response = _http_session().get(url, timeout=15, headers={"Accept": "application/rss+xml, application/xml, text/xml"})
-            response.raise_for_status()
-            root = ET.fromstring(response.content)
-            for node in root.iter():
-                if node.tag.split("}")[-1].lower() not in ("item", "entry"):
-                    continue
-                fields = {}
-                for child in list(node):
-                    key = child.tag.split("}")[-1].lower()
-                    value = "".join(child.itertext()).strip()
-                    if key == "link" and not value:
-                        value = child.attrib.get("href", "")
-                    fields[key] = value
-                title = fields.get("title", "").strip()
-                summary = re.sub(r"<[^>]+>", " ", fields.get("description", fields.get("summary", "")))
-                summary = re.sub(r"\s+", " ", summary).strip()
-                if not title:
-                    continue
-                if wanted not in ("", "ALL", "*", "MARKET"):
-                    searchable = f" {title} {summary} ".upper()
-                    if not re.search(rf"(?<![A-Z0-9]){re.escape(wanted)}(?![A-Z0-9])", searchable):
-                        continue
-                rows.append({"Published": fields.get("pubdate", fields.get("published", fields.get("updated", ""))),
-                             "Title": title, "Summary": summary[:500], "Source": source,
-                             "Currencies": wanted if wanted not in ("", "ALL", "*", "MARKET") else "Market",
-                             "Positive_Votes": 0, "Negative_Votes": 0, "URL": fields.get("link", "")})
-        except Exception as exc:
-            feed_errors.append(f"{source}: {str(exc)[:100]}")
-    if rows:
-        frame = pd.DataFrame(rows).drop_duplicates(subset=["Title"]).sort_values("Published", ascending=False, na_position="last")
-        return frame.head(40).reset_index(drop=True), f"Public RSS • {len(rows)} articles • {keyed_error}"
-    detail = " | ".join(feed_errors) if feed_errors else "No matching articles in the latest feed items."
-    return pd.DataFrame(), f"{keyed_error} RSS unavailable: {detail}"
 
 
 @st.cache_data(ttl=90, show_spinner=False)
@@ -2938,11 +2794,63 @@ def cryptometer_watchlist(results):
     return pd.DataFrame(rows).sort_values(["Activity score", "Evidence sources"], ascending=False)
 
 
+def add_watchlist_trade_levels(watchlist, market_df, currency, api_key, max_coins=10):
+    """Create conditional breakout levels from 7d history; leave fields blank if evidence is missing."""
+    if watchlist is None or watchlist.empty:
+        return watchlist
+    out = watchlist.copy()
+    columns = ["Current price", "Entry trigger", "Stop loss", "Target 1", "Target 2", "Risk/Reward T1", "Trade setup"]
+    for col in columns:
+        out[col] = "داده کافی نیست" if col == "Trade setup" else np.nan
+    if market_df is None or market_df.empty or not {"Symbol", "CoinGecko_ID", "Price"}.issubset(market_df.columns):
+        return out
+    lookup = market_df.copy()
+    lookup["_symbol"] = lookup["Symbol"].astype(str).str.upper().str.strip()
+    counts = lookup["_symbol"].value_counts()
+    lookup = lookup[lookup["_symbol"].map(counts).eq(1)].set_index("_symbol")
+    for idx, row in out.head(max_coins).iterrows():
+        symbol = str(row.get("Symbol", "")).upper().strip()
+        if symbol not in lookup.index:
+            continue
+        coin = lookup.loc[symbol]
+        current = pd.to_numeric(pd.Series([coin.get("Price")]), errors="coerce").iloc[0]
+        coin_id = coin.get("CoinGecko_ID")
+        if pd.isna(current) or current <= 0 or pd.isna(coin_id):
+            continue
+        try:
+            history = fetch_history(str(coin_id), currency, 7, api_key)
+            prices = numeric(history["price"]).dropna() if history is not None and not history.empty else pd.Series(dtype=float)
+            if len(prices) < 12:
+                continue
+            recent = prices.tail(24)
+            if len(recent) < 12:
+                continue
+            high = float(recent.max())
+            low = float(recent.min())
+            entry = high * 1.002
+            stop = low * 0.995
+            risk = entry - stop
+            if risk <= 0:
+                continue
+            target1 = entry + 2.0 * risk
+            target2 = entry + 3.0 * risk
+            out.at[idx, "Current price"] = float(current)
+            out.at[idx, "Entry trigger"] = entry
+            out.at[idx, "Stop loss"] = stop
+            out.at[idx, "Target 1"] = target1
+            out.at[idx, "Target 2"] = target2
+            out.at[idx, "Risk/Reward T1"] = round((target1-entry)/risk, 2)
+            out.at[idx, "Trade setup"] = "شکست سقف ۲۴ساعته + بسته‌شدن کندل بالای آن؛ ورود قبل از تأیید نیست" if current < entry else "قیمت از محدوده ورود عبور کرده؛ تعقیب نکن"
+        except Exception:
+            continue
+    return out
+
+
 # =========================================================
 # HEADER
 # =========================================================
 st.title("📡 اسکنر هوشمند بازار ارزهای دیجیتال")
-st.caption("پایش گسترده بازار • شناسایی فرصت‌های پیش از رشد • رادار انباشت • افزایش حجم • کنترل ریسک")
+st.caption("پایش بازار • شناسایی فرصت‌های پیش از رشد • رادار انباشت • جریان پول • کنترل ریسک")
 st.caption("Build 2026-11-14.1 • Same-asset vs cross-asset historical evidence separated • Conservative pre-pump triage")
 st.caption("دریافت بازار با فاصله‌گذاری بین صفحات و تلاش مجدد هوشمند انجام می‌شود؛ پاسخ‌ها ۵ دقیقه کش می‌شوند و در صورت محدودیت صفحه بعد، داده صفحات موفق حفظ می‌شود.")
 st.warning(
@@ -2950,7 +2858,7 @@ st.warning(
 )
 with st.expander("📘 راهنمای سریع استفاده از اسکنر", expanded=False):
     guide_a, guide_b, guide_c = st.columns(3)
-    guide_a.markdown("**۱. امتیاز هفت‌عاملی**\n\nخرید واقعی ۳۰٪، شتاب حجم ۲۰٪، مومنتوم ۱۵٪، نقدشوندگی ۱۵٪، تکنیکال ۱۰٪، وضعیت BTC پنج درصد و خبر پنج درصد. عواملِ بدون داده از محاسبه کنار می‌روند و پوشش شواهد نمایش داده می‌شود.")
+    guide_a.markdown("**۱. امتیاز شش‌عاملی**\n\nخرید واقعی ۳۰٪، شتاب حجم ۲۰٪، مومنتوم ۱۵٪، نقدشوندگی ۱۵٪، تکنیکال ۱۰٪ و وضعیت BTC ده درصد. عواملِ بدون داده از محاسبه کنار می‌روند و پوشش شواهد نمایش داده می‌شود.")
     guide_b.markdown("**۲. ورود ترکیبی و محافظه‌کارانه**\n\nورود اولیه حداکثر ۲۵٪ حجم موقعیت؛ ۷۵٪ باقی‌مانده فقط پس از شکست مقاومت و تثبیت با حجم مناسب. سیگنال Watch به معنی ورود نیست.")
     guide_c.markdown("**۳. مدیریت ریسک**\n\nریسک پیشنهادی هر معامله حداکثر ۰٫۵٪ سرمایه؛ حداقل نسبت سود به زیان ۲ به ۱. اگر داده کافی یا حدضرر ساختاری نداریم، ورود صادر نمی‌شود.")
 
@@ -2966,10 +2874,10 @@ with st.sidebar:
             "تعداد ارزهای مورد بررسی",
             options=[1, 2, 4, 8],
             format_func=lambda n: f"Up to {n * 250:,} market coins",
-            index=2,
-            help="Starts with up to 1,000 market coins. Reduce to 250 or 500 if CoinGecko rate limits occur.",
+            index=0,
+            help="Starts with up to 250 market coins. Increase only when you need wider coverage.",
         )
-        refresh_seconds = st.selectbox("فاصله به‌روزرسانی", [60, 120, 300, 600], index=1)
+        refresh_seconds = st.selectbox("فاصله به‌روزرسانی", [60, 120, 300, 600], index=2)
     cmc_key_input = st.text_input(
         "کلید API کوین‌مارکت‌کپ (CMC)",
         value=secret_or_env("COINMARKETCAP_API_KEY") or secret_or_env("CMC_PRO_API_KEY"),
@@ -2982,24 +2890,17 @@ with st.sidebar:
     st.subheader("🔬 تحلیل تکنیکال")
     use_bybit_derivatives = st.checkbox(
         "دریافت نرخ فاندینگ و سود باز قراردادها",
-        value=True,
-        help="Uses public USDT perpetual data: Bybit first, then OKX, then Gate.io if blocked. No exchange API key is used."
+        value=False,
+        help="برای کاهش درخواست‌های شبکه به‌صورت پیش‌فرض خاموش است؛ فقط هنگام نیاز فعالش کن."
     )
     technical_limit = st.selectbox(
         "تعداد ارز برای محاسبه شاخص‌های تکنیکال",
         [0, 10, 20, 30, 50],
-        index=3,
+        index=2,
         help="Fetches 7-day price and volume history for the highest turnover-to-market-cap candidates. 30 is a practical balance; 50 uses more API calls. 0 disables detailed indicators.",
     )
     run_technicals = st.button("محاسبه شاخص‌های تکنیکال", type="primary")
-    st.divider()
-    st.subheader("📰 اخبار بازار")
-    news_key_input = st.text_input(
-        "کلید CryptoPanic (اختیاری)",
-        value=secret_or_env("CRYPTOPANIC_API_KEY"),
-        type="password",
-        help="بدون کلید هم خبرها از RSS عمومی CoinDesk، Cointelegraph و Decrypt دریافت می‌شوند.",
-    )
+
     st.divider()
     st.subheader("🧪 جست‌وجوی صرافی‌های غیرمتمرکز")
     dex_query = st.text_input("نام ارز یا جفت معاملاتی", value="bitcoin", help="جفت‌های معاملاتی منطبق با عبارت جست‌وجو را پیدا می‌کند.")
@@ -3007,7 +2908,7 @@ with st.sidebar:
     st.divider()
     min_score = st.slider("حداقل امتیاز پیش از رشد", 0, 100, 70)
     min_liquidity = st.number_input("حداقل نقدشوندگی DEX (دلار)", min_value=0, value=50000, step=10000)
-    show_all = st.checkbox("نمایش همه ردیف‌های جدول داده", value=True)
+    show_all = st.checkbox("نمایش همه ردیف‌های جدول داده", value=False)
 
 cg_key = secret_or_env("COINGECKO_API_KEY")
 # =========================================================
@@ -3093,8 +2994,6 @@ if "Market_Momentum_Score" not in df.columns:
     ).clip(0, 100).round(2)
 if "Technical_Score" not in df.columns:
     df["Technical_Score"] = np.nan
-if "News_Score" not in df.columns:
-    df["News_Score"] = np.nan
 if "Pump_Potential_Score" not in df.columns:
     df["Pump_Potential_Score"] = df["Market_Momentum_Score"]
 
@@ -3352,7 +3251,7 @@ def render_semi_gauge(value, title, subtitle, marker_color="#1769d2"):
 filtered = df[(numeric(df["PrePump_Score"]).fillna(0) >= min_score) & (~df["Is_Excluded_Asset"])].copy()  # پیش‌فرض برای بخش‌های دیگر
 section = st.radio(
     "انتخاب بخش اسکنر",
-    ["🏠 نمای کلی", "🧲 رادار انباشت و پیش‌پامپ", "🧬 الگوهای تاریخی", "₿ رابطه ارزها با بیت‌کوین", "📊 نمودارها و ریزش‌ها", "📰 اخبار و DEX", "🐋 جریان پول و مشتقات", "📁 داده‌ها"],
+    ["🏠 نمای کلی", "🧲 رادار انباشت و پیش‌پامپ", "🧬 الگوهای تاریخی", "₿ رابطه ارزها با بیت‌کوین", "📊 نمودارها و ریزش‌ها", "🐋 جریان پول و مشتقات", "📁 داده‌ها"],
     horizontal=True,
     label_visibility="collapsed",
     key="scanner_section_navigation",
@@ -3367,7 +3266,6 @@ st.caption({
     "🧬 الگوهای تاریخی": "مقایسه وضعیت امروز با نمونه‌های تاریخی و آزمون walk-forward بدون نگاه به آینده",
     "₿ رابطه ارزها با بیت‌کوین": "همبستگی ساعتی و واگرایی عملکرد ارزها نسبت به BTC",
     "📊 نمودارها و ریزش‌ها": "بررسی ساختار قیمت، شاخص‌های تکنیکال و ارزهای با افت شدید",
-    "📰 اخبار و DEX": "اخبار، فعالیت صرافی‌های غیرمتمرکز و فشار خرید و فروش",
     "🐋 جریان پول و مشتقات": "جریان پول، خرید و فروش واقعی، فاندینگ و سود باز",
     "📁 داده‌ها": "مشاهده و دریافت داده خام بازار",
 }[section])
@@ -3382,7 +3280,7 @@ if section == "🏠 نمای کلی":
         f"Display refreshed: {pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
     st.info(
-        "وزن‌ها: خرید واقعی ۳۰٪ • شتاب حجم ۲۰٪ • مومنتوم ۱۵٪ • نقدشوندگی ۱۵٪ • تکنیکال ۱۰٪ • رژیم BTC پنج درصد • خبر پنج درصد. "
+        "وزن‌ها: خرید واقعی ۳۰٪ • شتاب حجم ۲۰٪ • مومنتوم ۱۵٪ • نقدشوندگی ۱۵٪ • تکنیکال ۱۰٪ • رژیم BTC ده درصد. "
         "داده ناموجود امتیاز مثبت نمی‌گیرد؛ امتیاز با وزن عواملِ واقعاً موجود نرمال می‌شود و پوشش شواهد جداگانه نشان داده می‌شود. "
         "رادار انباشت جداگانه فشردگی قیمت، کف‌های بالاتر، خرید خالص واقعی، حجم و RSI را می‌سنجد؛ فشردگی قیمت به‌تنهایی اثبات خرید نهنگ نیست. برای سیگنال Pre-Pump معتبر، خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه و شرایط مناسب بازار لازم است. OI و حجم معاملات به‌تنهایی ورود پول یا خرید نهنگ نیستند."
     )
@@ -3516,7 +3414,7 @@ if section == "🏠 نمای کلی":
 
     if filtered.empty:
         st.info("No coins match these filters. Lower the minimum score or broaden your search.")
-        # Do not stop: DEX and news panels may still be useful.
+        # Do not stop: other market panels may still be useful.
 
     a, b, c, d = st.columns(4)
     a.metric("🪙 Coins loaded", f"{len(df):,}")
@@ -3625,7 +3523,7 @@ if section == "🏠 نمای کلی":
     st.divider()
 if section == "🧲 رادار انباشت و پیش‌پامپ":
     st.subheader("🧲 رادار انباشت قبل از شکست مقاومت")
-    st.caption("این بخش جدا از امتیاز هفت‌عاملی است: فشردگی دامنه قیمت، کف‌های بالاتر، خرید خالص واقعی، شتاب حجم و RSI را می‌سنجد. فشردگی قیمت به‌تنهایی اثبات انباشت نهنگ‌ها نیست؛ برای تأیید خرید واقعی، داده خرید/فروش دلاری لازم است.")
+    st.caption("این بخش جدا از امتیاز شش‌عاملی است: فشردگی دامنه قیمت، کف‌های بالاتر، خرید خالص واقعی، شتاب حجم و RSI را می‌سنجد. فشردگی قیمت به‌تنهایی اثبات انباشت نهنگ‌ها نیست؛ برای تأیید خرید واقعی، داده خرید/فروش دلاری لازم است.")
     accumulation_view = df[~df["Is_Excluded_Asset"]].copy()
     if "Accumulation_Score" in accumulation_view.columns:
         accumulation_view["Accumulation_Score"] = numeric(accumulation_view["Accumulation_Score"])
@@ -3654,7 +3552,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
 
     st.divider()
     st.subheader("🛰️ فرصت‌های احتمالی پیش از رشد")
-    st.caption("استیبل‌کوین‌ها حذف شده‌اند. سیگنال معتبر نیازمند خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه، نقدشوندگی مناسب و بازار BTC غیرنزولی است. درصد پوشش نشان می‌دهد چه مقدار از هفت عامل واقعاً داده داشته‌اند.")
+    st.caption("استیبل‌کوین‌ها حذف شده‌اند. سیگنال معتبر نیازمند خرید واقعی مثبت، شتاب حجم، تکنیکال قابل محاسبه، نقدشوندگی مناسب و بازار BTC غیرنزولی است. درصد پوشش نشان می‌دهد چه مقدار از شش عامل واقعاً داده داشته‌اند.")
 
     # CoinMarketCap broad-universe radar: no 30-coin CoinGecko cutoff.
     st.markdown("### 🌐 رادار گسترده CoinMarketCap")
@@ -3832,7 +3730,6 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
             ("Liquidity_Quality_Score", "نقدشوندگی"),
             ("Technical_PrePump_Score", "تکنیکال"),
             ("BTC_Regime_Score", "وضعیت BTC"),
-            ("News_Factor_Score", "اخبار"),
         ]
         radar_rows = ranked.head(3)
         if not radar_rows.empty:
@@ -3878,7 +3775,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                 "Range_Compression_Ratio", "Higher_Low_24h_Percent",
                 "Volume_24h_vs_7d_Avg", "Volume_Acceleration_Score", "Market_Cap_Rank", "RSI_14", "Technical_PrePump_Score",
                 "Buy_Volume_USD", "Sell_Volume_USD", "Net_Buy_USD", "Buy_Share_Percent", "Buy_Flow_Status",
-                "Momentum_Factor_Score", "Liquidity_Quality_Score", "BTC_Market_Context", "BTC_Regime_Score", "News_Factor_Score", "Evidence_Coverage_Percent",
+                "Momentum_Factor_Score", "Liquidity_Quality_Score", "BTC_Market_Context", "BTC_Regime_Score", "Evidence_Coverage_Percent",
                 "Funding_Rate_Percent", "Open_Interest_USD", "Derivatives_Turnover_24h_USD", "Derivatives_Exchange",
                 "Derivatives_Context_Score", "PrePump_Score", "Pump_Potential_Score", "Trade_Signal", "Trade_Signal_Reason", "Trade_Analysis_Completed", "Signal", "Risk_Level", "Technical_Signal",
             ]
@@ -3894,7 +3791,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
                 "Volume_24h_vs_7d_Avg": "24h volume vs 7d baseline",
                 "Volume_Acceleration_Score": "Volume acceleration score", "Momentum_Factor_Score": "Momentum score",
                 "Liquidity_Quality_Score": "Liquidity score", "BTC_Regime_Score": "BTC regime score",
-                "News_Factor_Score": "News score", "Evidence_Coverage_Percent": "Evidence coverage (%)",
+                "Evidence_Coverage_Percent": "Evidence coverage (%)",
                 "RSI_14": "RSI (14)", "Technical_PrePump_Score": "Technical pre-pump",
                  "Buy_Volume_USD": "حجم خرید واقعی (USDT)", "Sell_Volume_USD": "حجم فروش واقعی (USDT)",
                 "Net_Buy_USD": "خالص خرید (USDT)", "Buy_Share_Percent": "سهم خرید (%)",
@@ -4359,124 +4256,7 @@ if section == "📊 نمودارها و ریزش‌ها":
     else:
         st.info("برای نمایش نمودارهای تکنیکال، منبع داده CoinGecko را انتخاب کن.")
 
-if section == "📰 اخبار و DEX":
-    # News panel
-    st.divider()
-    st.subheader("📰 اخبار و عوامل بنیادی")
-    st.caption("خبرها بدون نیاز به کلید API از RSS رسانه‌های عمومی دریافت می‌شوند؛ در صورت واردکردن کلید، CryptoPanic در اولویت است.")
-    news_symbol = st.selectbox("محدوده خبر", ["ALL", "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"], index=0,
-                               format_func=lambda x: "کل بازار" if x == "ALL" else x)
-    fetch_news_clicked = st.button("🔄 دریافت آخرین اخبار و تحلیل بنیادی", type="primary", key="fetch_market_news")
-    if fetch_news_clicked or "news_feed_cache" not in st.session_state or st.session_state.get("news_feed_symbol") != news_symbol:
-        with st.spinner("در حال دریافت خبرهای بازار از منابع خبری..."):
-            loaded_news, loaded_status = fetch_news(news_key_input, news_symbol)
-        st.session_state["news_feed_cache"] = loaded_news
-        st.session_state["news_feed_status"] = loaded_status
-        st.session_state["news_feed_symbol"] = news_symbol
-    news_df = st.session_state.get("news_feed_cache", pd.DataFrame())
-    news_status = st.session_state.get("news_feed_status", "هنوز خبری دریافت نشده است.")
-    st.caption(f"وضعیت منبع: {news_status}")
-    if news_df is None or news_df.empty:
-        st.warning("در حال حاضر خبری از منابع انتخاب‌شده دریافت نشد. وضعیت اتصال و پیام منبع بالا را بررسی کن.")
-    else:
-        # Transparent headline keyword proxy; this is not trained NLP or fact-checking.
-        positive_terms = ("approval", "adoption", "partnership", "launch", "upgrade", "inflow", "bullish", "listing", "گسترش", "همکاری", "تایید", "تصویب", "رشد")
-        negative_terms = ("hack", "exploit", "lawsuit", "ban", "delist", "outflow", "bearish", "scam", "breach", "هک", "حمله", "شکایت", "ممنوع", "حذف", "کلاهبرداری", "ورشکستگی")
-        def headline_score(title):
-            t = str(title).lower()
-            return sum(w in t for w in positive_terms) - sum(w in t for w in negative_terms)
-        news_df = news_df.copy()
-        news_df["Sentiment"] = news_df["Title"].apply(headline_score).map(
-            lambda x: "مثبتِ کلمه‌محور" if x > 0 else ("منفیِ کلمه‌محور" if x < 0 else "خنثی / نامشخص")
-        )
-        scores = news_df["Title"].apply(headline_score)
-        pos_n, neg_n = int((scores > 0).sum()), int((scores < 0).sum())
-        n1, n2, n3 = st.columns(3)
-        n1.metric("تعداد خبرهای دریافتی", len(news_df))
-        n2.metric("تیترهای دارای واژه مثبت", pos_n)
-        n3.metric("تیترهای دارای واژه منفی", neg_n)
-        if pos_n > neg_n:
-            st.success("جمع‌بندی خبری: در تیترهای دریافت‌شده واژه‌های مثبت بیشتر دیده می‌شود؛ این برداشت اولیه است و باید متن خبر و منبع آن بررسی شود.")
-        elif neg_n > pos_n:
-            st.warning("جمع‌بندی خبری: تیترهای دارای واژه منفی بیشترند؛ ریسک خبرهای منفی را قبل از تصمیم بررسی کن.")
-        else:
-            st.info("جمع‌بندی خبری: تیترها از نظر واژه‌های مثبت و منفی برتری روشنی ندارند یا بخش زیادی از آن‌ها خنثی‌اند.")
-        # Translate titles and summaries independently; delimiter-based combined translation
-        # was unreliable because translation services sometimes modify/remove delimiters.
-        news_df = news_df.copy().head(8)
-        translated_titles = []
-        translated_summaries = []
-        with st.spinner("در حال ترجمه تیترها و خلاصه خبرها به فارسی..."):
-            for _, article in news_df.iterrows():
-                title_en = str(article.get("Title", "") or "")
-                summary_en = str(article.get("Summary", "") or "")
-                title_fa = translate_news_to_persian(title_en[:350]) if title_en else ""
-                summary_fa = translate_news_to_persian(summary_en[:350]) if summary_en else ""
-                translated_titles.append(title_fa or title_en)
-                translated_summaries.append(summary_fa or summary_en)
-        news_df["عنوان فارسی"] = translated_titles
-        news_df["خلاصه فارسی"] = translated_summaries
-        translated_count = sum(1 for fa, en in zip(translated_titles, news_df["Title"]) if fa and fa != en)
-        st.caption(f"ترجمه فارسی: {translated_count} از {len(news_df)} تیتر ترجمه شد؛ MyMemory و در صورت نیاز Google Translate عمومی امتحان می‌شوند. حداکثر ۸ خبر تازه برای کنترل زمان و محدودیت سرویس ترجمه می‌شود؛ در صورت اختلال متن اصلی باقی می‌ماند.")
-        display_news = news_df.rename(columns={"Published": "زمان انتشار", "Title": "عنوان اصلی (انگلیسی)", "Summary": "خلاصه اصلی (انگلیسی)", "Source": "منبع", "Currencies": "ارز", "Sentiment": "برداشت اولیه", "URL": "لینک"})
-        keep_news = [c for c in ["زمان انتشار", "عنوان فارسی", "خلاصه فارسی", "عنوان اصلی (انگلیسی)", "منبع", "ارز", "برداشت اولیه", "لینک"] if c in display_news.columns]
-        st.dataframe(display_news[keep_news], use_container_width=True, hide_index=True, column_config={"لینک": st.column_config.LinkColumn("لینک خبر")})
-        st.caption("ترجمه از سرویس‌های عمومی رایگان انجام می‌شود و ممکن است محدود یا نادقیق باشد. برداشت مثبت/منفی فقط بر اساس واژه‌های تیتر است، نه تحلیل هوش مصنوعی یا راستی‌آزمایی خبر؛ اثر خبر بر قیمت قطعی نیست.")
 
-    # DEX panel
-    st.divider()
-    st.subheader("🧪 جریان معاملات، فشار خرید و فروش و نشانه‌های نهنگ‌ها")
-    st.caption("Searches DEX Screener pairs matching your query. This is a market-activity screen, not complete on-chain whale tracking.")
-    st.info(
-        "What these numbers mean: DEX volume is traded value, not net money entering a token. "
-        "Buy/sell counts are transaction counts. Estimated buy/sell volume below is only a rough proxy "
-        "that splits total volume by transaction-count share; it is NOT actual USD flow. "
-        "Real whale detection needs wallet-level/on-chain trade data from a suitable provider."
-    )
-    if dex_button:
-        if not dex_query.strip():
-            st.warning("Enter a search term.")
-        else:
-            try:
-                with st.spinner(f"Searching DEX pairs for {dex_query}..."):
-                    dex_df = fetch_dex_search(dex_query.strip())
-                if dex_df.empty:
-                    st.info("No DEX pairs found for that search term.")
-                else:
-                    dex_df = dex_df[numeric(dex_df["Liquidity_USD"]).fillna(0) >= min_liquidity]
-                    if dex_df.empty:
-                        st.warning("No pairs passed the minimum liquidity filter. Lower the liquidity filter and search again.")
-                    else:
-                        top = dex_df.iloc[0]
-                        k1, k2, k3, k4 = st.columns(4)
-                        k1.metric("DEX pairs found", f"{len(dex_df):,}")
-                        k2.metric("Top pair 24h volume", f"${fmt_num(top.get('Volume_24h_USD'), 0)}")
-                        k3.metric("Top pair liquidity", f"${fmt_num(top.get('Liquidity_USD'), 0)}")
-                        k4.metric("Top pair buy-count share", f"{fmt_num(top.get('Buy_Count_Share_Percent'), 1)}%")
-                        st.caption("Buy-count share = buys ÷ (buys + sells). It counts transactions, not their dollar size.")
-                        display_cols = [
-                            "Token", "Symbol", "Chain", "DEX", "Price_USD", "Change_1h_Percent",
-                            "Change_24h_Percent", "Volume_24h_USD", "Liquidity_USD", "Transactions_24h",
-                            "Buys_24h", "Sells_24h", "Buy_Count_Share_Percent",
-                            "Estimated_Buy_Volume_Proxy_USD", "Estimated_Sell_Volume_Proxy_USD",
-                            "Volume_to_Liquidity_Ratio", "Activity_Flag", "DEX_Screen_Score", "Risk_Flag", "Pair_URL"
-                        ]
-                        display_cols = [c for c in display_cols if c in dex_df.columns]
-                        st.dataframe(dex_df[display_cols].head(100), use_container_width=True, hide_index=True)
-                        st.caption(
-                            "Whale-watch clue only: unusually high volume relative to liquidity plus many transactions can merit review, "
-                            "but does not prove that whales traded or that net inflows occurred. Check wallet-level data separately."
-                        )
-                    st.download_button(
-                        "⬇️ Download DEX search CSV",
-                        data=dex_df.to_csv(index=False).encode("utf-8"),
-                        file_name="dex_screener_search.csv",
-                        mime="text/csv",
-                    )
-            except Exception as exc:
-                st.error(f"DEX Screener error: {exc}")
-
-    # =========================================================
 if section == "🐋 جریان پول و مشتقات":
     # LIVE FUNDING + OPEN INTEREST PANEL
     # =========================================================
@@ -4866,6 +4646,8 @@ if section == "🐋 جریان پول و مشتقات":
                     "and coin-level netflow (+/−15). A bullish/bearish label requires at least two independent evidence sources. "
                     "This score is not a calibrated probability and is not a buy recommendation."
                 )
+                watchlist_df = add_watchlist_trade_levels(watchlist_df, df, currency, cg_key, max_coins=10)
+                st.caption("سطوح ورود بر اساس شکست سقف ۲۴ ساعت اخیر و تثبیت بالای آن است؛ حدضرر زیر کف همین بازه و اهداف با نسبت ریسک به بازده ۲R و ۳R محاسبه می‌شوند. این‌ها سفارش خودکار نیستند. برای ارزهای بدون تاریخچه کافی سطحی ساخته نمی‌شود.")
                 st.dataframe(watchlist_df, use_container_width=True, hide_index=True)
                 st.download_button(
                     "⬇️ Download CryptoMeter watchlist CSV",

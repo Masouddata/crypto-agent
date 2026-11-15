@@ -2573,16 +2573,29 @@ def fetch_okx_auto_trader_candidates(limit: int = 50, last_days: int = 180):
     """
     base = "https://www.okx.com/api/v5/copytrading"
     errors, candidates = [], []
+    # minLeadDays is an OKX selector, not a literal day count (the API
+    # accepts preset values). Sending 180 causes HTTP 400 on the public API.
+    # Fetch the ranking without that optional selector and enforce the exact
+    # requested history threshold locally using disclosed trader/stat fields.
     params = {"instType": "SWAP", "sortType": "overview", "state": "1",
-              "minLeadDays": str(last_days), "page": "1", "limit": str(min(100, max(1, limit)))}
+              "page": "1", "limit": str(min(100, max(1, limit)))}
     try:
         r = requests.get(base + "/public-lead-traders", params=params, timeout=18)
-        r.raise_for_status(); payload = r.json()
+        if r.status_code == 400:
+            # Conservative compatibility fallback for regional API variants.
+            fallback_params = {"instType": "SWAP", "page": "1",
+                               "limit": str(min(100, max(1, limit)))}
+            r = requests.get(base + "/public-lead-traders", params=fallback_params, timeout=18)
+        if not r.ok:
+            detail = (r.text or "")[:240].replace("\n", " ")
+            raise RuntimeError(f"HTTP {r.status_code}: {detail}")
+        payload = r.json()
         if str(payload.get("code", "0")) != "0":
-            # Some OKX regions/versions reject minLeadDays; retry without it,
-            # then apply the history filter locally.
-            params.pop("minLeadDays", None)
-            r = requests.get(base + "/public-lead-traders", params=params, timeout=18)
+            # Retry without optional filters if the endpoint returns an OKX
+            # application-level parameter error instead of HTTP 400.
+            fallback_params = {"instType": "SWAP", "page": "1",
+                               "limit": str(min(100, max(1, limit)))}
+            r = requests.get(base + "/public-lead-traders", params=fallback_params, timeout=18)
             r.raise_for_status(); payload = r.json()
         if str(payload.get("code", "0")) != "0":
             raise RuntimeError(str(payload.get("msg", "OKX ranking endpoint error")))
@@ -2590,7 +2603,7 @@ def fetch_okx_auto_trader_candidates(limit: int = 50, last_days: int = 180):
         if not candidates:
             raise RuntimeError("OKX ranking endpoint returned no trader rows")
     except Exception as exc:
-        return pd.DataFrame(), [f"دریافت رتبه‌بندی عمومی OKX ناموفق بود: {str(exc)[:180]}"]
+        return pd.DataFrame(), [f"دریافت رتبه‌بندی عمومی OKX ناموفق بود: {str(exc)[:240]}"]
 
     rows = []
     for trader in candidates[:min(100, max(1, limit))]:

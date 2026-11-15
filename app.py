@@ -2695,16 +2695,49 @@ def cryptometer_frame(payload):
 
 
 def _cm_number(value):
+    """Parse provider numbers without turning missing/invalid values into zero."""
     try:
         value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-        return float(value) if pd.notna(value) else 0.0
+        return float(value) if pd.notna(value) and np.isfinite(float(value)) else np.nan
     except Exception:
-        return 0.0
+        return np.nan
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_okx_spot_tickers():
+    """One bulk public request; exact live BASE-USDT spot pairs only."""
+    url = "https://www.okx.com/api/v5/market/tickers"
+    response = _http_session().get(url, params={"instType": "SPOT"}, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    if str(payload.get("code", "")) != "0":
+        raise RuntimeError("OKX returned a non-zero API status")
+    rows = []
+    retrieved = pd.Timestamp.now(tz="UTC").isoformat()
+    for item in payload.get("data", []):
+        inst_id = str(item.get("instId", "")).upper()
+        if not inst_id.endswith("-USDT") or inst_id.count("-") != 1:
+            continue
+        rows.append({
+            "Symbol": inst_id[:-5], "OKX pair": inst_id,
+            "OKX price": _cm_number(item.get("last")),
+            "OKX 24h quote volume USDT": _cm_number(item.get("volCcy24h")),
+            "OKX bid": _cm_number(item.get("bidPx")),
+            "OKX ask": _cm_number(item.get("askPx")),
+            "OKX timestamp": item.get("ts"),
+            "OKX retrieved UTC": retrieved,
+            "OKX source": "OKX public SPOT tickers",
+        })
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame = frame.drop_duplicates("Symbol", keep=False)
+    return frame
 
 
 def cryptometer_watchlist(results):
-    """Build a transparent evidence score only from symbol-level returned evidence."""
+    """Summarize CryptoMeter evidence; its feeds count as ONE provider, not independent sources."""
     evidence = {}
+    retrieved_utc = pd.Timestamp.now(tz="UTC").isoformat()
 
     def slot(symbol):
         symbol = str(symbol or "").strip().upper()
@@ -2712,8 +2745,9 @@ def cryptometer_watchlist(results):
             return None
         return evidence.setdefault(symbol, {
             "Symbol": symbol, "Rapid bias": 0, "Rapid events": 0,
-            "Whale buys USD": 0.0, "Whale sells USD": 0.0,
-            "Netflow USD": np.nan,
+            "Whale buys USD": np.nan, "Whale sells USD": np.nan,
+            "Netflow USD": np.nan, "CryptoMeter provider": "CryptoMeter",
+            "CryptoMeter retrieved UTC": retrieved_utc,
         })
 
     rapid_result = results.get("rapid") or {}
@@ -2741,12 +2775,11 @@ def cryptometer_watchlist(results):
             item = slot(symbol)
             if item is None:
                 continue
-            usd = _cm_number(row.get("usd_total", row.get("total", 0)))
+            usd = _cm_number(row.get("usd_total", row.get("total")))
             side = str(row.get("side", "")).upper()
-            if side == "BUY":
-                item["Whale buys USD"] += usd
-            elif side == "SELL":
-                item["Whale sells USD"] += usd
+            if pd.notna(usd) and usd >= 0 and side in ("BUY", "SELL"):
+                key = "Whale buys USD" if side == "BUY" else "Whale sells USD"
+                item[key] = (0.0 if pd.isna(item[key]) else item[key]) + usd
 
     flow_result = results.get("liquidity") or {}
     if flow_result.get("payload"):
@@ -2761,37 +2794,32 @@ def cryptometer_watchlist(results):
     rows = []
     for item in evidence.values():
         score = 50.0
-        sources = 0
+        categories = 0
         rapid_bias = item["Rapid bias"]
         if item["Rapid events"]:
             score += 10 if rapid_bias > 0 else (-10 if rapid_bias < 0 else 0)
-            sources += 1
-        whale_total = item["Whale buys USD"] + item["Whale sells USD"]
-        if whale_total > 0:
-            score += 18 if item["Whale buys USD"] > item["Whale sells USD"] else -18
-            sources += 1
+            categories += 1
+        whale_values_present = pd.notna(item["Whale buys USD"]) or pd.notna(item["Whale sells USD"])
+        whale_buys = 0.0 if pd.isna(item["Whale buys USD"]) else item["Whale buys USD"]
+        whale_sells = 0.0 if pd.isna(item["Whale sells USD"]) else item["Whale sells USD"]
+        whale_total = whale_buys + whale_sells
+        if whale_values_present and whale_total > 0:
+            score += 18 if whale_buys > whale_sells else -18
+            categories += 1
         if pd.notna(item["Netflow USD"]):
             score += 15 if item["Netflow USD"] > 0 else (-15 if item["Netflow USD"] < 0 else 0)
-            sources += 1
-        # Do not label a single-source observation bullish or bearish.
+            categories += 1
         score = float(np.clip(score, 0, 100))
-        if sources < 2:
-            reading = "Insufficient independent evidence"
-        elif score >= 70:
-            reading = "Bullish watch — verify chart"
-        elif score <= 30:
-            reading = "Bearish / risk elevated"
-        else:
-            reading = "Mixed — monitor"
         rows.append({
             **item,
-            "Evidence sources": sources,
+            "CryptoMeter evidence categories": categories,
+            "Independent providers": 1,
             "Activity score": round(score, 1),
-            "Reading": reading,
+            "Reading": "CryptoMeter-only — needs independent market confirmation",
         })
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(["Activity score", "Evidence sources"], ascending=False)
+    return pd.DataFrame(rows).sort_values(["Activity score", "CryptoMeter evidence categories"], ascending=False)
 
 
 def add_watchlist_trade_levels(watchlist, market_df, currency, api_key, max_coins=10):
@@ -4642,10 +4670,37 @@ if section == "🐋 جریان پول و مشتقات":
             if not watchlist_df.empty:
                 st.markdown("**Cross-signal activity watchlist**")
                 st.caption(
-                    "Transparent evidence score: Rapid Moves (+/−10), whale buy/sell USD dominance (+/−18), "
-                    "and coin-level netflow (+/−15). A bullish/bearish label requires at least two independent evidence sources. "
-                    "This score is not a calibrated probability and is not a buy recommendation."
+                    "Rapid Moves، معاملات بزرگ و Netflow همگی از یک ارائه‌دهنده (CryptoMeter) هستند؛ "
+                    "بنابراین فقط یک منبع مستقل شمرده می‌شوند. اعداد ناموجود صفر فرض نمی‌شوند. "
+                    "تأیید مستقل قیمت/حجم از تیکرهای عمومی بازار OKX و فقط برای جفت دقیق SPOT با USDT انجام می‌شود."
                 )
+                try:
+                    okx_df = fetch_okx_spot_tickers()
+                    if not okx_df.empty:
+                        watchlist_df = watchlist_df.merge(okx_df, on="Symbol", how="left", validate="one_to_one")
+                        watchlist_df["OKX cross-check"] = np.where(
+                            watchlist_df["OKX pair"].notna(), "Exact OKX spot pair found", "No exact OKX-USDT spot pair"
+                        )
+                        market_prices = df[["Symbol", "Price"]].copy() if {"Symbol", "Price"}.issubset(df.columns) else pd.DataFrame()
+                        if not market_prices.empty and str(currency).upper() in ("USD", "USDT"):
+                            market_prices["Symbol"] = market_prices["Symbol"].astype(str).str.upper().str.strip()
+                            market_prices = market_prices.drop_duplicates("Symbol", keep=False)
+                            watchlist_df = watchlist_df.merge(market_prices.rename(columns={"Price": "CoinGecko price"}), on="Symbol", how="left", validate="one_to_one")
+                            watchlist_df["OKX vs CoinGecko price gap %"] = np.where(
+                                watchlist_df["CoinGecko price"].gt(0) & watchlist_df["OKX price"].notna(),
+                                (watchlist_df["OKX price"] / watchlist_df["CoinGecko price"] - 1) * 100,
+                                np.nan,
+                            )
+                            watchlist_df["Price cross-check"] = np.select(
+                                [watchlist_df["OKX vs CoinGecko price gap %"].abs().le(1), watchlist_df["OKX vs CoinGecko price gap %"].abs().gt(3)],
+                                ["Aligned (≤1%)", "Mismatch (>3%)"], default="Review / unavailable"
+                            )
+                        else:
+                            watchlist_df["Price cross-check"] = "Skipped: non-USD display currency or missing market price"
+                    else:
+                        watchlist_df["OKX cross-check"] = "OKX returned no usable spot pairs"
+                except Exception as exc:
+                    watchlist_df["OKX cross-check"] = f"Unavailable: {exc.__class__.__name__}"
                 watchlist_df = add_watchlist_trade_levels(watchlist_df, df, currency, cg_key, max_coins=10)
                 st.caption("سطوح ورود بر اساس شکست سقف ۲۴ ساعت اخیر و تثبیت بالای آن است؛ حدضرر زیر کف همین بازه و اهداف با نسبت ریسک به بازده ۲R و ۳R محاسبه می‌شوند. این‌ها سفارش خودکار نیستند. برای ارزهای بدون تاریخچه کافی سطحی ساخته نمی‌شود.")
                 st.dataframe(watchlist_df, use_container_width=True, hide_index=True)

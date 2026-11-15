@@ -2512,6 +2512,8 @@ def fetch_okx_public_lead_positions(unique_codes_text: str):
                     "Entry price": item.get("openAvgPx", ""),
                     "Mark price": item.get("markPx", ""),
                     "Margin (reported)": item.get("margin", ""),
+                    "Leverage (reported)": item.get("lever", item.get("leverRatio", "")),
+                    "Maintenance margin ratio": item.get("mgnRatio", ""),
                     "Unrealized PnL": item.get("upl", ""),
                     "Opened at (UTC)": item.get("openTime", ""),
                     "TP": item.get("tpOrdPx", ""),
@@ -2521,6 +2523,145 @@ def fetch_okx_public_lead_positions(unique_codes_text: str):
         except Exception as exc:
             errors.append(f"{code}: {exc.__class__.__name__}")
     return pd.DataFrame(rows), errors
+
+
+def _radar_pick(obj, names, default=None):
+    """Return the first non-empty field from an exchange payload."""
+    if not isinstance(obj, dict):
+        return default
+    for name in names:
+        value = obj.get(name)
+        if value not in (None, "", "-", "--"):
+            return value
+    return default
+
+
+def _radar_float(value):
+    try:
+        if value is None or value == "":
+            return np.nan
+        return float(str(value).replace(",", "").replace("%", ""))
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _radar_payload_rows(payload):
+    """Tolerate documented OKX response wrappers without guessing values."""
+    data = payload.get("data", []) if isinstance(payload, dict) else []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                for key in ("traderList", "leadTraderList", "list", "traders", "ranks"):
+                    nested = item.get(key)
+                    if isinstance(nested, list):
+                        return [x for x in nested if isinstance(x, dict)]
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        for key in ("traderList", "leadTraderList", "list", "traders", "ranks"):
+            nested = data.get(key)
+            if isinstance(nested, list):
+                return [x for x in nested if isinstance(x, dict)]
+    return []
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_okx_auto_trader_candidates(limit: int = 50, last_days: int = 180):
+    """Discover public OKX SWAP lead traders and score only disclosed risk data.
+
+    Public endpoints are read-only. A candidate is never labelled low-risk if
+    drawdown/history/leverage data are missing. No account login is used.
+    """
+    base = "https://www.okx.com/api/v5/copytrading"
+    errors, candidates = [], []
+    params = {"instType": "SWAP", "sortType": "overview", "state": "1",
+              "minLeadDays": str(last_days), "page": "1", "limit": str(min(100, max(1, limit)))}
+    try:
+        r = requests.get(base + "/public-lead-traders", params=params, timeout=18)
+        r.raise_for_status(); payload = r.json()
+        if str(payload.get("code", "0")) != "0":
+            # Some OKX regions/versions reject minLeadDays; retry without it,
+            # then apply the history filter locally.
+            params.pop("minLeadDays", None)
+            r = requests.get(base + "/public-lead-traders", params=params, timeout=18)
+            r.raise_for_status(); payload = r.json()
+        if str(payload.get("code", "0")) != "0":
+            raise RuntimeError(str(payload.get("msg", "OKX ranking endpoint error")))
+        candidates = _radar_payload_rows(payload)
+        if not candidates:
+            raise RuntimeError("OKX ranking endpoint returned no trader rows")
+    except Exception as exc:
+        return pd.DataFrame(), [f"دریافت رتبه‌بندی عمومی OKX ناموفق بود: {str(exc)[:180]}"]
+
+    rows = []
+    for trader in candidates[:min(100, max(1, limit))]:
+        code = str(_radar_pick(trader, ["uniqueCode", "unique_code", "traderId"], "")).strip()
+        if not code:
+            continue
+        nick = _radar_pick(trader, ["nickName", "nickname", "nick_name", "name"], "بدون نام")
+        lead_days = _radar_float(_radar_pick(trader, ["leadDays", "lead_days", "tradingDays", "tradeDays"]))
+        rank_roi = _radar_float(_radar_pick(trader, ["pnlRatio", "pnlRate", "roi", "收益率"]))
+        rank_win = _radar_float(_radar_pick(trader, ["winRatio", "winRate", "win_rate"]))
+        rank_dd = _radar_float(_radar_pick(trader, ["maxDd", "maxDrawdown", "maxDrawdownRatio", "maxDdRatio"]))
+        aum = _radar_float(_radar_pick(trader, ["aum", "copyTradingAum", "assets", "totalAssets"]))
+        stats = {}
+        try:
+            sr = requests.get(base + "/public-stats", params={"instType": "SWAP", "uniqueCode": code, "lastDays": str(last_days)}, timeout=12)
+            sr.raise_for_status(); sp = sr.json()
+            if str(sp.get("code", "0")) == "0":
+                stats_rows = _radar_payload_rows(sp)
+                if stats_rows:
+                    stats = stats_rows[0]
+                elif isinstance(sp.get("data"), list) and sp["data"] and isinstance(sp["data"][0], dict):
+                    stats = sp["data"][0]
+        except Exception as exc:
+            errors.append(f"{code}: stats unavailable ({exc.__class__.__name__})")
+
+        days = lead_days if pd.notna(lead_days) else _radar_float(_radar_pick(stats, ["leadDays", "tradingDays", "tradeDays"]))
+        roi = rank_roi if pd.notna(rank_roi) else _radar_float(_radar_pick(stats, ["pnlRatio", "pnlRate", "roi"]))
+        win = rank_win if pd.notna(rank_win) else _radar_float(_radar_pick(stats, ["winRatio", "winRate", "win_rate"]))
+        dd = rank_dd if pd.notna(rank_dd) else _radar_float(_radar_pick(stats, ["maxDd", "maxDrawdown", "maxDrawdownRatio", "maxDdRatio", "maxDrawdownRate"]))
+        copy_count = _radar_float(_radar_pick(trader, ["copyTraderNum", "copyTraderCount", "followerCount"]))
+        reported_leverage = _radar_float(_radar_pick(trader, ["avgLever", "avgLeverage", "leverage", "lever"]))
+        if pd.isna(reported_leverage):
+            reported_leverage = _radar_float(_radar_pick(stats, ["avgLever", "avgLeverage", "leverage", "lever"]))
+        # Drawdown ratios may be returned as fractions or percentages.
+        dd_pct = abs(dd) * 100 if pd.notna(dd) and abs(dd) <= 1 else abs(dd) if pd.notna(dd) else np.nan
+        win_pct = win * 100 if pd.notna(win) and 0 <= win <= 1 else win
+        roi_pct = roi * 100 if pd.notna(roi) and -1 <= roi <= 1 else roi
+        reasons = []
+        if pd.isna(days) or days < last_days: reasons.append("سابقه کمتر از حداقل/نامشخص")
+        if pd.isna(dd_pct): reasons.append("افت سرمایه تأیید نشده")
+        elif dd_pct > 15: reasons.append("افت سرمایه بالاتر از ۱۵٪")
+        if pd.isna(win_pct): reasons.append("نرخ برد نامشخص")
+        elif win_pct < 50: reasons.append("نرخ برد کمتر از ۵۰٪")
+        if pd.isna(reported_leverage): reasons.append("اهرم میانگین افشا نشده؛ قبل از انتخاب باید پوزیشن باز بررسی شود")
+        elif reported_leverage > 3: reasons.append("اهرم میانگین بالاتر از سقف ۳ برابر")
+        hard_fail = (
+            pd.isna(days) or days < last_days or pd.isna(dd_pct) or dd_pct > 15
+            or pd.isna(win_pct) or win_pct < 50
+            or (pd.notna(reported_leverage) and reported_leverage > 3)
+        )
+        # Missing leverage does not qualify a trader as safe; it remains a manual-review candidate.
+        score = 0.0
+        if pd.notna(days): score += min(days / 180, 1) * 25
+        if pd.notna(dd_pct): score += max(0, 1 - dd_pct / 25) * 35
+        if pd.notna(win_pct): score += max(0, min(win_pct, 75) - 45) / 30 * 20
+        if pd.notna(roi_pct): score += max(0, min(roi_pct, 30)) / 30 * 10
+        if pd.notna(copy_count): score += min(copy_count / 100, 1) * 10
+        screening_status = "رد فیلتر" if hard_fail else ("نیازمند کنترل اهرم" if pd.isna(reported_leverage) else "عبور اولیه از فیلتر")
+        rows.append({
+            "Trader": nick, "OKX uniqueCode": code, "Risk score /100": round(score, 1),
+            "Screening status": screening_status,
+            "Lead days": days, "ROI % (reported)": roi_pct, "Win rate %": win_pct,
+            "Max drawdown %": dd_pct, "Avg leverage (reported)": reported_leverage,
+            "Followers": copy_count, "AUM (reported)": aum,
+            "Reason / missing checks": "؛ ".join(reasons) if reasons else "از فیلتر اولیه عبور کرد؛ اهرم و معاملات باز هنوز باید بررسی شوند",
+            "Source": "OKX public lead-trader ranking + public stats",
+        })
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame = frame.sort_values(["Screening status", "Risk score /100"], ascending=[True, False]).reset_index(drop=True)
+    return frame, errors
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -4742,10 +4883,42 @@ if section == "🧠 رادار تریدر و نهنگ":
     )
     trader_tab, wallet_tab, guide_tab = st.tabs(["تریدرهای حرفه‌ای", "کیف‌پول‌های بزرگ", "راهنما و محدودیت‌ها"])
     with trader_tab:
-        st.markdown("#### پوزیشن‌های باز رهبران OKX")
-        st.write("کد یکتای عمومی (uniqueCode) تریدرها را وارد کن؛ هر خط یک کد. این بخش هیچ API Key یا دسترسی معاملاتی نمی‌خواهد.")
-        trader_codes = st.text_area("OKX lead trader unique codes", key="smart_radar_okx_codes", height=90, placeholder="مثال: uniqueCode تریدر اول\nuniqueCode تریدر دوم")
-        if st.button("دریافت پوزیشن‌های عمومی تریدرها", key="smart_radar_fetch_traders", type="primary"):
+        st.markdown("#### انتخاب خودکار تریدرهای عمومی با فیلتر ریسک")
+        st.info("این اسکن از رتبه‌بندی و آمار عمومی OKX استفاده می‌کند. تریدر فقط وقتی از فیلتر اولیه عبور می‌کند که سابقه، افت سرمایه و نرخ برد قابل ارزیابی باشند؛ اهرم و معاملات باز نیز قبل از تأیید نهایی باید بررسی شوند.")
+        c1, c2 = st.columns(2)
+        min_days = c1.selectbox("حداقل سابقه قابل قبول", [90, 180, 270, 365], index=1, key="smart_radar_min_days")
+        max_candidates = c2.selectbox("تعداد تریدرهای بررسی‌شونده", [20, 50, 100], index=1, key="smart_radar_candidate_count")
+        if st.button("🔎 پیدا کردن و رتبه‌بندی خودکار تریدرها", key="smart_radar_auto_discover", type="primary"):
+            with st.spinner("در حال دریافت رتبه‌بندی عمومی و بررسی آمار تریدرها از OKX..."):
+                auto_traders, auto_errors = fetch_okx_auto_trader_candidates(int(max_candidates), int(min_days))
+            st.session_state["smart_radar_auto_traders"] = auto_traders
+            st.session_state["smart_radar_auto_errors"] = auto_errors
+        auto_traders = st.session_state.get("smart_radar_auto_traders", pd.DataFrame())
+        auto_errors = st.session_state.get("smart_radar_auto_errors", [])
+        if isinstance(auto_traders, pd.DataFrame) and not auto_traders.empty:
+            passed = auto_traders[auto_traders["Screening status"].isin(["عبور اولیه از فیلتر", "نیازمند کنترل اهرم"])]
+            m1, m2, m3 = st.columns(3)
+            m1.metric("تریدرهای بررسی‌شده", len(auto_traders))
+            m2.metric("عبور از فیلتر اولیه", len(passed))
+            m3.metric("نیازمند بررسی / رد", len(auto_traders) - len(passed))
+            st.dataframe(auto_traders, use_container_width=True, hide_index=True)
+            st.download_button("دانلود رتبه‌بندی تریدرها CSV", auto_traders.to_csv(index=False).encode("utf-8-sig"), "okx_auto_trader_radar.csv", "text/csv", key="smart_radar_auto_trader_csv")
+            st.markdown("#### مشاهده پوزیشن‌های باز تریدرهای برتر")
+            eligible_codes = auto_traders.loc[auto_traders["Screening status"].isin(["عبور اولیه از فیلتر", "نیازمند کنترل اهرم"]), "OKX uniqueCode"].astype(str).head(10).tolist()
+            selected_codes = st.multiselect("تریدرهایی که پوزیشن بازشان بررسی شود", eligible_codes, default=eligible_codes[:5], key="smart_radar_selected_auto_codes")
+            if st.button("دریافت پوزیشن‌های باز انتخاب‌شده", key="smart_radar_fetch_auto_positions"):
+                pos, pos_errors = fetch_okx_public_lead_positions("\n".join(selected_codes))
+                st.session_state["smart_radar_trader_positions"] = pos
+                st.session_state["smart_radar_trader_errors"] = pos_errors
+        else:
+            st.caption("هنوز اسکن خودکار اجرا نشده یا API عمومی OKX داده‌ای برنگردانده است.")
+        for err in auto_errors:
+            st.warning(err)
+
+        st.divider()
+        st.markdown("#### دریافت مستقیم پوزیشن با کد تریدر (حالت دستی)")
+        trader_codes = st.text_area("OKX lead trader unique codes", key="smart_radar_okx_codes", height=70, placeholder="هر خط یک uniqueCode")
+        if st.button("دریافت پوزیشن‌های عمومی تریدرها", key="smart_radar_fetch_traders", type="secondary"):
             with st.spinner("در حال دریافت پوزیشن‌های عمومی OKX..."):
                 trader_positions, trader_errors = fetch_okx_public_lead_positions(trader_codes)
             st.session_state["smart_radar_trader_positions"] = trader_positions
@@ -4756,8 +4929,8 @@ if section == "🧠 رادار تریدر و نهنگ":
             st.metric("پوزیشن‌های قابل مشاهده", len(trader_positions))
             st.dataframe(trader_positions, use_container_width=True, hide_index=True)
             st.download_button("دانلود پوزیشن‌های تریدرها CSV", trader_positions.to_csv(index=False).encode("utf-8-sig"), "public_trader_positions.csv", "text/csv", key="smart_radar_trader_csv")
-        else:
-            st.info("هنوز پوزیشنی دریافت نشده است. کد تریدرهای عمومی را وارد و دریافت را بزن.")
+        elif not isinstance(auto_traders, pd.DataFrame) or auto_traders.empty:
+            st.info("پوزیشن عمومی قابل مشاهده‌ای ثبت نشده است؛ ممکن است تریدر پوزیشن باز نداشته باشد یا اطلاعات را مخفی کرده باشد.")
         for err in trader_errors:
             st.warning(err)
     with wallet_tab:
@@ -4798,7 +4971,8 @@ if section == "🧠 رادار تریدر و نهنگ":
 - پوزیشن OKX: نماد، جهت، اندازه، قیمت ورود، مارجین، سود/زیان شناور و TP/SL در صورت افشای عمومی.
 - کیف‌پول: انتقال ورودی/خروجی توکن، مقدار، قرارداد، زمان و هش تراکنش.
 - انتقال ورودی لزوماً خرید نیست؛ ممکن است انتقال بین کیف‌پول‌های خود شخص، ایردراپ یا جابه‌جایی صرافی باشد.
-- این نسخه آدرس‌های تحت‌نظر و کدهای تریدر را از کاربر می‌گیرد؛ هنوز کشف خودکار تمام تریدرها یا شناسایی خودکار کیف‌پول نهنگ در کل شبکه را ادعا نمی‌کند.
+- فهرست عمومی تریدرهای OKX به‌صورت خودکار دریافت و با سابقه، افت سرمایه و نرخ برد فیلتر می‌شود؛ نبود داده ریسک به معنی تأیید تریدر نیست. اهرم و معاملات باز نیز باید جداگانه بررسی شوند.
+- رادار کیف‌پول فعلاً انتقال آدرس‌های تحت‌نظر را می‌خواند؛ کشف خودکار تمام کیف‌پول‌های نهنگ در کل شبکه در این نسخه فعال نیست.
 - برای کشف خودکار نهنگ‌ها و تشخیص Swap واقعی باید سرویس ایندکس آن‌چین/DEX با پوشش شبکه‌ای و کلید API مناسب اضافه شود.
 - داده‌های عمومی OKX ممکن است ۵ دقیقه تأخیر داشته باشند و در صورت فعال‌بودن حفاظت تریدر، فیلدهای حساس خالی باشند.
         """)

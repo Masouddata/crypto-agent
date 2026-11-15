@@ -2721,13 +2721,9 @@ def cryptometer_watchlist(results):
         if item["Rapid events"]:
             score += 10 if rapid_bias > 0 else (-10 if rapid_bias < 0 else 0)
             categories += 1
-        whale_values_present = pd.notna(item["Whale buys USD"]) or pd.notna(item["Whale sells USD"])
-        whale_buys = 0.0 if pd.isna(item["Whale buys USD"]) else item["Whale buys USD"]
-        whale_sells = 0.0 if pd.isna(item["Whale sells USD"]) else item["Whale sells USD"]
-        whale_total = whale_buys + whale_sells
-        if whale_values_present and whale_total > 0:
-            score += 18 if whale_buys > whale_sells else -18
-            categories += 1
+        # Large-trade / whale buy volume is deliberately excluded from pump
+        # scoring. Large prints can be market-making, OTC-related, wash trading,
+        # or short-lived manipulation. Raw amounts remain visible for review.
         if pd.notna(item["Netflow USD"]):
             score += 15 if item["Netflow USD"] > 0 else (-15 if item["Netflow USD"] < 0 else 0)
             categories += 1
@@ -2736,6 +2732,7 @@ def cryptometer_watchlist(results):
             **item,
             "CryptoMeter evidence categories": categories,
             "Independent providers": 1,
+            "Large-buy score impact": "Excluded",
             "Activity score": round(score, 1),
             "Reading": "CryptoMeter-only — needs independent market confirmation",
         })
@@ -2801,7 +2798,7 @@ def add_watchlist_trade_levels(watchlist, market_df, currency, api_key, max_coin
 # =========================================================
 st.title("📡 اسکنر هوشمند بازار ارزهای دیجیتال")
 st.caption("پایش بازار • شناسایی فرصت‌های پیش از رشد • رادار انباشت • جریان پول • کنترل ریسک")
-st.caption("Build 2026-11-14.1 • Same-asset vs cross-asset historical evidence separated • Conservative pre-pump triage")
+st.caption("Build 2026-11-15.2 • Large-buy volume excluded from pump scoring • Conservative pre-pump triage")
 st.caption("دریافت بازار با فاصله‌گذاری بین صفحات و تلاش مجدد هوشمند انجام می‌شود؛ پاسخ‌ها ۵ دقیقه کش می‌شوند و در صورت محدودیت صفحه بعد، داده صفحات موفق حفظ می‌شود.")
 st.warning(
     "امتیازها ابزار غربالگری‌اند، نه احتمال قطعی پامپ یا توصیه مالی. داده‌های ناقص به‌عنوان سیگنال مثبت فرض نمی‌شوند؛ درصد پوشش شواهد را کنار امتیاز ببین."
@@ -4592,9 +4589,9 @@ if section == "🐋 جریان پول و مشتقات":
             if not watchlist_df.empty:
                 st.markdown("**Cross-signal activity watchlist**")
                 st.caption(
-                    "Rapid Moves، معاملات بزرگ و Netflow همگی از یک ارائه‌دهنده (CryptoMeter) هستند؛ "
-                    "بنابراین فقط یک منبع مستقل شمرده می‌شوند. اعداد ناموجود صفر فرض نمی‌شوند. "
-                    "تأیید مستقل قیمت/حجم از تیکرهای عمومی بازار OKX و فقط برای جفت دقیق SPOT با USDT انجام می‌شود."
+                    "حجم خریدهای بزرگ/معاملات نهنگ از امتیاز پامپ حذف شده و فقط به‌صورت داده خام برای بررسی دستی نمایش داده می‌شود. "
+                    "امتیاز فعالیت از Rapid Moves و Netflow می‌آید؛ هر دو متعلق به CryptoMeter هستند و منبع مستقل جداگانه محسوب نمی‌شوند. "
+                    "اعداد ناموجود صفر فرض نمی‌شوند. تأیید مستقل قیمت/حجم از تیکرهای عمومی OKX و فقط برای جفت دقیق SPOT با USDT انجام می‌شود."
                 )
                 try:
                     okx_df = fetch_okx_spot_tickers()

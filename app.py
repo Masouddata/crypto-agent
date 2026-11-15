@@ -2479,6 +2479,105 @@ def fetch_bybit_derivatives():
 
 
 
+
+# =========================================================
+# SMART TRADER + ON-CHAIN WALLET RADAR (read-only)
+# =========================================================
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_okx_public_lead_positions(unique_codes_text: str):
+    """Fetch public OKX lead-trader positions for explicitly supplied unique codes.
+
+    Public data may be delayed or masked by the lead trader. No private credentials
+    or trading permissions are used.
+    """
+    codes = [x.strip() for x in re.split(r"[\s,;]+", unique_codes_text or "") if x.strip()]
+    rows, errors = [], []
+    for code in codes[:20]:
+        try:
+            response = requests.get(
+                "https://www.okx.com/api/v5/copytrading/public-current-subpositions",
+                params={"instType": "SWAP", "uniqueCode": code}, timeout=15,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if str(payload.get("code", "")) != "0":
+                errors.append(f"{code}: OKX code {payload.get('code')} {payload.get('msg', '')}".strip())
+                continue
+            for item in payload.get("data", []) or []:
+                rows.append({
+                    "Trader code": code,
+                    "Instrument": item.get("instId", ""),
+                    "Side": item.get("posSide", item.get("side", "Unknown")),
+                    "Position size": item.get("subPos", item.get("pos", "")),
+                    "Entry price": item.get("openAvgPx", ""),
+                    "Mark price": item.get("markPx", ""),
+                    "Margin (reported)": item.get("margin", ""),
+                    "Unrealized PnL": item.get("upl", ""),
+                    "Opened at (UTC)": item.get("openTime", ""),
+                    "TP": item.get("tpOrdPx", ""),
+                    "SL": item.get("slOrdPx", ""),
+                    "Source": "OKX public lead positions",
+                })
+        except Exception as exc:
+            errors.append(f"{code}: {exc.__class__.__name__}")
+    return pd.DataFrame(rows), errors
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_etherscan_wallet_token_transfers(addresses_text: str, chain_id: int, api_key: str, limit: int = 100):
+    """Read ERC-20 transfer events for tracked EVM wallets using Etherscan API V2.
+
+    A transfer is NOT automatically a buy/sell; DEX swap decoding is a separate step.
+    """
+    addresses = [x.strip() for x in re.split(r"[\s,;]+", addresses_text or "") if x.strip()]
+    rows, errors = [], []
+    for address in addresses[:10]:
+        if not re.fullmatch(r"0x[a-fA-F0-9]{40}", address):
+            errors.append(f"Invalid EVM address: {address[:18]}…")
+            continue
+        try:
+            response = requests.get(
+                "https://api.etherscan.io/v2/api",
+                params={
+                    "chainid": int(chain_id), "module": "account", "action": "tokentx",
+                    "address": address, "page": 1, "offset": int(limit), "sort": "desc",
+                    "apikey": api_key,
+                }, timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            result = payload.get("result", [])
+            if not isinstance(result, list):
+                errors.append(f"{address[:10]}…: {payload.get('message', 'Explorer returned no transfer list')}")
+                continue
+            for item in result:
+                decimals = int(item.get("tokenDecimal") or 0)
+                try:
+                    amount = float(item.get("value", 0)) / (10 ** decimals)
+                except Exception:
+                    amount = np.nan
+                direction = "IN" if str(item.get("to", "")).lower() == address.lower() else "OUT"
+                rows.append({
+                    "Tracked wallet": address,
+                    "Direction": direction,
+                    "Token": item.get("tokenSymbol", "?"),
+                    "Token name": item.get("tokenName", ""),
+                    "Amount": amount,
+                    "Contract": item.get("contractAddress", ""),
+                    "Time UTC": pd.to_datetime(int(item.get("timeStamp", 0)), unit="s", utc=True, errors="coerce"),
+                    "Transaction": item.get("hash", ""),
+                    "From": item.get("from", ""),
+                    "To": item.get("to", ""),
+                    "Source": "Etherscan V2 ERC-20 transfer",
+                    "Interpretation": "Token transfer — not confirmed buy/sell",
+                })
+        except Exception as exc:
+            errors.append(f"{address[:10]}…: {exc.__class__.__name__}")
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame = frame.sort_values("Time UTC", ascending=False)
+    return frame, errors
+
 def add_derivatives_score(frame):
     """Add a small positioning context weight; never treat OI as cash inflow."""
     out = frame.copy()
@@ -3198,14 +3297,14 @@ def render_semi_gauge(value, title, subtitle, marker_color="#1769d2"):
 filtered = df[(numeric(df["PrePump_Score"]).fillna(0) >= min_score) & (~df["Is_Excluded_Asset"])].copy()  # پیش‌فرض برای بخش‌های دیگر
 section = st.radio(
     "انتخاب بخش اسکنر",
-    ["🏠 نمای کلی", "🧲 رادار انباشت و پیش‌پامپ", "🧬 الگوهای تاریخی", "₿ رابطه ارزها با بیت‌کوین", "📊 نمودارها و ریزش‌ها", "🐋 جریان پول و مشتقات", "📁 داده‌ها"],
+    ["🏠 نمای کلی", "🧲 رادار انباشت و پیش‌پامپ", "🧬 الگوهای تاریخی", "₿ رابطه ارزها با بیت‌کوین", "📊 نمودارها و ریزش‌ها", "🐋 جریان پول و مشتقات", "🧠 رادار تریدر و نهنگ", "📁 داده‌ها"],
     horizontal=True,
     label_visibility="collapsed",
     key="scanner_section_navigation",
 )
 # Keep scheduled refreshes away from the CryptoMeter panel so they cannot
 # interrupt a user-initiated mobile/API request.
-if section not in ("🐋 جریان پول و مشتقات", "🧬 الگوهای تاریخی") and data_source == "CoinGecko market":
+if section not in ("🐋 جریان پول و مشتقات", "🧬 الگوهای تاریخی", "🧠 رادار تریدر و نهنگ") and data_source == "CoinGecko market":
     st_autorefresh(interval=refresh_seconds * 1000, key="scanner_refresh")
 st.caption({
     "🏠 نمای کلی": "خلاصه وضعیت بازار و شاخص‌های اصلی اسکنر",
@@ -3214,6 +3313,7 @@ st.caption({
     "₿ رابطه ارزها با بیت‌کوین": "همبستگی ساعتی و واگرایی عملکرد ارزها نسبت به BTC",
     "📊 نمودارها و ریزش‌ها": "بررسی ساختار قیمت، شاخص‌های تکنیکال و ارزهای با افت شدید",
     "🐋 جریان پول و مشتقات": "جریان پول، خرید و فروش واقعی، فاندینگ و سود باز",
+    "🧠 رادار تریدر و نهنگ": "ردیابی پوزیشن‌های عمومی رهبران OKX و انتقال توکن کیف‌پول‌های بزرگ",
     "📁 داده‌ها": "مشاهده و دریافت داده خام بازار",
 }[section])
 st.divider()
@@ -4632,6 +4732,76 @@ if section == "🐋 جریان پول و مشتقات":
                 )
         else:
             st.info("Click 'Fetch CryptoMeter intelligence' to request the free feeds. Paid feeds remain off until you select them above.")
+
+
+if section == "🧠 رادار تریدر و نهنگ":
+    st.subheader("🧠 Smart Trader Radar + 🐋 On-chain Whale Radar")
+    st.caption(
+        "این صفحه فقط داده‌های عمومی/خواندنی را می‌گیرد. پوزیشن‌های عمومی OKX ممکن است با تأخیر ۵ دقیقه‌ای یا به‌دلیل محافظت تریدر ناقص/مخفی باشند. "
+        "انتقال توکن کیف‌پول به‌تنهایی خرید یا فروش محسوب نمی‌شود."
+    )
+    trader_tab, wallet_tab, guide_tab = st.tabs(["تریدرهای حرفه‌ای", "کیف‌پول‌های بزرگ", "راهنما و محدودیت‌ها"])
+    with trader_tab:
+        st.markdown("#### پوزیشن‌های باز رهبران OKX")
+        st.write("کد یکتای عمومی (uniqueCode) تریدرها را وارد کن؛ هر خط یک کد. این بخش هیچ API Key یا دسترسی معاملاتی نمی‌خواهد.")
+        trader_codes = st.text_area("OKX lead trader unique codes", key="smart_radar_okx_codes", height=90, placeholder="مثال: uniqueCode تریدر اول\nuniqueCode تریدر دوم")
+        if st.button("دریافت پوزیشن‌های عمومی تریدرها", key="smart_radar_fetch_traders", type="primary"):
+            with st.spinner("در حال دریافت پوزیشن‌های عمومی OKX..."):
+                trader_positions, trader_errors = fetch_okx_public_lead_positions(trader_codes)
+            st.session_state["smart_radar_trader_positions"] = trader_positions
+            st.session_state["smart_radar_trader_errors"] = trader_errors
+        trader_positions = st.session_state.get("smart_radar_trader_positions", pd.DataFrame())
+        trader_errors = st.session_state.get("smart_radar_trader_errors", [])
+        if isinstance(trader_positions, pd.DataFrame) and not trader_positions.empty:
+            st.metric("پوزیشن‌های قابل مشاهده", len(trader_positions))
+            st.dataframe(trader_positions, use_container_width=True, hide_index=True)
+            st.download_button("دانلود پوزیشن‌های تریدرها CSV", trader_positions.to_csv(index=False).encode("utf-8-sig"), "public_trader_positions.csv", "text/csv", key="smart_radar_trader_csv")
+        else:
+            st.info("هنوز پوزیشنی دریافت نشده است. کد تریدرهای عمومی را وارد و دریافت را بزن.")
+        for err in trader_errors:
+            st.warning(err)
+    with wallet_tab:
+        st.markdown("#### ردیابی انتقال توکن کیف‌پول‌ها (EVM)")
+        st.write("آدرس کیف‌پول‌های عمومی موردنظر را وارد کن؛ هر خط یک آدرس. برای دریافت تاریخچه انتقال ERC-20 به کلید رایگان Etherscan V2 نیاز است.")
+        etherscan_key = st.text_input("Etherscan API key", value=secret_or_env("ETHERSCAN_API_KEY"), type="password", key="smart_radar_etherscan_key")
+        chain_options = {"Ethereum": 1, "BNB Chain": 56, "Polygon": 137, "Arbitrum One": 42161, "Base": 8453, "Optimism": 10, "Avalanche C-Chain": 43114}
+        selected_chain = st.selectbox("شبکه", list(chain_options.keys()), key="smart_radar_chain")
+        wallet_addresses = st.text_area("Wallet addresses", key="smart_radar_wallet_addresses", height=100, placeholder="0x...\n0x...")
+        if st.button("ردیابی انتقال‌های کیف‌پول", key="smart_radar_fetch_wallets", type="primary"):
+            if not etherscan_key.strip():
+                st.error("ابتدا کلید Etherscan API را وارد کن یا ETHERSCAN_API_KEY را در Environment قرار بده.")
+            elif not wallet_addresses.strip():
+                st.error("حداقل یک آدرس کیف‌پول وارد کن.")
+            else:
+                with st.spinner("در حال دریافت انتقال‌های توکن..."):
+                    wallet_events, wallet_errors = fetch_etherscan_wallet_token_transfers(wallet_addresses, chain_options[selected_chain], etherscan_key.strip(), 100)
+                st.session_state["smart_radar_wallet_events"] = wallet_events
+                st.session_state["smart_radar_wallet_errors"] = wallet_errors
+        wallet_events = st.session_state.get("smart_radar_wallet_events", pd.DataFrame())
+        wallet_errors = st.session_state.get("smart_radar_wallet_errors", [])
+        if isinstance(wallet_events, pd.DataFrame) and not wallet_events.empty:
+            incoming = int((wallet_events["Direction"] == "IN").sum())
+            outgoing = int((wallet_events["Direction"] == "OUT").sum())
+            w1, w2, w3 = st.columns(3)
+            w1.metric("تعداد انتقال‌ها", len(wallet_events))
+            w2.metric("ورودی به کیف‌پول", incoming)
+            w3.metric("خروجی از کیف‌پول", outgoing)
+            st.dataframe(wallet_events, use_container_width=True, hide_index=True)
+            st.download_button("دانلود رخدادهای کیف‌پول CSV", wallet_events.to_csv(index=False).encode("utf-8-sig"), "onchain_wallet_transfers.csv", "text/csv", key="smart_radar_wallet_csv")
+        else:
+            st.info("برای شروع، کلید API و آدرس کیف‌پول را وارد کن. این نسخه انتقال‌های ERC-20 را نشان می‌دهد؛ خرید/فروش DEX هنوز از روی انتقال خام نتیجه‌گیری نمی‌شود.")
+        for err in wallet_errors:
+            st.warning(err)
+    with guide_tab:
+        st.markdown("""
+**چطور باید این داده را بخوانیم؟**
+- پوزیشن OKX: نماد، جهت، اندازه، قیمت ورود، مارجین، سود/زیان شناور و TP/SL در صورت افشای عمومی.
+- کیف‌پول: انتقال ورودی/خروجی توکن، مقدار، قرارداد، زمان و هش تراکنش.
+- انتقال ورودی لزوماً خرید نیست؛ ممکن است انتقال بین کیف‌پول‌های خود شخص، ایردراپ یا جابه‌جایی صرافی باشد.
+- این نسخه آدرس‌های تحت‌نظر و کدهای تریدر را از کاربر می‌گیرد؛ هنوز کشف خودکار تمام تریدرها یا شناسایی خودکار کیف‌پول نهنگ در کل شبکه را ادعا نمی‌کند.
+- برای کشف خودکار نهنگ‌ها و تشخیص Swap واقعی باید سرویس ایندکس آن‌چین/DEX با پوشش شبکه‌ای و کلید API مناسب اضافه شود.
+- داده‌های عمومی OKX ممکن است ۵ دقیقه تأخیر داشته باشند و در صورت فعال‌بودن حفاظت تریدر، فیلدهای حساس خالی باشند.
+        """)
 
 
 if section == "📁 داده‌ها":

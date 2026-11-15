@@ -1545,14 +1545,6 @@ def run_cmc_pre_pump_scan(limit, api_key, min_volume_usd=100_000, min_market_cap
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_binance_spot_symbols():
-    """Fallback: active Binance spot symbols; public endpoint, no API key."""
-    payload = safe_get("https://api.binance.com/api/v3/exchangeInfo", timeout=20)
-    rows = payload.get("symbols", []) if isinstance(payload, dict) else []
-    return {r.get("symbol") for r in rows if r.get("status") == "TRADING" and r.get("isSpotTradingAllowed", True)}
-
-
-@st.cache_data(ttl=900, show_spinner=False)
 def fetch_okx_spot_symbols():
     """Primary venue: active OKX USDT spot instruments."""
     payload = safe_get("https://www.okx.com/api/v5/public/instruments", params={"instType": "SPOT"}, timeout=20)
@@ -1560,21 +1552,6 @@ def fetch_okx_spot_symbols():
         raise ValueError(f"OKX instruments error: {payload.get('msg', 'invalid response') if isinstance(payload, dict) else 'invalid response'}")
     return {x.get("instId") for x in payload.get("data", [])
             if x.get("state") == "live" and str(x.get("instId", "")).endswith("-USDT")}
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_binance_hourly_closes(symbol, limit=721):
-    """Fetch completed Binance hourly closes; discard the in-progress candle."""
-    payload = safe_get("https://api.binance.com/api/v3/klines",
-                       params={"symbol": str(symbol), "interval": "1h", "limit": min(int(limit), 1000)}, timeout=20)
-    if not isinstance(payload, list) or not payload:
-        return pd.Series(dtype=float)
-    frame = pd.DataFrame(payload, columns=["open_time", "open", "high", "low", "close", "volume", "close_time", "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"])
-    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
-    frame["time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
-    now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
-    frame = frame[pd.to_numeric(frame["close_time"], errors="coerce") < now_ms]
-    return pd.Series(frame["close"].to_numpy(), index=frame["time"], dtype=float).dropna()
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -1616,22 +1593,18 @@ def fetch_okx_hourly_closes(inst_id, limit=721):
 
 
 def build_btc_correlation_frame(market_df, currency, universe_limit=60, symbols=None):
-    """Align completed hourly returns; OKX is primary and Binance is fallback."""
+    """Align completed hourly returns using OKX Spot only (no Binance dependency)."""
     if market_df is None or market_df.empty or "symbol" not in market_df.columns:
         return pd.DataFrame(), "فهرست بازار برای تحلیل در دسترس نیست."
     venue_errors = []
     okx_symbols = set()
-    binance_symbols = set()
     try:
         okx_symbols = fetch_okx_spot_symbols()
     except Exception as exc:
-        venue_errors.append(f"OKX: {str(exc)[:130]}")
-    try:
-        binance_symbols = fetch_binance_spot_symbols()
-    except Exception as exc:
-        venue_errors.append(f"Binance: {str(exc)[:130]}")
-    if not okx_symbols and not binance_symbols:
-        return pd.DataFrame(), "دریافت فهرست جفت‌ها از هر دو صرافی ناموفق بود. " + " | ".join(venue_errors)
+        venue_errors.append(f"OKX: {str(exc)[:180]}")
+        return pd.DataFrame(), "دریافت فهرست جفت‌های OKX ناموفق بود؛ اتصال اینترنت یا دسترسی به API عمومی OKX را بررسی کنید. " + " | ".join(venue_errors)
+    if not okx_symbols:
+        return pd.DataFrame(), "در فهرست OKX جفت فعال USDT پیدا نشد؛ دسترسی به API عمومی OKX را بررسی کنید."
 
     base = market_df.copy()
     base["symbol"] = base["symbol"].astype(str).str.upper()
@@ -1648,33 +1621,21 @@ def build_btc_correlation_frame(market_df, currency, universe_limit=60, symbols=
     jobs = []
     for _, row in base.iterrows():
         symbol = str(row.get("symbol", "")).upper()
-        okx_pair, binance_pair = f"{symbol}-USDT", f"{symbol}USDT"
+        okx_pair = f"{symbol}-USDT"
         if okx_pair in okx_symbols:
             jobs.append(("OKX", okx_pair, row))
-        elif binance_pair in binance_symbols:
-            jobs.append(("Binance", binance_pair, row))
     btc_row = {"symbol": "BTC", "name": "Bitcoin", "current_price": np.nan}
     if not any(str(x[2].get("symbol", "")).upper() == "BTC" for x in jobs):
         if "BTC-USDT" in okx_symbols:
             jobs.insert(0, ("OKX", "BTC-USDT", btc_row))
-        elif "BTCUSDT" in binance_symbols:
-            jobs.insert(0, ("Binance", "BTCUSDT", btc_row))
     if not jobs:
-        return pd.DataFrame(), "هیچ جفت USDT مشترکی میان فهرست بازار و OKX/Binance پیدا نشد."
+        return pd.DataFrame(), "هیچ جفت فعال USDT مشترکی میان فهرست بازار و OKX پیدا نشد. نمادها یا دسترسی API عمومی OKX را بررسی کنید."
 
     from concurrent.futures import as_completed
     series_map, errors = {}, []
     def fetch_one(venue, pair):
-        if venue == "OKX":
-            try:
-                return fetch_okx_hourly_closes(pair, 721), "OKX"
-            except Exception as first:
-                # A per-instrument OKX failure may still be served by Binance.
-                fallback = pair.replace("-", "")
-                if fallback in binance_symbols:
-                    return fetch_binance_hourly_closes(fallback, 721), "Binance fallback"
-                raise first
-        return fetch_binance_hourly_closes(pair, 721), "Binance"
+        # Strictly use OKX; do not silently route requests to Binance.
+        return fetch_okx_hourly_closes(pair, 721), "OKX"
 
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {pool.submit(fetch_one, venue, pair): (venue, pair) for venue, pair, _ in jobs}
@@ -1685,7 +1646,7 @@ def build_btc_correlation_frame(market_df, currency, universe_limit=60, symbols=
             except Exception as exc:
                 errors.append(f"{pair}: {str(exc)[:100]}")
 
-    btc_pair = "BTC-USDT" if "BTC-USDT" in series_map else "BTCUSDT"
+    btc_pair = "BTC-USDT"
     btc = series_map.get(btc_pair, pd.Series(dtype=float))
     if len(btc) < 170:
         detail = "؛ ".join(venue_errors + errors[:3])
@@ -2007,58 +1968,19 @@ def fetch_gecko_hourly_candles(chain, pair_address):
 
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_public_exchange_hourly_market(symbol):
-    """Free public CEX fallback: return closed 1h OHLCV and taker-buy share.
+    """Free public CEX fallback using OKX Spot, then Kraken Spot.
 
-    Binance Spot is tried first, then OKX Spot. No API key is required. This
-    fallback is used when DEX Screener has no qualifying liquid pool, so
-    exchange-listed assets are not silently omitted from the hourly radar.
+    Binance is deliberately not used because access may be restricted for
+    users in sanctioned regions. Missing exchange data stays missing; it is
+    never replaced with fabricated values.
     """
     symbol = str(symbol or "").upper().strip()
     if not re.fullmatch(r"[A-Z0-9]{2,15}", symbol):
         return None
     now_ms = int(time.time() * 1000)
 
-    # Binance public spot klines. Quote volume and taker-buy quote volume are
-    # provider-reported values; no transaction-count split is fabricated.
-    try:
-        raw = safe_get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": f"{symbol}USDT", "interval": "1h", "limit": 12},
-            timeout=12,
-        )
-        if isinstance(raw, list) and raw:
-            closed = [k for k in raw if len(k) > 10 and int(k[6]) <= now_ms]
-            closed.sort(key=lambda k: int(k[0]), reverse=True)
-            if closed:
-                last = closed[0]
-                quote_vol = float(last[7] or 0)
-                taker_buy_quote = float(last[10] or 0)
-                previous_vols = [float(k[7] or 0) for k in closed[1:7]]
-                avg_prev = sum(previous_vols) / len(previous_vols) if previous_vols else 0
-                opn, close = float(last[1]), float(last[4])
-                if opn > 0 and close > 0:
-                    return {
-                        "source": "Binance Spot",
-                        "change_1h": (close / opn - 1) * 100,
-                        "volume_1h": quote_vol,
-                        "volume_ratio": quote_vol / avg_prev if avg_prev > 0 else np.nan,
-                        "buys": np.nan,
-                        "sells": np.nan,
-                        "transactions": float(last[8] or 0),
-                        "buy_share": (taker_buy_quote / quote_vol * 100) if quote_vol > 0 else np.nan,
-                        "liquidity": np.nan,
-                        "candle": "سبز" if close > opn else ("قرمز" if close < opn else "خنثی"),
-                        "open": opn, "close": close, "timestamp": int(last[0] // 1000),
-                        "pair_url": f"https://www.binance.com/en/trade/{symbol}_USDT?type=spot",
-                        "chain": "CEX", "dex": "Binance Spot",
-                        "pair_address": f"{symbol}USDT", "token_address": "",
-                        "buy_pressure_type": "سهم حجم خرید تیکر (Binance)",
-                    }
-    except Exception:
-        pass
-
-    # OKX public spot candles as a second no-key source. OKX does not expose
-    # taker-side split in this endpoint, so buy pressure remains unavailable.
+    # OKX public spot candles (no API key required). Its endpoint has no taker-side
+    # split, so buy pressure remains unavailable.
     try:
         raw = safe_get(
             "https://www.okx.com/api/v5/market/candles",
@@ -2132,7 +2054,7 @@ def fetch_public_exchange_hourly_market(symbol):
 def scan_hourly_pump_radar(market_frame, max_coins=100, min_pair_liquidity=100_000):
     """
     Scan a broad CoinGecko market universe. Prefer qualifying DEX pairs, then
-    fall back to free public Binance/OKX spot OHLCV for CEX-listed assets.
+    fall back to free public OKX/Kraken spot OHLCV for CEX-listed assets.
     Stablecoins and ambiguous duplicate tickers remain excluded.
     """
     if market_frame is None or market_frame.empty or "Symbol" not in market_frame.columns:
@@ -3655,7 +3577,7 @@ if section == "🧲 رادار انباشت و پیش‌پامپ":
     st.caption(
         "علاوه بر حجم و نسبت خرید به فروش، آخرین کندل یک‌ساعته بسته‌شده از OHLCV جفت DEX بررسی می‌شود. "
         "کندل قرمز یا داده کندل ناموجود اجازه صدور وضعیت کاندید اولیه نمی‌دهد. "
-        "اسکن تا ۱۰۰ ارز بازار را بررسی می‌کند: ابتدا جفت‌های DEX و در صورت نبود جفت مناسب، کندل عمومی Binance/OKX/Kraken را بدون API Key می‌خواند. "
+        "اسکن تا ۱۰۰ ارز بازار را بررسی می‌کند: ابتدا جفت‌های DEX و در صورت نبود جفت مناسب، کندل عمومی OKX/Kraken را بدون API Key می‌خواند؛ هیچ درخواست مستقیمی به Binance ارسال نمی‌شود. "
         "استیبل‌کوین‌ها حذف می‌شوند؛ برای ردیف‌های CEX، نقدشوندگی DEX و سهم خرید فقط در صورت ارائه منبع نمایش داده می‌شود."
     )
     if data_source != "CoinGecko market":
@@ -4536,7 +4458,7 @@ if section == "🐋 جریان پول و مشتقات":
                 )
             with buy_col2:
                 buy_exchange = st.selectbox(
-                    "صرافی مرجع", ["binance", "bybit_spot", "okx", "kucoin", "coinbase_pro", "kraken"],
+                    "صرافی مرجع", ["bybit_spot", "okx", "kucoin", "coinbase_pro", "kraken"],
                     index=0, key="cm_actual_buy_exchange"
                 )
             if st.button("محاسبه حجم واقعی خرید و فروش", key="cm_actual_buy_fetch", type="primary"):
@@ -4740,7 +4662,7 @@ if section == "📁 داده‌ها":
 # =========================================================
 if section == "₿ رابطه ارزها با بیت‌کوین":
     st.title("₿ رابطه ارزها با بیت‌کوین؛ همبستگی و واگرایی")
-    st.caption("تحلیل بر پایه بازده کندل‌های یک‌ساعته بسته‌شده و هم‌زمان؛ اولویت دریافت با OKX Spot و جایگزین Binance Spot است")
+    st.caption("تحلیل بر پایه بازده کندل‌های یک‌ساعته بسته‌شده و هم‌زمان؛ دریافت داده فقط از OKX Spot انجام می‌شود و به Binance وابسته نیست")
     st.info("همبستگی ۱ساعت* با پنجره متحرک ۲۴ بازده ساعتی محاسبه می‌شود؛ یک کندل به‌تنهایی برای محاسبه همبستگی کافی نیست. بازه‌های ۷ و ۳۰ روز به‌ترتیب از ۱۶۸ و ۷۲۰ بازده ساعتی هم‌زمان استفاده می‌کنند. واگرایی با عملکرد بهتر از BTC، سهم ساعات مثبت ارز هنگام افت BTC و ساعات خلاف‌جهت سنجیده می‌شود؛ همبستگی پایین به‌تنهایی واگرایی نیست.")
     corr_a, corr_b = st.columns([1, 1])
     with corr_a:
@@ -4749,14 +4671,14 @@ if section == "₿ رابطه ارزها با بیت‌کوین":
         st.metric("واحد قیمت", currency.upper())
     run_corr = st.button("🔄 دریافت و محاسبه همبستگی و واگرایی", type="primary", key="run_btc_corr")
     if run_corr or "btc_corr_result" not in st.session_state:
-        with st.spinner("در حال دریافت کندل‌های یک‌ساعته BTC و ارزهای منتخب از OKX (جایگزین: Binance)؛ ممکن است کمی زمان ببرد..."):
+        with st.spinner("در حال دریافت کندل‌های یک‌ساعته BTC و ارزهای منتخب از OKX؛ ممکن است کمی زمان ببرد..."):
             corr_frame, corr_status = build_btc_correlation_frame(df, currency, corr_universe)
         st.session_state["btc_corr_result"] = corr_frame
         st.session_state["btc_corr_status"] = corr_status
     corr_frame = st.session_state.get("btc_corr_result", pd.DataFrame())
     st.caption(st.session_state.get("btc_corr_status", "برای شروع، دریافت داده را اجرا کنید."))
     if corr_frame.empty:
-        st.warning("داده کافی برای نمایش نتیجه وجود ندارد. اتصال API یا جفت‌های معاملاتی Binance را بررسی کنید و دوباره دریافت را بزنید.")
+        st.warning("داده کافی برای نمایش نتیجه از OKX دریافت نشد. اتصال اینترنت، دسترسی به API عمومی OKX و فعال‌بودن جفت‌های معاملاتی USDT را بررسی کنید؛ سپس دوباره دریافت را بزنید. این بخش از Binance استفاده نمی‌کند.")
     else:
         corr_view = corr_frame.copy()
         for col in ["همبستگی ۱ساعت*", "همبستگی ۷روز", "همبستگی ۳۰روز"]:
